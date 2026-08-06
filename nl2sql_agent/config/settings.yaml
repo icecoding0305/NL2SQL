@@ -1,0 +1,33 @@
+# 运行参数:所有可调项都放配置,不允许写死在代码里
+
+# SQL 方言(对应不同数据库连接),sqlglot 支持:mysql / postgres / duckdb ...
+dialect: mysql
+
+# Schema 检索:向量兜底的 Top-K
+schema_search_top_k: 5
+
+performance:
+  # auto:明细列表直接生成确定性摘要；真正的指标/聚合结果再调用 LLM 润色。
+  result_summary_mode: auto
+
+# 数据库连接(不配置则无法真正执行,只能走校验链路)
+# 可用 .env 的 DATABASE_URL 覆盖;按 scheme 自动选择执行器:
+#   mysql://  → MySQLExecutor   postgresql:// 或 postgres:// → PostgresExecutor
+database_url: null
+# 兼容旧字段(仅 postgres 场景)
+pg_database_url: null
+# pgvector 仅 postgres 有;MySQL 无 pgvector,向量兜底自动用内存实现
+pgvector_url: null
+
+execution:
+  read_only: true                 # 事务级只读(MySQL: START TRANSACTION READ ONLY)
+  limit: 1000                     # 未聚合查询强制 LIMIT
+  timeout_seconds: 30             # 查询超时,超时视为 execution_error
+  explain_row_threshold: 1000000  # 执行前 EXPLAIN 预估行数超过该值直接拒绝
+
+row_level_filter:
+  # data_scope 只控制系统/表权限，绝不作为此字段的取值。
+  # 如需按平台隔离，鉴权层应向 state.row_level_filters 注入
+  # {"PLATFORM_CODE": ["真实平台编码"]} 后再启用。
+  enabled: false
+  column: PLATFORM_CODE

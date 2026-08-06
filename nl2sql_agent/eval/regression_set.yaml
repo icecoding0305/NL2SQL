@@ -1,0 +1,30 @@
+# 回归用例集:每一条都应在 Fake 双打下稳定通过
+# data_scope = 用户可访问的系统(业务线按系统维度),如 risk_mart(风险数据集市)/ dw / core
+cases:
+  - id: loan_count_simple
+    user_query: "查询新信贷的借据笔数"
+    user_id: u_xxd
+    data_scope: [risk_mart]
+    expect:
+      path: simple            # 走模块 5a 简单路径
+      plan_skipped: true
+      final_status: success
+      execution_result_nonempty: true
+
+  - id: overdue_rate_complex
+    user_query: "查询新信贷近三个月的逾期率"
+    user_id: u_xxd
+    data_scope: [risk_mart]
+    expect:
+      path: complex           # 命中复合口径指标,走模块 5b
+      plan_passed: true
+      sensitive: true         # 金额聚合触发敏感,需人工确认
+      paused_at: human_review
+
+  - id: sensitive_amount
+    user_query: "查询新信贷的逾期本金"
+    user_id: u_xxd
+    data_scope: [risk_mart]
+    expect:
+      sensitive: true         # 金额字段聚合触发敏感
+      paused_at: human_review # 在人工确认处暂停,不会自动执行

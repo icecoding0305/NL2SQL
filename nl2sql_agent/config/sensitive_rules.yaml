@@ -1,0 +1,23 @@
+# 敏感判定规则(模块 9)
+# 命中任一条即进入人工确认(interrupt),判定标准全部可配,供风控同事自行调整。
+sensitive_rules:
+  # 敏感字段列表:SQL 引用到这些字段即触发(基于 dwd_ar_loan_info 真实字段)
+  sensitive_fields:
+    - {name: IDNUM, keywords: [身份证, 证件号, 证件号码, idnum]}
+    - {name: NAME, keywords: [姓名]}
+
+  # 扫描量属于硬安全边界，超限直接阻断，不进入无法兑现的人工审批。
+  # 如业务允许审批后越过该阈值，可将 action 改为 approval_required，
+  # 并同步提高 settings.yaml 中 execution.explain_row_threshold 的硬上限。
+  explain_scan:
+    threshold: 1000000
+    action: hard_block
+
+  # 涉及金额类字段的汇总或导出即触发(按字段名/注释关键字识别)
+  amount_field_keywords: [金额, 贷款金额, 本金, 余额, amount, principal]
+
+  aggregation_trigger:
+    enabled: true
+
+  export_trigger:
+    enabled: true

@@ -1,0 +1,42 @@
+# 表结构入库配置(schema_ingest)
+quality_check:
+  # 表注释少于该字数视为"空"
+  min_table_comment_length: 4
+  # 字段注释覆盖率低于该比例 → 整张表打回待审核
+  min_column_comment_coverage: 0.8
+  # 覆盖率达标仍不能放过剩余空字段；每列都必须有最低质量描述
+  require_all_columns: true
+  min_column_comment_length: 2
+  generic_comments: [字段, 数据, 相关字段, 业务字段, 暂无]
+
+# XiYan 思路的轻量字段画像:每张变化表只执行一次受限采样，不跑全表 COUNT DISTINCT
+profiling:
+  enabled: true
+  sample_size: 100
+  example_limit: 3
+
+# 规则优先分类，低基数维度识别为 enum；不对每一列单独调用 LLM
+classification:
+  enum_max_distinct: 20
+
+# M-Schema 输出；相对路径从项目根目录解析
+artifact_dir: data/schema
+prompt_version: enterprise-xiyan-v1
+
+# 字段级 embedding 文本分组(几十上百个字段拼一条会损失检索精度)
+columns_per_chunk: 15
+
+# 敏感字段标注关键字(列名/注释命中即标 sensitive,取值需脱敏)
+sensitive_patterns:
+  - "身份证"
+  - "证件号"
+  - "证件号码"
+  - "证件"
+  - "手机"
+  - "电话"
+  - "mobile"
+  - "idnum"
+  - "idcard"
+
+# 脱敏样例值取样数
+sample_limit: 3

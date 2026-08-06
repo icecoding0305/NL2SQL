@@ -1,0 +1,68 @@
+# 澄清规则
+# - 模块 2(时间范围):只在缺时间范围时拦截
+# - 模块 3.5(检索后置信度):术语是否收录不再是澄清依据,改为看检索置信度分布
+#
+# sensitivity(0~1):时间范围规则的判定阈值。数值越低越容易触发;误报多就调高。
+clarification_rules:
+  enabled: true
+  sensitivity: 0.5
+
+  # ---------- 模块 2:问题理解与改写 ----------
+  query_resolution:
+    # auto:高置信通用语法走确定性解析；多轮、排序、同比/环比、多事实等复杂表达才调用 LLM。
+    use_llm: auto
+    auto_min_confidence: 0.7
+    llm_required_markers: [最新, 最早, 排名, 前, top, 同比, 环比, 占比, 增长率, 分别, 每个, 或者, 任一, 除外, 连续]
+
+  # ---------- 模块 2:缺时间范围 ----------
+  time_range_missing:
+    enabled: true
+    reliability: 1.0
+    # 命中这些词视为"问题表现出时间意图"
+    time_intent_keywords: [时间, 期间, 月份, 季度, 周, 年, 月, 日期, 日, date, 最近, 本期, 时间段, 时段]
+    # 命中这些模式视为"已经有了明确时间范围",不再追问
+    # 注意支持中文数字与量词:如"近三个月""最近两个月"
+    range_present_patterns:
+      - "近[0-9一二三四五六七八九十百千]+个?[天日月周]"
+      - "最近[0-9一二三四五六七八九十百千]+个?[天日月周]"
+      - "\\d{4}[-年/.]\\d{1,2}"
+      - "今年以来|上月|本月|本季度|本年度|上周|本周|去年|今年"
+      - "Q[1-4]|第[一二三四]季度"
+      - "到|至|~|>=|<=|>|<|between|以来|至今|起止"
+    message: "请补充查询的时间范围(起止时间)"
+
+  # ---------- 模块 3.5:检索后置信度判定 ----------
+  retrieval_confidence:
+    # 检索置信度低于该值 → 低置信澄清(问用户是否继续)
+    confidence_threshold: 0.7
+    # Top-2 候选置信度差小于该值 → 视为相近候选,触发候选澄清
+    candidate_gap_threshold: 0.1
+    # 候选判断优先使用相对差距，避免低分区间被绝对阈值放大
+    candidate_gap_ratio: 0.15
+    # 术语层命中后,向量补充关联表的数量(解决多表 join 查询缺表)
+    supplement_top_n: 3
+    # 补充表最低置信度(低于此值不补充,避免完全无关的表)
+    supplement_threshold: 0.1
+    supplement_relative_threshold: 0.45
+    # 字段相关加成权重:查询剩余词(去掉已命中术语)命中表字段时,
+    # 给该表 +权重×命中次数 的补充加分,让语义相关的表(如学历→客户表)优先
+    field_relevance_weight: 0.08
+    # 表级/字段级向量的融合权重；只有单路有结果时沿用该路原始分数
+    table_vector_weight: 0.65
+    column_vector_weight: 0.35
+    # 关系向量只补充与主候选直接相连的表，避免无约束扩散
+    relation_expand_top_n: 2
+    relation_threshold: 0.1
+    max_join_path_hops: 3
+    # 字段/过滤型问题提高字段向量权重，主题/汇总型问题保留表级权重
+    field_query_markers: [为, 等于, 超过, 不超过, 至少, 至多, 大于, 小于, 高于, 低于, 包含, 按, 分组, 明细, 字段, 哪些客户]
+    field_query_table_weight: 0.4
+    field_query_column_weight: 0.6
+    # 显式领域查询扩展；集中配置，避免散落在术语 alias 中
+    query_expansions:
+      借了多少: [贷款金额, 放款金额]
+      放了多少款: [放款金额, 贷款金额]
+      坏账: [不良贷款, 逾期, 核销]
+      不良: [不良贷款, 逾期]
+      代偿: [代偿金额, 代偿记录]
+      销账: [核销, 坏账]

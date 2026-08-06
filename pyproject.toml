@@ -1,0 +1,43 @@
+[project]
+name = "nl2sql"
+version = "0.1.0"
+description = "基于 LangGraph 的 NL2SQL 智能体(多业务线、权限安全、人工确认)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.1",
+    "langgraph-checkpoint>=4.0",
+    "pydantic>=2.10",
+    "sqlglot>=30.14",
+    "anthropic>=0.40",
+    "openai>=1.40",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+    "psycopg>=3.2",
+    "pymysql>=1.1",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "sentence-transformers>=3.0",
+    "modelscope>=1.39.0",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["nl2sql_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["nl2sql_agent/tests"]
+addopts = "-q"

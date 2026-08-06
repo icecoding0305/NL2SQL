@@ -1,0 +1,17 @@
+# 少量高影响业务状态谓词。它们不是问法枚举，而是经治理的业务定义。
+business_predicates:
+  current_overdue:
+    concept: 逾期
+    aliases: [逾期]
+    subject: 贷款
+    related_concept: 贷款
+    temporal_default: current
+    binding_concept: 逾期本金余额
+    operator: ">"
+    value: 0
+    assumption: “有逾期”按当前逾期理解，即逾期本金余额大于0
+    status: approved
+
+semantic_defaults:
+  conjunction_scope: same_record
+  conjunction_scope_assumption: 贷款金额和逾期条件按同一笔贷款记录理解

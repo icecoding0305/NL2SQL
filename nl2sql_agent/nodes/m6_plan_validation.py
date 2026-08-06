@@ -1,0 +1,226 @@
+"""模块 6:计划校验(拦截业务逻辑错误的关键卡点)。
+
+对照 Schema 检索结果与术语映射表做交叉核对:
+- target_tables 和引用字段是否都在 retrieved_schema 范围内
+- metric_logic 若引用术语映射表里的复合口径,定义是否与映射表一致
+
+校验不过把具体错误写入 plan_validation_errors,退回模块 5b 重试;
+达到上限(max_plan_retries,比 SQL 重试更严格,默认 2)直接结束,提示人工介入。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from nl2sql_agent.state import NL2SQLState, QueryPlan, SchemaPlan
+from nl2sql_agent.services.semantic_parser import required_atom_ids, semantic_atom_map
+from nl2sql_agent.services.logical_planner import validate_logical_plan
+from nl2sql_agent.services.term_mapping import TermResolutionStatus
+
+
+def _iter_referenced_fields(plan: QueryPlan):
+    for f in plan.filters:
+        yield f"{f.table}.{f.column}" if f.table else f.column
+    for col in plan.group_by:
+        yield str(col)
+    if plan.metric_logic:
+        yield from plan.metric_logic.columns
+    for output in plan.output_fields:
+        if output.table and output.column:
+            yield f"{output.table}.{output.column}"
+    yield from plan.output_grain.keys
+
+
+def _validate_field_ref(
+    field: str,
+    table_cols: dict[str, set[str]],
+    target_tables: set[str],
+) -> str | None:
+    """校验字段归属；多表同名字段必须显式限定表名。"""
+    if not field:
+        return None
+    if "." in field:
+        table, column = field.rsplit(".", 1)
+        if table not in target_tables:
+            return f"字段 {field} 引用了计划外表 {table}"
+        if column not in table_cols.get(table, set()):
+            return f"表 {table} 不存在字段 {column}"
+        return None
+    owners = [table for table in target_tables if field in table_cols.get(table, set())]
+    if not owners:
+        return f"引用了不存在的字段 {field}"
+    if len(owners) > 1:
+        return f"字段 {field} 同时存在于多张目标表 {sorted(owners)},必须限定表名"
+    return None
+
+
+def validate_plan(
+    plan: QueryPlan,
+    retrieved_schema,
+    term_mapping,
+    data_scope: list[str],
+    schema_plan: SchemaPlan | None = None,
+    semantic_graph=None,
+    semantic_bindings: dict | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    known_tables = {h.table_name for h in retrieved_schema}
+    table_cols = {h.table_name: {c["name"] for c in h.columns} for h in retrieved_schema}
+    target_tables = set(plan.target_tables)
+
+    # 0. 所有高影响语义原子必须显式进入计划，禁止静默漏掉用户条件。
+    required_atoms = required_atom_ids(semantic_graph)
+    implemented_atoms: set[str] = set()
+    for item in plan.filters:
+        implemented_atoms.update(item.source_atom_ids)
+    for item in plan.join_logic:
+        implemented_atoms.update(item.source_atom_ids)
+    if plan.metric_logic:
+        implemented_atoms.update(plan.metric_logic.source_atom_ids)
+    declared_atoms = set(plan.covered_atom_ids)
+    missing_atoms = required_atoms - implemented_atoms
+    unknown_atoms = implemented_atoms - required_atoms
+    if missing_atoms:
+        errors.append(f"QueryPlan 遗漏高影响语义条件 {sorted(missing_atoms)}")
+    if unknown_atoms:
+        errors.append(f"QueryPlan 声明了不存在的语义条件 {sorted(unknown_atoms)}")
+    if declared_atoms != implemented_atoms:
+        errors.append(
+            "covered_atom_ids 必须与实际 filter/join/metric 的 source_atom_ids 完全一致: "
+            f"covered={sorted(declared_atoms)}, implemented={sorted(implemented_atoms)}"
+        )
+    atom_map = semantic_atom_map(semantic_graph)
+    semantic_bindings = semantic_bindings or {}
+    for filter_spec in plan.filters:
+        for atom_id in filter_spec.source_atom_ids:
+            atom = atom_map.get(atom_id)
+            if atom and atom.predicate_type in {"comparison", "aggregate_comparison", "status"}:
+                if filter_spec.operator != atom.operator or filter_spec.value != atom.value:
+                    errors.append(
+                        f"语义条件 {atom_id} 的操作符/值与计划不一致: "
+                        f"语义={atom.operator} {atom.value!r}, "
+                        f"计划={filter_spec.operator} {filter_spec.value!r}"
+                    )
+            binding = semantic_bindings.get(atom_id)
+            if binding and (
+                filter_spec.table != binding.get("table_name")
+                or filter_spec.column != binding.get("column_name")
+                or filter_spec.operator != binding.get("operator")
+                or filter_spec.value != binding.get("value")
+            ):
+                errors.append(
+                    f"语义条件 {atom_id} 未采用已确认的 Schema 绑定: "
+                    f"期望={binding.get('table_name')}.{binding.get('column_name')} "
+                    f"{binding.get('operator')} {binding.get('value')!r}"
+                )
+
+    # 1. target_tables 必须都在检索结果内
+    for t in plan.target_tables:
+        if t not in known_tables:
+            errors.append(f"target_tables 中的表 {t} 不在检索到的 schema 内")
+
+    # 2. join 引用的表
+    for j in plan.join_logic:
+        for tbl in (j.left_table, j.right_table):
+            if tbl not in known_tables:
+                errors.append(f"join 引用了未检索到的表 {tbl}")
+            elif tbl not in target_tables:
+                errors.append(f"join 引用了 target_tables 未声明的表 {tbl}")
+        if j.left_column not in table_cols.get(j.left_table, set()):
+            errors.append(f"join 左表 {j.left_table} 不存在字段 {j.left_column}")
+        if j.right_column not in table_cols.get(j.right_table, set()):
+            errors.append(f"join 右表 {j.right_table} 不存在字段 {j.right_column}")
+
+        if schema_plan is not None:
+            allowed = any(
+                (
+                    relation.get("source_table") == j.left_table
+                    and relation.get("target_table") == j.right_table
+                    and j.left_column in relation.get("source_columns", [])
+                    and j.right_column in relation.get("target_columns", [])
+                ) or (
+                    relation.get("source_table") == j.right_table
+                    and relation.get("target_table") == j.left_table
+                    and j.right_column in relation.get("source_columns", [])
+                    and j.left_column in relation.get("target_columns", [])
+                )
+                for relation in schema_plan.relations
+            )
+            if not allowed:
+                errors.append(
+                    f"join {j.left_table}.{j.left_column} -> "
+                    f"{j.right_table}.{j.right_column} 不在已规划关系子图中"
+                )
+
+    # 3. 引用字段必须存在于某个检索表
+    for field in _iter_referenced_fields(plan):
+        error = _validate_field_ref(field, table_cols, target_tables)
+        if error:
+            errors.append(error)
+
+    # 4. SchemaPlan 中的事实、实体和桥接表必须完整落入 QueryPlan。
+    if schema_plan is not None:
+        required_tables = {
+            item.table_name
+            for item in [
+                *schema_plan.anchor_tables,
+                *schema_plan.dimension_tables,
+                *schema_plan.bridge_tables,
+            ]
+        }
+        missing = required_tables - target_tables
+        if missing:
+            errors.append(f"QueryPlan 缺少 SchemaPlan 必需表 {sorted(missing)}")
+
+    # 5. metric_logic 的复合口径必须与术语映射一致
+    ml = plan.metric_logic
+    if ml and ml.metric_name:
+        res = term_mapping.resolve(ml.metric_name, data_scope)
+        if res.status == TermResolutionStatus.FOUND:
+            entry = res.entries[0]
+            if entry.composite_metric and ml.definition != entry.definition:
+                errors.append(
+                    f"指标 {ml.metric_name} 的 definition 与术语映射不一致: "
+                    f"计划={ml.definition!r}, 映射={entry.definition!r}"
+                )
+
+    return errors
+
+
+def make_plan_validation_node(deps):
+    def plan_validation_node(state: NL2SQLState) -> NL2SQLState | dict:
+        if state.query_plan is None:
+            # 上一轮结构化解析失败(query_plan 为空),视为计划未通过
+            errors = [*(state.plan_validation_errors or []), "计划未生成,重新生成"]
+        else:
+            errors = validate_plan(
+                state.query_plan,
+                state.retrieved_schema,
+                deps.term_mapping,
+                state.data_scope,
+                state.schema_plan,
+                state.semantic_graph,
+                state.semantic_bindings,
+            )
+            if state.logical_plan is None:
+                errors.append("LogicalPlan 未生成")
+            elif state.query_mschema is None:
+                errors.append("Query M-Schema 未生成")
+            else:
+                errors.extend(validate_logical_plan(state.logical_plan, state.query_mschema))
+
+        # retry_count 只统计失败后的重试，不把首次成功校验计为一次重试。
+        new_count = state.plan_retry_count + (1 if errors else 0)
+        out: dict[str, Any] = {
+            "plan_validation_errors": errors,
+            "plan_retry_count": new_count,
+        }
+        if errors and new_count >= state.max_plan_retries:
+            # 反复生成不对的计划通常说明问题本身有歧义,不要继续重试
+            out["final_answer"] = (
+                "查询计划多次生成失败,问题可能存在歧义,请人工介入\n"
+                + "；".join(errors[:5])
+            )
+        return out
+
+    return plan_validation_node

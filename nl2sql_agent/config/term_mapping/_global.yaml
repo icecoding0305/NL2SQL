@@ -1,0 +1,42 @@
+# 跨业务线(平台)通用术语映射,基于 dwd_ar_loan_info 借据表
+# 业务线 = PLATFORM_CODE(如 XXD 新信贷 / ZJ 字节 / WL 蔚来),共享同一套口径
+逾期本金:
+  business_line: global
+  resolved_fields: [OVD_BAL]
+  definition: "逾期本金余额(OVD_BAL)"
+  composite_metric: false
+  aliases: [逾期金额, 逾期本金余额]
+
+逾期率:
+  business_line: global
+  resolved_fields: [OVD_BAL, LOAN_STATUS]
+  definition: "逾期借据数 / 总借据数(OVD_BAL>0 视为逾期)"
+  composite_metric: true
+  aliases: [逾期贷款率]
+
+贷款余额:
+  business_line: global
+  resolved_fields: [PRIN_BAL]
+  definition: "贷款本金余额(PRIN_BAL)"
+  composite_metric: false
+  aliases: [本金余额, 余额]
+
+贷款金额:
+  business_line: global
+  resolved_fields: [LOAN_AMT]
+  definition: "贷款金额(LOAN_AMT)"
+  composite_metric: false
+  aliases: [放款金额, 放款额]
+
+正常本金:
+  business_line: global
+  resolved_fields: [NORMAL_BAL]
+  definition: "正常本金余额(NORMAL_BAL)"
+  composite_metric: false
+
+借据笔数:
+  business_line: global
+  resolved_fields: [LOAN_NO]
+  definition: "借据笔数(COUNT LOAN_NO)"
+  composite_metric: false
+  aliases: [借据数, 贷款笔数]

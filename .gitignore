@@ -1,0 +1,25 @@
+# 本地敏感配置
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# 测试与工具
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行时数据(查询历史/审计 SQLite)
+data/
+logs/
+
+# 本地 embedding 模型缓存
+models/
+
+# 前端
+web/node_modules/
+web/dist/

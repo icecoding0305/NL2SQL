@@ -1,0 +1,31 @@
+# 少样本示例库(模块 7 简单路径使用),基于真实借据表 dwd_ar_loan_info
+# 注意:
+# - 行级权限过滤(WHERE PLATFORM_CODE IN (...))由模块 8 代码自动注入,示例里不写,
+#   但 SQL 只应引用 schema 内真实表/字段
+# - 语法为 MySQL(与 dialect 一致)
+# - 反馈闭环:人工确认通过的案例可回流到此处(暂未接入图内,预留 add_example 接口)
+examples:
+  - user_query: "查询新信贷的借据笔数"
+    sql: "SELECT COUNT(*) AS cnt FROM dwd_ar_loan_info"
+    used_tables: [dwd_ar_loan_info]
+    tags: [count, simple]
+
+  - user_query: "查询新信贷的逾期本金"
+    sql: "SELECT SUM(OVD_BAL) AS total_ovd FROM dwd_ar_loan_info"
+    used_tables: [dwd_ar_loan_info]
+    tags: [sum, amount]
+
+  - user_query: "查询新信贷的贷款余额"
+    sql: "SELECT SUM(PRIN_BAL) AS total_balance FROM dwd_ar_loan_info"
+    used_tables: [dwd_ar_loan_info]
+    tags: [sum, amount]
+
+  - user_query: "查询新信贷的贷款金额"
+    sql: "SELECT SUM(LOAN_AMT) AS total FROM dwd_ar_loan_info"
+    used_tables: [dwd_ar_loan_info]
+    tags: [sum, amount]
+
+  - user_query: "查询新信贷的逾期借据清单"
+    sql: "SELECT LOAN_NO, LOAN_STATUS, OVD_BAL FROM dwd_ar_loan_info WHERE OVD_BAL > 0"
+    used_tables: [dwd_ar_loan_info]
+    tags: [where, overdue]

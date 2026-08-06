@@ -1,0 +1,5 @@
+# 向量存储后端配置(显式选择,而不是靠环境变量隐式二选一)
+# backend: memory(内存,重启重建) / pgvector(Postgres + pgvector 扩展)
+backend: memory
+pgvector:
+  url: ${PGVECTOR_URL}

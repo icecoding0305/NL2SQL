@@ -1,0 +1,16 @@
+# 复杂度判断规则(模块 4,纯确定性规则,不调 LLM)
+# 偏保守:宁可让本可简单的查询多走一次计划,也不要漏判真正复杂的查询
+# (漏判的后果是业务逻辑错误,更难被校验发现)。
+complexity_rules:
+  # conservative: true 时,任意一条规则命中即判定为复杂
+  conservative: true
+
+  # 涉及表数量 >= 该阈值 → 复杂
+  multi_table_threshold: 2
+
+  # 命中术语映射表里 composite_metric: true 的指标 → 复杂
+  composite_metric_trigger: true
+
+  # 命中多步聚合语义关键词 → 复杂
+  multi_step_keywords: [同比, 环比, 累计, 环比增长, 同比增长, 留存率, 转化率, 占比, 逐月, 滚动, 排名, 均值]
+  keyword_trigger: true

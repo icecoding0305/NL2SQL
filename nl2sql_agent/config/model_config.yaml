@@ -1,0 +1,23 @@
+# 模型配置
+runtime:
+  # 主模型独立使用 LLM_PROVIDER / DEEPSEEK_MODEL 配置，不复用 SQL 模型。
+  main_model_source: default
+
+embedding:
+  # local:本地 sentence-transformers(需可下载/离线缓存模型)
+  # fake:测试用确定性词袋向量(不依赖模型,仅测试)
+  provider: local
+  model: paraphrase-multilingual-MiniLM-L12-v2
+  # 本地已下载的模型目录(相对项目根解析);不配则按 model 名从 huggingface 下载
+  model_path: models/models/sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/master
+  dimension: 384
+  # 同一查询会检索表/字段/关系三个集合，复用其单条查询向量。
+  query_cache_size: 256
+  # 该模型为默认基线。更换中文金融领域模型前，应使用真实标注集对比
+  # Recall@K、字段召回率、Join 路径正确率和澄清率，并同步修改 dimension。
+
+# 各节点模型(离线/专用任务可用更便宜模型)
+nodes:
+  schema_comment_generation:
+    # 表注释缺失时辅助生成候选注释(离线任务,用便宜模型即可)
+    model: deepseek-chat

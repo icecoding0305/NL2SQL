@@ -1,0 +1,14 @@
+langgraph>=1.1
+langgraph-checkpoint>=4.0
+langgraph-checkpoint-sqlite>=3.1.1
+pydantic>=2.10
+sqlglot>=30.14
+anthropic>=0.40
+openai>=1.40
+PyYAML>=6.0
+python-dotenv>=1.0
+psycopg>=3.2
+pymysql>=1.1
+fastapi>=0.115
+uvicorn>=0.30
+pytest>=8.0

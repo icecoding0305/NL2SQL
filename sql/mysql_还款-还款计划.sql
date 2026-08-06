@@ -1,0 +1,25 @@
+-- 还款计划 DWD_EV_REPAY_PLAN(Hive DDL 转 MySQL)
+-- 在 nl2sql 库手动执行:
+--   mysql -h mysql5.sqlpub.com -P 3310 -u fbrisk -p nl2sql < sql/mysql_还款-还款计划.sql
+CREATE TABLE IF NOT EXISTS `dwd_ev_repay_plan` (
+  `LOAN_NO` VARCHAR(100) NOT NULL COMMENT '借据编号',
+  `PRD_CODE` VARCHAR(100) COMMENT '产品编号',
+  `LOAN_AMT` DECIMAL(24,6) COMMENT '放款金额',
+  `TRANS_DATE` DATE COMMENT '资产转让日',
+  `TRANS_AMT` DECIMAL(24,6) COMMENT '资产转让放款金额',
+  `TOTAL_TERMS` INT COMMENT '总期数',
+  `TERM_NO` INT NOT NULL COMMENT '当前期数',
+  `RPY_AMT` DECIMAL(24,6) COMMENT '应还总金额',
+  `RPY_PRINC` DECIMAL(24,6) COMMENT '应还本金',
+  `RPY_INT` DECIMAL(24,6) COMMENT '应还利息',
+  `RPY_OVD` DECIMAL(24,6) COMMENT '应还罚息',
+  `START_DATE` DATE COMMENT '本期开始日期',
+  `END_DATE` DATE COMMENT '本期结束日期',
+  `INT_START_DATE` DATE COMMENT '起息日',
+  `FREE_INT_DAY` INT COMMENT '宽限期',
+  `UPDATE_DATE` DATE COMMENT '最新更新日期',
+  `PLATFORM_CODE` VARCHAR(100) COMMENT '平台代码',
+  PRIMARY KEY (`LOAN_NO`, `TERM_NO`),
+  CONSTRAINT `fk_plan_loan` FOREIGN KEY (`LOAN_NO`) REFERENCES `dwd_ar_loan_info` (`LOAN_NO`)
+    ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='事件-还款-还款计划';
