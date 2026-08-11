@@ -18,10 +18,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from pydantic import BaseModel
+
+from nl2sql_agent.services.llm_telemetry import annotate_last_call, record_call, usage_value
 
 
 class EnvConfigError(RuntimeError):
@@ -122,8 +125,10 @@ class BaseLLMClient(ABC):
                 data = json.loads(extract_json(text))
                 if not _valid(data):
                     raise ValueError(f"输出缺少目标字段 {keys}(疑似回显 schema 定义)")
+                annotate_last_call(status="json_valid")
                 return data
             except Exception as e:  # noqa: BLE001
+                annotate_last_call(status="json_invalid", error=e)
                 last_err = e
         raise ValueError(f"LLM 结构化输出多次解析失败: {last_err}")
 
@@ -141,8 +146,11 @@ class BaseLLMClient(ABC):
             previous_data = None
             try:
                 previous_data = self.complete_json(attempt_prompt, schema, retries=0)
-                return model.model_validate(previous_data)
+                result = model.model_validate(previous_data)
+                annotate_last_call(status="pydantic_valid")
+                return result
             except Exception as e:  # noqa: BLE001
+                annotate_last_call(status="pydantic_invalid", error=e)
                 last_err = e
                 previous_text = json.dumps(
                     previous_data, ensure_ascii=False, default=str
@@ -205,14 +213,41 @@ class AnthropicLLMClient(BaseLLMClient):
         return cls(anthropic.Anthropic(api_key=api_key), model=model)
 
     def complete(self, prompt: str, max_tokens: int = 2000) -> str:
-        resp = self.client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(
-            block.text for block in resp.content if getattr(block, "type", "") == "text"
-        )
+        started_at = time.perf_counter()
+        try:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = "".join(
+                block.text for block in resp.content if getattr(block, "type", "") == "text"
+            )
+            usage = getattr(resp, "usage", None)
+            record_call(
+                provider="anthropic",
+                model=self.model,
+                operation="complete",
+                started_at=started_at,
+                prompt_chars=len(prompt),
+                max_tokens=max_tokens,
+                output_chars=len(content),
+                prompt_tokens=usage_value(usage, "input_tokens"),
+                completion_tokens=usage_value(usage, "output_tokens"),
+                request_id=getattr(resp, "id", None),
+            )
+            return content
+        except Exception as exc:
+            record_call(
+                provider="anthropic",
+                model=self.model,
+                operation="complete",
+                started_at=started_at,
+                prompt_chars=len(prompt),
+                max_tokens=max_tokens,
+                error=exc,
+            )
+            raise
 
     def _complete_tool(self, prompt: str, name: str, description: str, schema: dict) -> dict | None:
         resp = self.client.messages.create(
@@ -254,13 +289,40 @@ class DeepSeekLLMClient(BaseLLMClient):
         return cls(openai.OpenAI(api_key=api_key, base_url=base_url), model=model)
 
     def complete(self, prompt: str, max_tokens: int = 2000) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = resp.choices[0].message.content
-        return content or ""
+        started_at = time.perf_counter()
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = resp.choices[0].message.content or ""
+            usage = getattr(resp, "usage", None)
+            record_call(
+                provider="openai_compatible",
+                model=self.model,
+                operation="complete",
+                started_at=started_at,
+                prompt_chars=len(prompt),
+                max_tokens=max_tokens,
+                output_chars=len(content),
+                prompt_tokens=usage_value(usage, "prompt_tokens", "input_tokens"),
+                completion_tokens=usage_value(usage, "completion_tokens", "output_tokens"),
+                total_tokens=usage_value(usage, "total_tokens"),
+                request_id=getattr(resp, "id", None) or getattr(resp, "_request_id", None),
+            )
+            return content
+        except Exception as exc:
+            record_call(
+                provider="openai_compatible",
+                model=self.model,
+                operation="complete",
+                started_at=started_at,
+                prompt_chars=len(prompt),
+                max_tokens=max_tokens,
+                error=exc,
+            )
+            raise
 
     def _complete_tool(self, prompt: str, name: str, description: str, schema: dict) -> dict | None:
         # DeepSeek 的 thinking/reasoning 模式不支持 tool_choice(会 400),
@@ -268,13 +330,117 @@ class DeepSeekLLMClient(BaseLLMClient):
         return None
 
 
-def _load_nodes_config() -> dict:
+class OpenAICompatibleLLMClient(DeepSeekLLMClient):
+    """Generic OpenAI-compatible client configured entirely from YAML."""
+
+    def __init__(self, client, model: str, *, supports_tool_calling: bool = True):
+        super().__init__(client, model)
+        self.supports_tool_calling = supports_tool_calling
+
+    def _complete_tool(self, prompt: str, name: str, description: str, schema: dict) -> dict | None:
+        if not self.supports_tool_calling:
+            return None
+        started_at = time.perf_counter()
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[{
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": schema,
+                    },
+                }],
+                tool_choice={"type": "function", "function": {"name": name}},
+            )
+            message = resp.choices[0].message
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if not tool_calls:
+                return None
+            arguments = tool_calls[0].function.arguments
+            data = json.loads(arguments) if isinstance(arguments, str) else arguments
+            usage = getattr(resp, "usage", None)
+            record_call(
+                provider="openai_compatible",
+                model=self.model,
+                operation="tool_call",
+                started_at=started_at,
+                prompt_chars=len(prompt),
+                max_tokens=2000,
+                output_chars=len(arguments) if isinstance(arguments, str) else 0,
+                prompt_tokens=usage_value(usage, "prompt_tokens", "input_tokens"),
+                completion_tokens=usage_value(usage, "completion_tokens", "output_tokens"),
+                total_tokens=usage_value(usage, "total_tokens"),
+                request_id=getattr(resp, "id", None) or getattr(resp, "_request_id", None),
+            )
+            return data
+        except Exception as exc:
+            record_call(
+                provider="openai_compatible",
+                model=self.model,
+                operation="tool_call",
+                started_at=started_at,
+                prompt_chars=len(prompt),
+                max_tokens=2000,
+                error=exc,
+            )
+            raise
+
+
+def build_llm_from_config(config: dict) -> BaseLLMClient:
+    """Build a provider client from ``model_config.yaml`` without embedding secrets."""
+    if config.get("api_key"):
+        raise EnvConfigError("model_config.yaml 禁止直接保存 api_key，请使用 api_key_env")
+    provider = str(config.get("provider") or "").strip().lower().replace("-", "_")
+    model = str(config.get("model") or "").strip()
+    api_key_env = str(config.get("api_key_env") or "").strip()
+    if not provider:
+        raise EnvConfigError("model_config.yaml 缺少 runtime.provider")
+    if not model:
+        raise EnvConfigError("model_config.yaml 缺少 runtime.model")
+    if not api_key_env:
+        raise EnvConfigError("model_config.yaml 缺少 runtime.api_key_env")
+    api_key = os.getenv(api_key_env)
+    if not api_key:
+        raise EnvConfigError(f"模型密钥环境变量 {api_key_env} 未设置")
+
+    if provider == "anthropic":
+        import anthropic
+
+        return AnthropicLLMClient(anthropic.Anthropic(api_key=api_key), model=model)
+    if provider in {"deepseek", "openai", "openai_compatible"}:
+        import openai
+
+        base_url = str(config.get("base_url") or "").strip()
+        if provider == "deepseek" and not base_url:
+            base_url = "https://api.deepseek.com"
+        if not base_url:
+            raise EnvConfigError("OpenAI 兼容模型必须在 model_config.yaml 配置 base_url")
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        if provider == "deepseek":
+            return DeepSeekLLMClient(client, model=model)
+        return OpenAICompatibleLLMClient(
+            client,
+            model=model,
+            supports_tool_calling=bool(config.get("supports_tool_calling", True)),
+        )
+    raise EnvConfigError(f"不支持的模型 provider: {provider}")
+
+
+def _load_model_config() -> dict:
     from pathlib import Path
 
     from nl2sql_agent.services.config_loader import ConfigLoader
 
     cfg_dir = Path(__file__).resolve().parent.parent / "config"
-    return (ConfigLoader(cfg_dir).load("model_config.yaml") or {}).get("nodes", {})
+    return ConfigLoader(cfg_dir).load("model_config.yaml") or {}
+
+
+def _load_nodes_config() -> dict:
+    return _load_model_config().get("nodes", {})
 
 
 def get_model_for_node(node_key: str) -> BaseLLMClient:
@@ -282,16 +448,26 @@ def get_model_for_node(node_key: str) -> BaseLLMClient:
 
     未配置该节点 → 回退主模型。
     """
-    cfg = _load_nodes_config().get(node_key, {})
-    model = cfg.get("model")
+    config = _load_model_config()
+    runtime = dict(config.get("runtime") or {})
+    node_cfg = dict((config.get("nodes") or {}).get(node_key) or {})
+    if runtime.get("provider"):
+        if node_cfg.get("inherit", "runtime") == "runtime":
+            merged = runtime
+        else:
+            merged = {**runtime, **node_cfg}
+        return build_llm_from_config(merged)
+
+    # Legacy environment-driven fallback.
+    model = node_cfg.get("model")
     if not model:
         return build_llm()
     import openai
 
     return DeepSeekLLMClient(
         openai.OpenAI(
-            api_key=cfg.get("api_key") or os.getenv("DEEPSEEK_API_KEY"),
-            base_url=cfg.get("base_url")
+            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            base_url=node_cfg.get("base_url")
             or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         ),
         model=model,
@@ -303,8 +479,10 @@ def _is_deepseek() -> bool:
     return provider == "deepseek" or (not provider and os.getenv("DEEPSEEK_API_KEY"))
 
 
-def build_llm() -> BaseLLMClient:
+def build_llm(config: dict | None = None) -> BaseLLMClient:
     """主模型(按环境变量选择 provider),用于计划生成、结果解释等思考类任务。"""
+    if config and config.get("provider"):
+        return build_llm_from_config(config)
     return DeepSeekLLMClient.from_env() if _is_deepseek() else AnthropicLLMClient.from_env()
 
 

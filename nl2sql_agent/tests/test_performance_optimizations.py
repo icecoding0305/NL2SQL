@@ -65,7 +65,7 @@ def test_plan_without_explicit_outputs_uses_compatibility_fallback():
 def test_main_model_is_independent_from_configured_sql_model(monkeypatch):
     main_model = FakeLLM()
     sql_model = FakeLLM()
-    monkeypatch.setattr("nl2sql_agent.services.deps.build_llm", lambda: main_model)
+    monkeypatch.setattr("nl2sql_agent.services.deps.build_llm", lambda config=None: main_model)
     deps = build_deps(
         sql_llm=sql_model,
         executor=InMemoryExecutor(tables={}),
@@ -73,6 +73,23 @@ def test_main_model_is_independent_from_configured_sql_model(monkeypatch):
     )
     assert deps.llm is main_model
     assert deps.sql_llm is sql_model
+    assert deps.config.approval_enabled is False
+
+
+def test_unified_runtime_reuses_main_model_for_sql_fallback(monkeypatch):
+    main_model = FakeLLM()
+    main_model.model = "configured-model"
+    monkeypatch.setattr(
+        "nl2sql_agent.services.deps.build_llm", lambda config=None: main_model
+    )
+    deps = build_deps(
+        executor=InMemoryExecutor(tables={}),
+        vector_store=object(),
+    )
+    assert deps.llm is main_model
+    assert deps.sql_llm is main_model
+    assert deps.node_llms == {}
+    assert deps.model_routes()["sql_model"]["source"] == "runtime.unified"
 
 
 def test_runtime_prompts_never_include_complete_retrieved_schema(deps):

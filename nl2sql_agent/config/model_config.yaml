@@ -1,7 +1,14 @@
 # 模型配置
 runtime:
-  # 主模型独立使用 LLM_PROVIDER / DEEPSEEK_MODEL 配置，不复用 SQL 模型。
-  main_model_source: default
+  # 单一模型配置源：主流程、节点任务与 SQL 生成兜底共用同一个模型。
+  # 后续切换模型只需修改本段；密钥只保存于环境变量，不得直接写入本文件。
+  unified: true
+  provider: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  # DeepSeek 当前走纯 JSON 文本解析；切换支持 function calling 的 OpenAI 兼容模型时可设 true。
+  supports_tool_calling: false
 
 embedding:
   # local:本地 sentence-transformers(需可下载/离线缓存模型)
@@ -18,6 +25,9 @@ embedding:
 
 # 各节点模型(离线/专用任务可用更便宜模型)
 nodes:
+  query_resolution:
+    inherit: runtime
+  plan_generation:
+    inherit: runtime
   schema_comment_generation:
-    # 表注释缺失时辅助生成候选注释(离线任务,用便宜模型即可)
-    model: deepseek-chat
+    inherit: runtime

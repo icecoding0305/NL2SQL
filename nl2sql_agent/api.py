@@ -87,9 +87,14 @@ def _state_to_dict(state: dict) -> dict:
         "sensitive_reasons": state.get("sensitive_reasons") or [],
         "execution_result": state.get("execution_result"),
         "execution_error": state.get("execution_error"),
+        "result_summary": (
+            state["result_summary"].model_dump() if state.get("result_summary") else None
+        ),
         "final_answer": state.get("final_answer"),
         "trace_steps": state.get("trace_steps") or [],
         "node_latencies": state.get("node_latencies") or {},
+        "node_latency_history": state.get("node_latency_history") or {},
+        "llm_calls": state.get("llm_calls") or [],
         "retry_count": state.get("retry_count", 0),
         "plan_retry_count": state.get("plan_retry_count", 0),
         "blocked_reason": state.get("blocked_reason"),
@@ -140,9 +145,12 @@ def _persist(
         retrieved_schema=d["retrieved_schema"],
         sensitive_reasons=d["sensitive_reasons"],
         execution_result=d["execution_result"],
+        result_summary=d["result_summary"],
         final_answer=d["final_answer"],
         trace_steps=d["trace_steps"],
         node_latencies=d["node_latencies"],
+        node_latency_history=d["node_latency_history"],
+        llm_calls=d["llm_calls"],
         retry_count=d["retry_count"],
         plan_retry_count=d["plan_retry_count"],
         approved=approved,
@@ -312,6 +320,8 @@ class ApproveRequest(BaseModel):
 
 @router.post("/query/{trace_id}/approve")
 async def api_approve(trace_id: str, body: ApproveRequest):
+    if not get_deps().config.approval_enabled:
+        raise HTTPException(404, "查询审批功能已临时关闭")
     row = _store.get_query(trace_id)
     if not row:
         raise HTTPException(404, f"trace {trace_id} 不存在")
@@ -384,6 +394,15 @@ async def api_resume(trace_id: str, body: ResumeRequest):
 
     threading.Thread(target=_resume, daemon=True).start()
     return {"trace_id": trace_id, "status": "resumed"}
+
+
+@router.get("/diagnostics/models")
+async def api_model_diagnostics():
+    """Expose effective model routing; secrets and endpoint URLs are never returned."""
+    return {
+        "routes": get_deps().model_routes(),
+        "note": "Whether a configured model was actually called is recorded in each query's llm_calls.",
+    }
 
 
 @router.get("/history")

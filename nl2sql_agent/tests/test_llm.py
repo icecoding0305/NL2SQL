@@ -8,10 +8,48 @@ from nl2sql_agent.services.llm import (
     AnthropicLLMClient,
     DeepSeekLLMClient,
     EnvConfigError,
+    OpenAICompatibleLLMClient,
     SQLResult,
     build_llm,
+    build_llm_from_config,
     extract_json,
 )
+
+
+def test_build_openai_compatible_llm_entirely_from_config(monkeypatch):
+    import openai
+
+    fake_client = object()
+    monkeypatch.setenv("TEST_MODEL_KEY", "secret")
+    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: fake_client)
+    client = build_llm_from_config({
+        "provider": "openai_compatible",
+        "model": "config-model",
+        "base_url": "https://model.example/v1",
+        "api_key_env": "TEST_MODEL_KEY",
+        "supports_tool_calling": False,
+    })
+    assert isinstance(client, OpenAICompatibleLLMClient)
+    assert client.client is fake_client
+    assert client.model == "config-model"
+    assert client.supports_tool_calling is False
+
+
+def test_config_model_rejects_inline_or_missing_secret(monkeypatch):
+    with pytest.raises(EnvConfigError, match="禁止直接保存"):
+        build_llm_from_config({
+            "provider": "deepseek",
+            "model": "m",
+            "api_key": "must-not-be-here",
+            "api_key_env": "MODEL_KEY",
+        })
+    monkeypatch.delenv("MISSING_MODEL_KEY", raising=False)
+    with pytest.raises(EnvConfigError, match="MISSING_MODEL_KEY"):
+        build_llm_from_config({
+            "provider": "deepseek",
+            "model": "m",
+            "api_key_env": "MISSING_MODEL_KEY",
+        })
 
 
 # ---------------- provider 选择 ----------------

@@ -9,8 +9,8 @@ clarification_rules:
 
   # ---------- 模块 2:问题理解与改写 ----------
   query_resolution:
-    # auto:高置信通用语法走确定性解析；多轮、排序、同比/环比、多事实等复杂表达才调用 LLM。
-    use_llm: auto
+    # 模型负责开放词汇语义解析；确定性解析仅作为失败兜底和完整性保护。
+    use_llm: always
     auto_min_confidence: 0.7
     llm_required_markers: [最新, 最早, 排名, 前, top, 同比, 环比, 占比, 增长率, 分别, 每个, 或者, 任一, 除外, 连续]
 

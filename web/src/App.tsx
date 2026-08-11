@@ -9,6 +9,7 @@ import {
   BulbOutlined,
 } from "@ant-design/icons";
 import ErrorBoundary from "./components/ErrorBoundary";
+import { APPROVAL_ENABLED } from "./config/features";
 const QueryPage = lazy(() => import("./pages/QueryPage"));
 const ApprovalsPage = lazy(() => import("./pages/ApprovalsPage"));
 const HistoryPage = lazy(() => import("./pages/HistoryPage"));
@@ -37,7 +38,9 @@ export default function App() {
           className="app-nav"
           items={[
             { key: "query", icon: <DatabaseOutlined />, label: "数据问答" },
-            { key: "approvals", icon: <CheckCircleOutlined />, label: "审批队列" },
+            ...(APPROVAL_ENABLED
+              ? [{ key: "approvals", icon: <CheckCircleOutlined />, label: "审批队列" }]
+              : []),
             { key: "schema", icon: <TableOutlined />, label: "表与注释" },
             { key: "history", icon: <HistoryOutlined />, label: "历史与审计" },
             { key: "config", icon: <SettingOutlined />, label: "配置管理" },
@@ -48,7 +51,7 @@ export default function App() {
         <ErrorBoundary>
           <Suspense fallback={<div style={{ height: "60vh", display: "grid", placeItems: "center" }}><Spin /></div>}>
             {page === "query" && <QueryPage />}
-            {page === "approvals" && <ApprovalsPage />}
+            {APPROVAL_ENABLED && page === "approvals" && <ApprovalsPage />}
             {page === "schema" && <SchemaPage />}
             {page === "history" && <HistoryPage />}
             {page === "config" && <ConfigPage />}

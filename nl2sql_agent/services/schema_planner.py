@@ -17,6 +17,7 @@ from nl2sql_agent.state import (
     IntentSlot,
     PlannedTable,
     QueryIntent,
+    SemanticGraph,
     SchemaPlan,
 )
 
@@ -38,6 +39,7 @@ _MEASURE_RE = re.compile(
     r"[\u4e00-\u9fffA-Za-z_]{1,18}?(?:金额|余额|总额|数量|笔数|比率|率)"
 )
 _ENTITY_WORDS = ("客户", "产品", "机构", "借据", "合同", "申请", "贷款", "还款", "代偿")
+_GENERIC_PROJECTIONS = {"基本信息", "详细信息", "联系方式", "明细"}
 _NUMERIC_TYPES = ("int", "decimal", "numeric", "number", "float", "double", "real")
 _PREFIXES = ("请帮我统计", "帮我统计", "统计", "查询", "计算", "筛选", "查找", "查出")
 _GENERIC_ALIASES = (
@@ -50,6 +52,31 @@ _CONCEPT_ALIASES = {
     "联系方式": ("手机号", "手机", "电话", "邮箱"),
     "时间": ("日期", "时间", "月份", "年度"),
 }
+
+
+def _fallback_output_phrases(query: str) -> list[str]:
+    """Conservative safety net for explicit result lists when the LLM is unavailable.
+
+    This is intentionally not a business dictionary. It only recognizes a trailing
+    natural-language list such as ``客户的姓名和地址``. Open-vocabulary output
+    understanding remains the responsibility of the resolution model.
+    """
+    tail = query.rsplit("的", 1)[-1].strip(" ，。！？?") if "的" in query else ""
+    if (
+        not tail
+        or tail in _ENTITY_WORDS
+        or any(word in tail for word in _COMPARISONS)
+        or re.search(r"\d", tail)
+    ):
+        return []
+    parts = [item.strip(" 的") for item in re.split(r"和|与|以及|、", tail)]
+    # A lone open-vocabulary tail (e.g. “逾期本金”“借据笔数”) may be a metric,
+    # not a projection. The model handles that case; fallback only protects an
+    # unmistakable explicit list. Generic entity projections are handled by the
+    # existing entity policy rather than pretending they are one physical field.
+    if len(parts) < 2:
+        return []
+    return [item for item in parts if 1 <= len(item) <= 16 and item not in _ENTITY_WORDS]
 
 
 def normalize_semantic_text(value: str) -> str:
@@ -123,6 +150,9 @@ def parse_query_intent(query: str) -> QueryIntent:
     for phrase in ("基本信息", "详细信息", "联系方式", "明细"):
         if phrase in query:
             attributes.append(IntentSlot(text=phrase, role="attribute"))
+    for phrase in _fallback_output_phrases(query):
+        if phrase not in {item.text for item in attributes}:
+            attributes.append(IntentSlot(text=phrase, role="attribute"))
 
     dimensions: list[IntentSlot] = []
     dimension_match = re.search(r"按(.{1,12}?)(?:统计|汇总|分组|计算)", query)
@@ -187,8 +217,8 @@ def rank_field_candidates(
     column_table_scores = column_table_scores or {}
     slots = {
         slot.text: slot
-        for slot in [*intent.measures, *intent.filters, *intent.dimensions]
-        if slot.text
+        for slot in [*intent.measures, *intent.filters, *intent.attributes, *intent.dimensions]
+        if slot.text and slot.text not in _GENERIC_PROJECTIONS
     }
     candidates: list[FieldCandidate] = []
     for slot_text, slot in slots.items():
@@ -229,6 +259,7 @@ def rank_field_candidates(
                 candidates.append(FieldCandidate(
                     table_name=table.name,
                     column_name=str(column.get("name") or ""),
+                    column_comment=str(column.get("comment") or ""),
                     query_slot=slot_text,
                     semantic_role=role,
                     data_type=str(column.get("type") or column.get("raw_type") or ""),
@@ -274,6 +305,82 @@ def find_field_ambiguities(
         if len(distinct) > 1:
             ambiguities[slot] = close[:5]
     return ambiguities
+
+
+def ground_output_bindings(
+    graph: SemanticGraph | None,
+    candidates: list[FieldCandidate],
+    overrides: dict[str, str] | None = None,
+) -> dict[str, dict]:
+    """Bind required outputs; broad result-only concepts may expand safely."""
+    if graph is None:
+        return {}
+    overrides = overrides or {}
+    by_slot: dict[str, list[FieldCandidate]] = {}
+    for candidate in candidates:
+        by_slot.setdefault(candidate.query_slot, []).append(candidate)
+
+    bindings: dict[str, dict] = {}
+    for output in graph.outputs:
+        if not output.required:
+            continue
+        concept = output.grounding_concept or output.concept
+        options = by_slot.get(concept, [])
+        override = overrides.get(concept)
+        if override:
+            options = [
+                item for item in options
+                if f"{item.table_name}.{item.column_name}" == override
+            ]
+        if not options or options[0].final_score < 0.42:
+            continue
+        selected = options[0]
+        selected_fields = [selected]
+        normalized_concept = normalize_semantic_text(concept)
+        if normalized_concept == "地址" and not override:
+            # “地址”是宽泛返回概念，可展开客户本人同表的完整地址字段。
+            # 排除单位/配偶地址以及省市区、邮编等不同主体或不同粒度字段。
+            excluded = ("单位", "工作", "配偶", "省份", "省", "城市", "市", "区县", "区", "邮编")
+            expanded = [
+                item for item in options
+                if item.table_name == selected.table_name
+                and item.final_score >= max(0.42, selected.final_score * 0.82)
+                and item.phrase_coverage >= 0.75
+                and "地址" in item.column_comment
+                and not any(word in item.column_comment for word in excluded)
+            ]
+            if expanded:
+                selected_fields = expanded[:5]
+        physical_bindings = [
+            {
+                "table_name": item.table_name,
+                "column_name": item.column_name,
+                "label": item.column_comment or output.concept,
+                "confidence": item.final_score,
+            }
+            for item in selected_fields
+        ]
+        bindings[output.id] = {
+            "concept": output.concept,
+            "grounding_concept": concept,
+            "table_name": selected.table_name,
+            "column_name": selected.column_name,
+            "confidence": selected.final_score,
+            "required": True,
+            "binding_mode": "expanded" if len(physical_bindings) > 1 else "exact",
+            "bindings": physical_bindings,
+        }
+    return bindings
+
+
+def output_binding_fields(binding: dict) -> list[dict]:
+    """Read new one-to-many bindings while remaining compatible with old states."""
+    fields = binding.get("bindings")
+    if isinstance(fields, list) and fields:
+        return [item for item in fields if isinstance(item, dict)]
+    if binding.get("table_name") and binding.get("column_name"):
+        return [binding]
+    return []
 
 
 def _entity_table_score(entity: str, table: TableDef) -> float:
@@ -341,8 +448,8 @@ def build_schema_plan(
     unresolved: list[str] = []
     ordered_slots = list(dict.fromkeys(
         item.text
-        for item in [*intent.measures, *intent.filters, *intent.dimensions]
-        if item.text
+        for item in [*intent.measures, *intent.filters, *intent.attributes, *intent.dimensions]
+        if item.text and item.text not in _GENERIC_PROJECTIONS
     ))
     for slot in ordered_slots:
         options = by_slot.get(slot, [])
@@ -360,8 +467,9 @@ def build_schema_plan(
     anchors: dict[str, PlannedTable] = {}
     dimensions: dict[str, PlannedTable] = {}
     dimension_slots = {item.text for item in intent.dimensions}
+    attribute_slots = {item.text for item in intent.attributes}
     for candidate in selected:
-        if candidate.query_slot in dimension_slots:
+        if candidate.query_slot in dimension_slots or candidate.query_slot in attribute_slots:
             existing_dimension = dimensions.get(candidate.table_name)
             if existing_dimension:
                 if candidate.column_name not in existing_dimension.selected_columns:
@@ -370,9 +478,13 @@ def build_schema_plan(
             else:
                 dimensions[candidate.table_name] = PlannedTable(
                     table_name=candidate.table_name,
-                    role="dimension",
+                    role="entity" if candidate.query_slot in attribute_slots else "dimension",
                     selected_columns=[candidate.column_name],
-                    reason=f"提供分组维度“{candidate.query_slot}”",
+                    reason=(
+                        f"提供返回属性“{candidate.query_slot}”"
+                        if candidate.query_slot in attribute_slots
+                        else f"提供分组维度“{candidate.query_slot}”"
+                    ),
                     score=candidate.final_score,
                 )
             continue

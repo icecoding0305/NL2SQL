@@ -77,7 +77,7 @@ def _decision_summary(resolved: ResolvedQuery) -> DecisionSummary:
 
 
 def _prefer_complete_graph(candidate, fallback):
-    """已被确定性规则识别的高影响短语不允许被 LLM 静默遗漏。"""
+    """模型主导理解，但确定性识别出的条件和显式输出都不允许静默遗漏。"""
     if candidate is None:
         return fallback
     fallback_sources = {
@@ -90,7 +90,47 @@ def _prefer_complete_graph(candidate, fallback):
         for atom in iter_semantic_atoms(candidate.predicate)
         if atom.materiality == "high"
     )
-    return candidate if all(source in candidate_text for source in fallback_sources) else fallback
+    base = candidate if all(source in candidate_text for source in fallback_sources) else fallback
+    if base is None or fallback is None:
+        return base
+
+    outputs = list(base.outputs)
+    known_concepts = {
+        re.sub(r"\s+", "", output.grounding_concept or output.concept).lower()
+        for output in outputs
+    }
+    used_ids = {output.id for output in outputs}
+    for graph in (candidate, fallback):
+        for output in graph.outputs:
+            concept = re.sub(r"\s+", "", output.grounding_concept or output.concept).lower()
+            if concept in known_concepts:
+                continue
+            output_id = output.id
+            if output_id in used_ids:
+                index = len(outputs) + 1
+                while f"output_{index}" in used_ids:
+                    index += 1
+                output_id = f"output_{index}"
+            outputs.append(output.model_copy(update={"id": output_id}))
+            known_concepts.add(concept)
+            used_ids.add(output_id)
+
+    subjects = list(base.subjects)
+    known_subjects = {(item.id, item.concept) for item in subjects}
+    for graph in (candidate, fallback):
+        for item in graph.subjects:
+            key = (item.id, item.concept)
+            if key not in known_subjects:
+                subjects.append(item)
+                known_subjects.add(key)
+    capabilities = list(base.capabilities)
+    if outputs and "entity_output" not in capabilities:
+        capabilities.append("entity_output")
+    return base.model_copy(update={
+        "subjects": subjects,
+        "outputs": outputs,
+        "capabilities": capabilities,
+    })
 
 
 def _should_use_llm_resolution(state: NL2SQLState, resolved: ResolvedQuery, config: dict) -> bool:
@@ -123,7 +163,7 @@ def make_query_resolution_node(deps):
         use_llm = _should_use_llm_resolution(state, resolved, resolution_config)
         if use_llm:
             try:
-                candidate = deps.llm.complete_structured(
+                candidate = deps.llm_for("query_resolution").complete_structured(
                     _resolution_prompt(state, deps), ResolvedQuery, retries=1
                 )
                 # 原始问题由服务端锁定，避免模型改写审计事实。
@@ -132,6 +172,14 @@ def make_query_resolution_node(deps):
                 resolved = candidate.model_copy(update={
                     "original_query": query,
                     "semantic_graph": graph,
+                    "attributes": list(dict.fromkeys([
+                        *candidate.attributes,
+                        *[
+                            output.grounding_concept or output.concept
+                            for output in (graph.outputs if graph else [])
+                            if output.required
+                        ],
+                    ])),
                     "assumptions": [
                         *candidate.assumptions,
                         *[

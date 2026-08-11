@@ -41,7 +41,7 @@ class QueryStore:
                     user_id         TEXT,
                     user_query      TEXT,
                     data_scope      TEXT,
-                    status          TEXT,            -- running / done / pending_review / error / rejected / blocked
+                    status          TEXT,            -- running / done / pending_review / error / rejected / blocked / cancelled
                     generated_sql   TEXT,
                     plan_json       TEXT,
                     logical_plan    TEXT,
@@ -49,9 +49,12 @@ class QueryStore:
                     retrieved_schema TEXT,
                     sensitive_reasons TEXT,
                     execution_result TEXT,
+                    result_summary  TEXT,
                     final_answer    TEXT,
                     trace_steps     TEXT,
                     node_latencies  TEXT,
+                    node_latency_history TEXT,
+                    llm_calls       TEXT,
                     retry_count     INTEGER DEFAULT 0,
                     plan_retry_count INTEGER DEFAULT 0,
                     approved        INTEGER,
@@ -102,7 +105,10 @@ class QueryStore:
                 "clarification_reason TEXT",
                 "low_confidence_flag INTEGER DEFAULT 0",
                 "execution_error TEXT",
+                "result_summary TEXT",
                 "risk_decision TEXT DEFAULT 'pass'",
+                "node_latency_history TEXT",
+                "llm_calls TEXT",
             ):
                 try:
                     conn.execute(f"ALTER TABLE queries ADD COLUMN {col}")
@@ -216,7 +222,8 @@ class QueryStore:
         d = dict(row)
         for key in (
             "data_scope", "plan_json", "logical_plan", "query_mschema", "retrieved_schema", "sensitive_reasons",
-            "execution_result", "trace_steps", "node_latencies", "retrieval_candidates",
+            "execution_result", "result_summary", "trace_steps", "node_latencies", "node_latency_history",
+            "llm_calls", "retrieval_candidates",
             "query_intent", "resolved_query", "semantic_graph", "business_clarification", "decision_summary",
             "field_candidates", "field_ambiguities", "schema_plan",
         ):

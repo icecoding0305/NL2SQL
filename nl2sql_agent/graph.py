@@ -8,7 +8,8 @@
   模块5b → 模块6 ─(不过)→ 回模块5b(上限 max_plan_retries)
                     └─(通过)→ 模块7
   模块7 → 模块8 ─(不过,非危险)→ 回模块7(上限 max_retries)
-                └─(通过)→ 模块9 ─(approval_required)→ 人工确认→ 模块10
+                └─(通过)→ 模块9 ─(approval_required 且审批开启)→ 人工确认→ 模块10
+                                └─(approval_required 且审批关闭)→ 模块10
                                 ├─(hard_block)→ 结束
                                 └─(pass)→ 模块10
   模块10 ─(报错/结果为空)→ 回模块7(上限 max_retries)
@@ -27,6 +28,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from nl2sql_agent.services.checkpoint import checkpoint_serializer
+from nl2sql_agent.services.llm_telemetry import begin_capture, end_capture
 from nl2sql_agent.nodes import (
     human_review,
     m1_entry,
@@ -92,11 +94,24 @@ def _traced(name: str, fn, sink=None):
     def wrapped(state: NL2SQLState):
         _emit(sink, "node_start", name, state.trace_id)
         t0 = time.perf_counter()
-        out = fn(state)
+        capture_tokens = begin_capture(name, state.trace_id)
+        try:
+            out = fn(state)
+        finally:
+            node_llm_calls = end_capture(capture_tokens)
         latency_ms = round((time.perf_counter() - t0) * 1000, 2)
         if isinstance(out, dict):
             out = dict(out)
-            out["node_latencies"] = {**(state.node_latencies or {}), name: latency_ms}
+            latencies = dict(state.node_latencies or {})
+            latencies[name] = round(float(latencies.get(name, 0)) + latency_ms, 2)
+            latency_history = {
+                key: list(values)
+                for key, values in (state.node_latency_history or {}).items()
+            }
+            latency_history.setdefault(name, []).append(latency_ms)
+            out["node_latencies"] = latencies
+            out["node_latency_history"] = latency_history
+            out["llm_calls"] = [*(state.llm_calls or []), *node_llm_calls]
             out["trace_steps"] = [*(state.trace_steps or []), name]
         _emit(sink, "node_complete", name, state.trace_id, out)
         return out
@@ -150,7 +165,9 @@ def route_static_validation(state: NL2SQLState) -> str:
     return "give_up"
 
 
-def route_sensitive(state: NL2SQLState) -> str:
+def route_sensitive(state: NL2SQLState, approval_enabled: bool = True) -> str:
+    if state.risk_decision == "approval_required" and not approval_enabled:
+        return "pass"
     return state.risk_decision
 
 
@@ -209,6 +226,7 @@ def build_graph(deps: Deps, checkpointer=None, event_sink=None):
         "schema_retrieval",
         m3_5_retrieval_confidence_router.make_route_after_retrieval(deps),
         {
+            "unsupported_output": END,
             "clarify_business": "clarify_business",
             "clarify_low_confidence": "clarify_low_confidence",
             "plan_generation": "plan_generation",
@@ -249,10 +267,10 @@ def build_graph(deps: Deps, checkpointer=None, event_sink=None):
         {"pass": "sensitive_check", "retry": "sql_generation", "blocked": END, "give_up": END},
     )
 
-    # 模块9 → 可审批风险→ human_review;硬风险→ END;无风险→ 模块10
+    # 模块9 → 可审批风险(开关开启)→ human_review；开关关闭时直接执行；硬风险仍 → END。
     g.add_conditional_edges(
         "sensitive_check",
-        route_sensitive,
+        lambda state: route_sensitive(state, deps.config.approval_enabled),
         {
             "approval_required": "human_review",
             "hard_block": END,
@@ -286,5 +304,9 @@ def build_graph(deps: Deps, checkpointer=None, event_sink=None):
         # 复用 checkpoint 序列化器(注册全部 state 模型,避免 msgpack 反序列化告警)
         checkpointer=checkpointer
         or InMemorySaver(serde=checkpoint_serializer()),
-        interrupt_before=["human_review", "clarify_low_confidence"],
+        interrupt_before=(
+            ["human_review", "clarify_low_confidence"]
+            if deps.config.approval_enabled
+            else ["clarify_low_confidence"]
+        ),
     )

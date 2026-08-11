@@ -65,8 +65,15 @@ def build_semantic_graph(query: str, config: dict | None = None) -> SemanticGrap
             concept=item.text,
             grounding_concept=item.text,
             source_text=item.text,
+            source_span=(
+                [query.rfind(item.text), query.rfind(item.text) + len(item.text)]
+                if item.text and query.rfind(item.text) >= 0 else []
+            ),
+            required=True,
+            confidence=0.9,
         )
         for index, item in enumerate(legacy.attributes, start=1)
+        if item.text not in {"基本信息", "详细信息", "联系方式", "明细"}
     ]
 
     atoms: list[SemanticPredicate] = []
@@ -244,8 +251,16 @@ def semantic_graph_to_query_intent(
                 value=rule.get("value", True),
             ))
     query_type = "fact_filter" if filters else legacy.query_type
+    output_attributes = [
+        IntentSlot(text=output.grounding_concept or output.concept, role="attribute")
+        for output in graph.outputs
+        if output.required and (output.grounding_concept or output.concept)
+    ]
     return legacy.model_copy(update={
         "query_type": query_type,
         "filters": filters,
         "measures": list({item.text: item for item in [*legacy.measures, *measures]}.values()),
+        "attributes": list({
+            item.text: item for item in [*legacy.attributes, *output_attributes]
+        }.values()),
     })

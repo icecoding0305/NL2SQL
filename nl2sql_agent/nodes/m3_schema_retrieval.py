@@ -20,6 +20,7 @@ from __future__ import annotations
 from nl2sql_agent.services.schema_planner import (
     build_schema_plan,
     find_field_ambiguities,
+    ground_output_bindings,
     parse_query_intent,
     plan_table_names,
     rank_field_candidates,
@@ -151,6 +152,22 @@ def _ground_semantic_atoms(state, candidates):
             "evidence": selected.evidence,
         }
     return bindings
+
+
+def _unsupported_output_concepts(state: NL2SQLState, bindings: dict[str, dict]) -> list[str]:
+    return [
+        output.concept
+        for output in (state.semantic_graph.outputs if state.semantic_graph else [])
+        if output.required and output.id not in bindings
+    ]
+
+
+def _unsupported_output_answer(concepts: list[str]) -> str:
+    joined = "、".join(concepts)
+    return (
+        f"当前可访问的数据结构中无法确认以下返回字段：{joined}。"
+        "系统已停止生成 SQL，以避免猜测字段或返回不完整结果。"
+    )
 
 
 def _candidate_is_close(deps, top_score: float, score: float) -> bool:
@@ -453,6 +470,23 @@ def make_schema_retrieval_node(deps):
                 field_ambiguities = find_field_ambiguities(
                     field_candidates, state.selected_field_overrides
                 )
+                # 仅作为结果投影的属性允许自动选择/展开，不要求用户确认。
+                # 同名槽位若同时参与筛选、分组或度量，仍保留唯一口径确认。
+                constrained_slots = {
+                    item.text for item in [
+                        *query_intent.filters,
+                        *query_intent.dimensions,
+                        *query_intent.measures,
+                    ]
+                }
+                output_only_slots = {
+                    item.text for item in query_intent.attributes
+                    if item.text not in constrained_slots
+                }
+                field_ambiguities = {
+                    slot: options for slot, options in field_ambiguities.items()
+                    if slot not in output_only_slots
+                }
                 source = load_mschema_vector_source(getattr(deps.catalog, "metadata", {}))
                 relations = source[0].get("relations", []) if source is not None else []
                 max_hops = int(
@@ -484,6 +518,14 @@ def make_schema_retrieval_node(deps):
                         deps, scope, field_ambiguities
                     )
                     semantic_bindings = _ground_semantic_atoms(state, field_candidates)
+                    output_bindings = ground_output_bindings(
+                        state.semantic_graph,
+                        field_candidates,
+                        state.selected_field_overrides,
+                    )
+                    unsupported_outputs = _unsupported_output_concepts(
+                        state, output_bindings
+                    )
                     main_table_count = max(
                         1,
                         len(schema_plan.anchor_tables) + len(schema_plan.dimension_tables),
@@ -500,6 +542,10 @@ def make_schema_retrieval_node(deps):
                         "business_clarification": business_clarification,
                         "business_option_bindings": option_bindings,
                         "semantic_bindings": semantic_bindings,
+                        "output_bindings": output_bindings,
+                        "unsupported_outputs": unsupported_outputs,
+                        **({"final_answer": _unsupported_output_answer(unsupported_outputs)}
+                           if unsupported_outputs else {}),
                         "decision_summary": _enrich_decision_summary(
                             state, deps, schema_plan, confidence
                         ),
@@ -540,6 +586,15 @@ def make_schema_retrieval_node(deps):
         business_clarification, option_bindings = _business_clarification(
             deps, scope, field_ambiguities
         )
+        output_bindings = ground_output_bindings(
+            state.semantic_graph,
+            field_candidates,
+            state.selected_field_overrides,
+        )
+        unsupported_outputs = (
+            _unsupported_output_concepts(state, output_bindings)
+            if field_candidates else []
+        )
         return {
             "retrieved_schema": merged,
             "retrieval_confidence": confidence,
@@ -552,6 +607,10 @@ def make_schema_retrieval_node(deps):
             "business_clarification": business_clarification,
             "business_option_bindings": option_bindings,
             "semantic_bindings": _ground_semantic_atoms(state, field_candidates),
+            "output_bindings": output_bindings,
+            "unsupported_outputs": unsupported_outputs,
+            **({"final_answer": _unsupported_output_answer(unsupported_outputs)}
+               if unsupported_outputs else {}),
             "decision_summary": _enrich_decision_summary(
                 state, deps, schema_plan, confidence
             ),

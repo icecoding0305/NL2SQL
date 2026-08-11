@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nl2sql_agent.services.semantic_parser import semantic_atom_map
+from nl2sql_agent.services.schema_planner import output_binding_fields
 from nl2sql_agent.state import (
     LogicalOperation,
     LogicalPlan,
@@ -44,6 +45,12 @@ def build_query_mschema(state: NL2SQLState) -> QueryMSchema:
         column = binding.get("column_name")
         if table and column:
             selected.setdefault(table, set()).add(column)
+    for binding in state.output_bindings.values():
+        for field in output_binding_fields(binding):
+            table = field.get("table_name")
+            column = field.get("column_name")
+            if table and column:
+                selected.setdefault(table, set()).add(column)
 
     planned_tables = set(roles)
     tables: list[QuerySchemaTable] = []
@@ -103,6 +110,7 @@ def build_query_mschema(state: NL2SQLState) -> QueryMSchema:
         tables=tables,
         relations=query_relations,
         semantic_bindings=state.semantic_bindings,
+        output_bindings=state.output_bindings,
     )
 
 

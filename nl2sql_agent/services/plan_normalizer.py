@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nl2sql_agent.services.semantic_parser import iter_semantic_atoms
+from nl2sql_agent.services.schema_planner import output_binding_fields
 from nl2sql_agent.state import QueryPlan, SemanticPredicate
 
 
@@ -26,8 +27,16 @@ def _implemented_atom_ids(plan: QueryPlan) -> set[str]:
     return atom_ids
 
 
+def _implemented_output_ids(plan: QueryPlan) -> set[str]:
+    return {
+        output_id
+        for field in plan.output_fields
+        for output_id in field.source_output_ids
+    }
+
+
 def normalize_structural_coverage(
-    plan: QueryPlan, semantic_graph
+    plan: QueryPlan, semantic_graph, output_bindings: dict[str, dict] | None = None
 ) -> tuple[QueryPlan, list[str]]:
     """Attach provably implemented positive ``exists`` atoms to physical operators.
 
@@ -36,7 +45,7 @@ def normalize_structural_coverage(
     bookkeeping gap. Negative existence is intentionally excluded because it needs
     explicit anti-join/NOT EXISTS semantics and cannot be inferred safely.
     """
-    if semantic_graph is None or semantic_graph.predicate is None:
+    if semantic_graph is None:
         return plan, []
 
     normalized = plan.model_copy(deep=True)
@@ -80,4 +89,30 @@ def normalize_structural_coverage(
             changes.append(f"{atom.atom_id} 自动绑定到同表记录过滤")
 
     normalized.covered_atom_ids = sorted(_implemented_atom_ids(normalized))
+
+    output_bindings = output_bindings or {}
+    for output in semantic_graph.outputs:
+        if not output.required:
+            continue
+        binding = output_bindings.get(output.id)
+        if not binding:
+            continue
+        for expected in output_binding_fields(binding):
+            target = next((
+                field for field in normalized.output_fields
+                if field.table == expected.get("table_name")
+                and field.column == expected.get("column_name")
+            ), None)
+            if target is None or output.id in target.source_output_ids:
+                continue
+            target.source_output_ids = list(dict.fromkeys([
+                *target.source_output_ids, output.id,
+            ]))
+            if binding.get("binding_mode") == "expanded" and not target.alias:
+                target.alias = str(expected.get("label") or "") or None
+            changes.append(
+                f"{output.id} 自动绑定到返回字段 "
+                f"{expected.get('table_name')}.{expected.get('column_name')}"
+            )
+    normalized.covered_output_ids = sorted(_implemented_output_ids(normalized))
     return normalized, changes

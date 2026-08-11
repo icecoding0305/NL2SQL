@@ -10,6 +10,10 @@ performance:
   # auto:明细列表直接生成确定性摘要；真正的指标/聚合结果再调用 LLM 润色。
   result_summary_mode: auto
 
+# 查询人工审批临时关闭。hard_block 安全策略不受影响。
+approval:
+  enabled: false
+
 # 数据库连接(不配置则无法真正执行,只能走校验链路)
 # 可用 .env 的 DATABASE_URL 覆盖;按 scheme 自动选择执行器:
 #   mysql://  → MySQLExecutor   postgresql:// 或 postgres:// → PostgresExecutor

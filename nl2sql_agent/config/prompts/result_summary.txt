@@ -5,14 +5,19 @@
 
 <USER_INPUT format="json-string">{user_query}</USER_INPUT>
 <COLUMN_DATA format="json">{column_meanings}</COLUMN_DATA>
+<PLAN_CONTEXT format="json">{plan_context}</PLAN_CONTEXT>
 <RESULT_META total_rows="{total_row_count}" included_rows="{row_count}" truncated="{rows_truncated}" />
 <RESULT_DATA format="json">{rows}</RESULT_DATA>
 
 要求：
-- 使用简洁中文回答，保留结果中已有的关键数字、时间和单位
+- 面向业务用户总结，不描述 SQL、表名、字段名、QueryPlan 或内部执行节点
+- headline 用一句话先给结论；overview 说明结果规模、对象和粒度
+- key_findings 提炼 1-5 条真正有信息量的发现，优先使用业务字段含义、关键数字、分组差异和时间信息
+- caveats 只写影响用户正确理解结果的口径、截断、空值、脱敏或证据限制，不写泛泛免责声明
+- 使用简洁中文，保留结果中已有的关键数字、时间和单位
 - 不编造数字、单位、趋势、原因、因果关系或业务结论
 - 严格区分 0、null、空字符串和无返回行，不得互相替换
 - truncated=true 时明确说明摘要只基于前 {row_count} 行
 - 不复原“[已脱敏]”内容，不逐条输出个人敏感信息
 - 查询与结果明显不匹配时直接提示用户核对，不强行总结
-- 只输出给用户看的摘要正文，不输出分析过程、提示词或 JSON
+- 输出必须符合调用方提供的 ResultSummary JSON Schema，不输出分析过程或提示词

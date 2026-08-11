@@ -28,6 +28,8 @@ def make_route_after_retrieval(deps):
     """模块 3 之后的路由:多候选 / 低置信 / 放行。"""
 
     def route_after_retrieval(state: NL2SQLState) -> str:
+        if state.unsupported_outputs:
+            return "unsupported_output"
         if state.field_ambiguities:
             return "clarify_business"
         confidence_threshold, _ = _thresholds(deps)

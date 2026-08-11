@@ -31,6 +31,7 @@ const statusLabels: Record<string, string> = {
   error: "失败",
   rejected: "已驳回",
   blocked: "已拦截",
+  cancelled: "已停止",
 };
 
 export default function HistorySidebar({ records, activeTrace, onOpen, onNew, onRefresh, onDelete }: Props) {

@@ -32,6 +32,7 @@ def checkpoint_serializer() -> JsonPlusSerializer:
                 "BusinessClarification",
                 "DecisionSource",
                 "DecisionSummary",
+                "ResultSummary",
                 "FieldCandidate",
                 "PlannedTable",
                 "SchemaPlan",

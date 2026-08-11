@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -132,6 +132,9 @@ def query(req: QueryRequest):
         "thread_id": thread_id,
         "status": status,
         "final_answer": vals.get("final_answer"),
+        "result_summary": (
+            vals["result_summary"].model_dump() if vals.get("result_summary") else None
+        ),
         "execution_result": vals.get("execution_result"),
         "sql": vals.get("generated_sql"),
         "trace_id": vals.get("trace_id"),
@@ -145,6 +148,8 @@ def query(req: QueryRequest):
 
 @app.post("/approve")
 def approve(req: ApproveRequest):
+    if not get_deps().config.approval_enabled:
+        raise HTTPException(status_code=404, detail="查询审批功能已临时关闭")
     graph = get_graph()
     config = {"configurable": {"thread_id": req.thread_id}}
     graph.invoke(
@@ -157,6 +162,9 @@ def approve(req: ApproveRequest):
     return {
         "status": "done",
         "final_answer": vals.get("final_answer"),
+        "result_summary": (
+            vals["result_summary"].model_dump() if vals.get("result_summary") else None
+        ),
         "execution_result": vals.get("execution_result"),
         "trace_steps": vals.get("trace_steps"),
     }

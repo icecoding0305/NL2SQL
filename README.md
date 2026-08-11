@@ -1,4 +1,4 @@
-# NL2SQL 智能体(LangGraph)
+# https://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanNL2SQL 智能体(LangGraph)
 
 面向企业内部数据分析场景(多系统、字段量大、对生成准确性和权限安全要求较高)的
 自然语言 → SQL 智能体。使用类型化语义图、Schema Grounding 与统一计划链路执行;
@@ -108,6 +108,8 @@ data/                          # 运行数据(SQLite 历史/审核/快照)
 - **复合口径分离**:模块 5b 生成结构化 QueryPlan(非自由文本),模块 6 与术语映射交叉校验口径。
 - **风险三态决策**:证件/姓名/金额聚合/低置信等可审批风险输出 `approval_required` 并暂停；
   超扫描阈值等硬风险输出 `hard_block` 直接结束；其余输出 `pass`。
+  当前 `settings.yaml` 中 `approval.enabled: false`，软风险仅记录原因并直接执行，不进入人工审批；
+  `hard_block` 仍然生效。恢复审批时把该开关改为 `true` 即可。
 - **有反馈的局部重试**:计划或 SQL 重试时会带入上一轮产物和校验/执行错误，要求模型只修错、不改变原查询语义。
 - **结构语义确定性归并**:当正向 `exists` 的全部高影响子条件已经进入计划，且相应 Join 或同表记录过滤存在时，
   服务端自动把父级存在原子绑定到物理操作并重算覆盖集合，避免仅因模型漏写父 atom_id 重试；`not_exists` 仍必须显式规划反连接。
@@ -119,8 +121,10 @@ data/                          # 运行数据(SQLite 历史/审核/快照)
 - **LLM 可插拔、按节点**:`build_llm()`(主模型,计划/解释)、`build_sql_llm()`(SQL 专用,
   可指向任意 OpenAI 兼容端点如千问)、`get_model_for_node()`(离线任务如注释生成)。
   model 名一律从环境变量/配置读取,不硬编码。
-  当前 `model_config.yaml` 配置 `runtime.main_model_source: default`，主流程的计划生成、
-  复杂问题理解和结果解释使用 `DEEPSEEK_MODEL=deepseek-v4-pro`；SQL 模型继续使用独立配置。
+  模型统一由 `config/model_config.yaml` 的 `runtime` 配置。默认开启 `unified: true`，
+  问题理解、计划生成、结果解释、离线 Schema 描述以及 SQL 生成兜底均继承同一个模型。
+  切换模型只需修改 provider、model、base_url、api_key_env 和 supports_tool_calling；
+  API Key 本身仍保存在 `.env` 对应的环境变量中，不得写入 YAML 或代码。
 - **数据库可插拔**:按 `DATABASE_URL` scheme 选 MySQL / Postgres 执行器,方言随 sqlglot 切换。
 
 ## 快速开始(uv)
@@ -218,19 +222,24 @@ uv run python scripts/seed_data.py --count 1000   # 6 张表插入 ~1000 条真�
 数仓/网贷核心等新系统:建表 → 导入(`--business-line dw` / `--business-line core`)。
 表自动归入对应系统命名空间,只有 `data_scope` 含该系统的用户能检索。
 
-## LLM 多模型配置(.env)
+## LLM 统一模型配置
 
+模型路由只修改 `nl2sql_agent/config/model_config.yaml`：
+
+```yaml
+runtime:
+  unified: true
+  provider: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  supports_tool_calling: false
 ```
-# 主模型(计划生成、结果解释)。模型名必须用小写，DeepSeek 后端的 API 只认
-# deepseek-v4-pro / deepseek-v4-flash / deepseek-chat（大写会 400）。
-# thinking/reasoning 模型对"查询计划"这类复杂 JSON 可能返回空/超时，计划不可用时退回 deepseek-chat。
-DEEPSEEK_MODEL=deepseek-v4-pro
 
-# SQL 专用模型:可指向任意 OpenAI 兼容端点(如千问 DashScope)
-SQL_MODEL=qwen3.8-max
-SQL_API_KEY=sk-xxx
-SQL_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+`.env` 只保存密钥和数据库连接，不再保存模型名称或模型路由：
 
+```env
+DEEPSEEK_API_KEY=sk-xxx
 # 数据库(按 scheme 自动选执行器)
 DATABASE_URL=mysql://user:pass@host:port/db
 ```

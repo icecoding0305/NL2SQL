@@ -14,6 +14,7 @@ from langgraph.types import Command
 from nl2sql_agent.graph import build_graph
 from nl2sql_agent.services.executor import InMemoryExecutor
 from nl2sql_agent.services.llm import SQLResult
+from nl2sql_agent.state import NL2SQLState
 from nl2sql_agent.testing import FAKE_TABLES, FakeLLM, build_test_deps
 
 from .conftest import make_input
@@ -210,3 +211,26 @@ def test_dangerous_sql_is_blocked_without_retry(deps):
     assert result["blocked_reason"] == "Drop"
     assert "SQL 被拦截" in result["final_answer"]
     assert result["trace_steps"].count("sql_generation") == 1  # 不进入重试
+
+
+def test_disabled_approval_skips_human_review_but_keeps_risk_record():
+    local_deps = build_test_deps()
+    local_deps.config.approval_enabled = False
+    graph = build_graph(local_deps, checkpointer=InMemorySaver())
+
+    result = _invoke(graph, make_input("查询新信贷的逾期本金"), thread="approval-off")
+
+    assert result["risk_decision"] == "approval_required"
+    assert result["sensitive_reasons"]
+    assert "human_review" not in result["trace_steps"]
+    assert result.get("execution_result") is not None
+
+
+def test_disabled_approval_does_not_bypass_hard_block():
+    from nl2sql_agent.graph import route_sensitive
+
+    state = NL2SQLState(
+        **make_input("高风险查询"),
+        risk_decision="hard_block",
+    )
+    assert route_sensitive(state, approval_enabled=False) == "hard_block"

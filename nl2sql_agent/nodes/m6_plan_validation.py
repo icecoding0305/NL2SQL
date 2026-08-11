@@ -15,6 +15,7 @@ from typing import Any
 from nl2sql_agent.state import NL2SQLState, QueryPlan, SchemaPlan
 from nl2sql_agent.services.semantic_parser import required_atom_ids, semantic_atom_map
 from nl2sql_agent.services.logical_planner import validate_logical_plan
+from nl2sql_agent.services.schema_planner import output_binding_fields
 from nl2sql_agent.services.term_mapping import TermResolutionStatus
 
 
@@ -62,6 +63,7 @@ def validate_plan(
     schema_plan: SchemaPlan | None = None,
     semantic_graph=None,
     semantic_bindings: dict | None = None,
+    output_bindings: dict | None = None,
 ) -> list[str]:
     errors: list[str] = []
     known_tables = {h.table_name for h in retrieved_schema}
@@ -113,6 +115,71 @@ def validate_plan(
                     f"期望={binding.get('table_name')}.{binding.get('column_name')} "
                     f"{binding.get('operator')} {binding.get('value')!r}"
                 )
+
+    # 0.5 所有明确返回要求必须进入 output_fields，不能用实体主键替代属性。
+    required_outputs = {
+        output.id for output in (semantic_graph.outputs if semantic_graph else [])
+        if output.required
+    }
+    implemented_outputs = {
+        output_id
+        for field in plan.output_fields
+        for output_id in field.source_output_ids
+    }
+    declared_outputs = set(plan.covered_output_ids)
+    missing_outputs = required_outputs - implemented_outputs
+    unknown_outputs = implemented_outputs - required_outputs
+    if missing_outputs:
+        errors.append(f"QueryPlan 遗漏用户明确要求的返回内容 {sorted(missing_outputs)}")
+    if unknown_outputs:
+        errors.append(f"QueryPlan 声明了不存在的返回要求 {sorted(unknown_outputs)}")
+    if declared_outputs != implemented_outputs:
+        errors.append(
+            "covered_output_ids 必须与 output_fields.source_output_ids 完全一致: "
+            f"covered={sorted(declared_outputs)}, implemented={sorted(implemented_outputs)}"
+        )
+    output_bindings = output_bindings or {}
+    for output_id in required_outputs:
+        if output_id not in output_bindings:
+            errors.append(f"返回要求 {output_id} 尚未完成 Schema 字段绑定")
+            continue
+        expected_fields = {
+            (item.get("table_name"), item.get("column_name"))
+            for item in output_binding_fields(output_bindings[output_id])
+        }
+        implemented_fields = {
+            (field.table, field.column)
+            for field in plan.output_fields
+            if output_id in field.source_output_ids
+        }
+        missing_fields = expected_fields - implemented_fields
+        unexpected_fields = implemented_fields - expected_fields
+        if missing_fields:
+            errors.append(
+                f"返回要求 {output_id} 遗漏已确认字段 "
+                f"{sorted(f'{table}.{column}' for table, column in missing_fields)}"
+            )
+        if unexpected_fields:
+            errors.append(
+                f"返回要求 {output_id} 使用了绑定外字段 "
+                f"{sorted(f'{table}.{column}' for table, column in unexpected_fields)}"
+            )
+        if output_bindings[output_id].get("binding_mode") == "expanded":
+            labels = {
+                (item.get("table_name"), item.get("column_name")): item.get("label")
+                for item in output_binding_fields(output_bindings[output_id])
+            }
+            for field in plan.output_fields:
+                key = (field.table, field.column)
+                if (
+                    output_id in field.source_output_ids
+                    and key in labels
+                    and field.alias != labels[key]
+                ):
+                    errors.append(
+                        f"展开返回字段 {field.table}.{field.column} 必须使用业务别名 "
+                        f"{labels[key]!r}"
+                    )
 
     # 1. target_tables 必须都在检索结果内
     for t in plan.target_tables:
@@ -201,6 +268,7 @@ def make_plan_validation_node(deps):
                 state.schema_plan,
                 state.semantic_graph,
                 state.semantic_bindings,
+                state.output_bindings,
             )
             if state.logical_plan is None:
                 errors.append("LogicalPlan 未生成")

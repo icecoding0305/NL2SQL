@@ -20,10 +20,12 @@ import {
   CopyOutlined,
   ExclamationCircleOutlined,
   LoadingOutlined,
+  BulbOutlined,
+  InfoCircleOutlined,
   SyncOutlined,
 } from "@ant-design/icons";
 import { apiPost } from "../api";
-import type { SchemaHit, SchemaPlan } from "../types";
+import type { ResultSummary, SchemaHit, SchemaPlan } from "../types";
 
 const { Text, Paragraph } = Typography;
 
@@ -399,11 +401,68 @@ export function RetryTimeline({ retries }: { retries: { attempt: number; reason:
 
 // ---------------- 结果摘要 ----------------
 
-export function AnswerCard({ answer }: { answer?: string | null }) {
-  if (!answer) return null;
+export function AnswerCard({
+  answer,
+  summary,
+}: {
+  answer?: string | null;
+  summary?: ResultSummary | null;
+}) {
+  if (!answer && !summary) return null;
+  if (!summary) {
+    return (
+      <Card size="small" bordered={false} style={{ background: "#eef7f1", borderRadius: 14 }}>
+        <Paragraph style={{ fontSize: 15, lineHeight: 1.75, whiteSpace: "pre-line", marginBottom: 0 }}>
+          {answer}
+        </Paragraph>
+      </Card>
+    );
+  }
   return (
-    <Card size="small" bordered={false} style={{ background: "#eaf7ef", borderRadius: 10 }}>
-      <Text style={{ fontSize: 15, lineHeight: 1.75 }}>{answer}</Text>
+    <Card
+      size="small"
+      bordered={false}
+      style={{ background: "linear-gradient(145deg, #f4f8f4 0%, #edf5f0 100%)", borderRadius: 14 }}
+      styles={{ body: { padding: "18px 20px" } }}
+    >
+      <Space direction="vertical" size={14} style={{ width: "100%" }}>
+        <div>
+          <Space size={8} align="start">
+            <BulbOutlined style={{ color: "#5f806e", marginTop: 5 }} />
+            <Text strong style={{ fontSize: 17, color: "#29483a" }}>{summary.headline}</Text>
+          </Space>
+          <Paragraph style={{ margin: "8px 0 0 26px", fontSize: 15, lineHeight: 1.75, color: "#496056" }}>
+            {summary.overview}
+          </Paragraph>
+        </div>
+        {summary.key_findings.length > 0 && (
+          <div style={{ marginLeft: 26 }}>
+            <Text strong>关键发现</Text>
+            <List
+              size="small"
+              split={false}
+              dataSource={summary.key_findings}
+              renderItem={(item) => (
+                <List.Item style={{ padding: "5px 0", color: "#3f5149" }}>
+                  <span style={{ color: "#7d9a89", marginRight: 9 }}>●</span>{item}
+                </List.Item>
+              )}
+            />
+          </div>
+        )}
+        {summary.caveats.length > 0 && (
+          <div style={{ marginLeft: 26, padding: "10px 12px", borderRadius: 10, background: "rgba(255,255,255,.58)" }}>
+            <Space size={7} align="start">
+              <InfoCircleOutlined style={{ color: "#9a7b52", marginTop: 4 }} />
+              <div>
+                {summary.caveats.map((item) => (
+                  <Text key={item} type="secondary" style={{ display: "block", lineHeight: 1.65 }}>{item}</Text>
+                ))}
+              </div>
+            </Space>
+          </div>
+        )}
+      </Space>
     </Card>
   );
 }

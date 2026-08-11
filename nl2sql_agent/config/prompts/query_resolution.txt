@@ -10,6 +10,9 @@
 - 会改变结果且无法确定的信息写入 unresolved_business_slots
 - assumptions 只记录可审计假设，不输出内部推理过程
 - semantic_graph 必须保存比较、状态、存在、否定和 AND/OR 结构；每个高影响条件必须有唯一 atom_id
+- 用户明确要求返回、展示、列出或查询的每个业务字段，都必须分别写入 semantic_graph.outputs，不能用“客户信息”等笼统概念替代用户明确列出的“姓名、地址”等字段
+- 每个 output 必须具有唯一 id、subject_id、concept、grounding_concept、source_text、source_span、required=true 和 confidence；不得把筛选字段误作返回字段
+- attributes 必须与 semantic_graph.outputs 的 grounding_concept 保持一致，禁止只保留实体编号而遗漏明确返回属性
 - “有/存在/发生过/没有”不能丢弃，必须形成 status + exists/not_exists 语义
 - semantic_graph 不得包含物理表名、字段名或 SQL
 - 本阶段禁止接收或请求任何数据库 Schema；只能根据用户问题和会话上文理解业务语义

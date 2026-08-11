@@ -103,6 +103,30 @@ def make_static_validation_node(deps):
 
         table_cols = {h.table_name: {c["name"] for c in h.columns} for h in state.retrieved_schema}
         errors: list[str] = []
+
+        # 返回字段完整性：即使 SQL 来自 LLM 降级路径，也必须实现已校验计划中的
+        # 每一个显式物理输出，不能生成可执行但缺列的 SQL。
+        root_select = next(expr.find_all(exp.Select), None)
+        projected_columns: set[tuple[str | None, str]] = set()
+        if root_select is not None:
+            for projection in root_select.expressions:
+                for column_expr in projection.find_all(exp.Column):
+                    qualifier = column_expr.table or None
+                    projected_columns.add((alias_map.get(qualifier, qualifier), column_expr.name))
+        for output in state.query_plan.output_fields if state.query_plan else []:
+            if not output.table or not output.column:
+                continue
+            qualified = (output.table, output.column) in projected_columns
+            unqualified = (None, output.column) in projected_columns
+            owners = [
+                table for table in ref_tables
+                if output.column in table_cols.get(table, set())
+            ]
+            if not qualified and not (unqualified and owners == [output.table]):
+                errors.append(
+                    f"SQL SELECT 遗漏计划返回字段 {output.table}.{output.column}"
+                )
+
         for tbl, col in sqlsvc.extract_columns(expr):
             if tbl is not None:
                 real = alias_map.get(tbl, tbl)

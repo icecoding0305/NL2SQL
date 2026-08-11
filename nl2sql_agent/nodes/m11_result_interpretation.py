@@ -7,10 +7,9 @@ Prompt 模板来自 config/prompts/result_summary.txt。
 
 from __future__ import annotations
 
-import json
-
 from nl2sql_agent.services.prompt_context import effective_query, prompt_json
-from nl2sql_agent.state import NL2SQLState
+from nl2sql_agent.services.schema_planner import output_binding_fields
+from nl2sql_agent.state import NL2SQLState, ResultSummary
 
 
 def sanitize_rows_for_llm(
@@ -56,15 +55,112 @@ def sanitize_rows_for_llm(
     return sanitized
 
 
-def deterministic_summary(query: str, rows: list[dict]) -> str:
+def render_result_summary(summary: ResultSummary) -> str:
+    """Render a readable compatibility string for history and conversation context."""
+    sections = [summary.headline, summary.overview]
+    if summary.key_findings:
+        sections.append("关键发现：\n" + "\n".join(f"- {item}" for item in summary.key_findings))
+    if summary.caveats:
+        sections.append("说明：\n" + "\n".join(f"- {item}" for item in summary.caveats))
+    return "\n\n".join(section for section in sections if section)
+
+
+def deterministic_result_summary(
+    query: str,
+    rows: list[dict],
+    state: NL2SQLState,
+    deps,
+) -> ResultSummary:
+    """Produce a factual business summary without exposing raw row JSON."""
     if not rows:
-        return f"针对「{query}」未返回结果。"
-    head = rows[:3]
-    return (
-        f"查询「{query}」共返回 {len(rows)} 行结果。"
-        f"示例:{json.dumps(head, ensure_ascii=False, default=str)}"
-        "(完整结果见数据表格,请核对。)"
+        return ResultSummary(
+            status="empty",
+            headline="未找到符合条件的数据",
+            overview=f"按照“{query}”所描述的条件查询后，本次没有返回记录。",
+            key_findings=["当前结果集为空，不代表相关业务数据一定从未存在。"],
+            caveats=["可以检查筛选条件、时间范围和当前数据权限是否符合预期。"],
+            row_count=0,
+            summarized_row_count=0,
+        )
+
+    plan = state.query_plan
+    grain = plan.output_grain if plan else None
+    entity = grain.entity if grain and grain.entity else "目标对象"
+    if grain and grain.level == "entity":
+        overview = f"本次返回 {len(rows)} 行符合条件的{entity}结果，每行代表一个{entity}。"
+    elif grain and grain.level in {"aggregate", "global"}:
+        overview = f"已完成查询所要求的汇总计算，本次返回 {len(rows)} 行汇总结果。"
+    elif grain and grain.level == "record":
+        overview = f"本次返回 {len(rows)} 行符合条件的业务明细。"
+    else:
+        overview = f"本次查询共返回 {len(rows)} 行结果。"
+
+    findings: list[str] = []
+    output_labels = list(dict.fromkeys(
+        field.concept or field.alias or field.column or "返回值"
+        for field in (plan.output_fields if plan else [])
+    ))
+    if output_labels:
+        findings.append(f"结果包含：{'、'.join(output_labels)}。")
+    if plan and plan.group_by:
+        findings.append(f"结果共形成 {len(rows)} 个分组。")
+
+    # A single aggregate/global row is safe and useful to summarize. Values have
+    # already passed execution; sensitive outputs are described but never copied.
+    if len(rows) == 1 and plan and grain and grain.level in {"aggregate", "global"}:
+        row = sanitize_rows_for_llm(rows, state, deps, max_rows=1)[0]
+        values: list[str] = []
+        for field in plan.output_fields:
+            key = field.alias or field.column
+            if not key or key not in row:
+                continue
+            value = row[key]
+            label = field.concept or key
+            values.append(f"{label}为 {value if value is not None else '空值'}")
+        if values:
+            findings.append("；".join(values[:5]) + "。")
+
+    caveats: list[str] = ["详细记录可在下方结果数据中查看。"]
+    for binding in state.output_bindings.values():
+        if binding.get("binding_mode") != "expanded":
+            continue
+        labels = [
+            str(item.get("label") or item.get("column_name"))
+            for item in output_binding_fields(binding)
+        ]
+        caveats.append(
+            f"“{binding.get('concept', '返回字段')}”存在多个同主体字段，"
+            f"本次已同时返回：{'、'.join(labels)}。"
+        )
+    execution_limit = int(getattr(deps.config, "execution_limit", 0) or 0)
+    truncated = bool(execution_limit and len(rows) >= execution_limit)
+    if truncated:
+        caveats.append(
+            f"本次结果达到系统单次返回上限 {execution_limit} 行，可能仍有更多符合条件的数据。"
+        )
+    if state.low_confidence_flag:
+        caveats.append("本次 Schema 匹配证据偏低，建议结合字段口径核对结果。")
+    for assumption in (state.resolved_query.assumptions if state.resolved_query else []):
+        if assumption.materiality in {"medium", "high"}:
+            caveats.append(f"本次采用口径：{assumption.content}。")
+
+    return ResultSummary(
+        status="partial" if truncated else "success",
+        headline=f"已完成查询，共返回 {len(rows)} 行结果",
+        overview=overview,
+        key_findings=findings[:5],
+        caveats=list(dict.fromkeys(caveats))[:5],
+        row_count=len(rows),
+        summarized_row_count=len(rows),
+        truncated=truncated,
     )
+
+
+def deterministic_summary(query: str, rows: list[dict]) -> str:
+    """Backward-compatible plain summary used by external callers."""
+    if not rows:
+        return f"按照“{query}”所描述的条件查询后，本次没有返回记录。"
+    return f"已完成“{query}”查询，本次共返回 {len(rows)} 行结果；详细记录可在结果数据中查看。"
 
 
 def _should_use_llm_summary(state: NL2SQLState, deps) -> bool:
@@ -86,32 +182,59 @@ def make_result_interpretation_node(deps):
         rows = state.execution_result
         if rows is None:
             return {"final_answer": "未获得查询结果。"}
-        if not _should_use_llm_summary(state, deps):
-            return {"final_answer": deterministic_summary(effective_query(state), rows)}
+        query = effective_query(state)
+        fallback = deterministic_result_summary(query, rows, state, deps)
+        if not rows or not _should_use_llm_summary(state, deps):
+            return {
+                "result_summary": fallback,
+                "final_answer": render_result_summary(fallback),
+            }
         try:
             # 构建列含义映射，帮助 LLM 理解缩写列名（如 OVD_BAL → 逾期本金余额）
             safe_rows = sanitize_rows_for_llm(rows, state, deps)
             result_columns = {str(key) for row in safe_rows for key in row}
             query_tables = state.query_mschema.tables if state.query_mschema else []
-            column_meanings = json.dumps({
+            column_meanings = {
                 column.name: column.comment
                 for table in query_tables
                 for column in table.columns
                 if column.name in result_columns
-            }, ensure_ascii=False)
+            }
+            plan_context = {
+                "output_fields": [
+                    {"concept": field.concept, "alias": field.alias, "column": field.column}
+                    for field in (state.query_plan.output_fields if state.query_plan else [])
+                ],
+                "output_grain": (
+                    state.query_plan.output_grain.model_dump() if state.query_plan else None
+                ),
+                "group_by": state.query_plan.group_by if state.query_plan else [],
+            }
             prompt = deps.prompts.render("result_summary",
-                user_query=prompt_json(effective_query(state)),
-                column_meanings=column_meanings,
+                user_query=prompt_json(query),
+                column_meanings=prompt_json(column_meanings),
+                plan_context=prompt_json(plan_context),
                 row_count=len(safe_rows),
                 total_row_count=len(rows),
                 rows_truncated=str(len(rows) > len(safe_rows)).lower(),
                 rows=prompt_json(safe_rows),
             )
-            answer = deps.llm.complete(prompt, max_tokens=500)
-            if not answer or not answer.strip():
-                answer = deterministic_summary(effective_query(state), rows)
+            generated = deps.llm.complete_structured(prompt, ResultSummary, retries=1)
+            summary = generated.model_copy(update={
+                "status": fallback.status,
+                "row_count": len(rows),
+                "summarized_row_count": len(safe_rows),
+                "truncated": len(rows) > len(safe_rows) or fallback.truncated,
+                "caveats": list(dict.fromkeys([
+                    *generated.caveats,
+                    *fallback.caveats,
+                ]))[:5],
+            })
         except Exception:  # noqa: BLE001 - LLM 不可用时降级为确定性摘要
-            answer = deterministic_summary(effective_query(state), rows)
-        return {"final_answer": answer}
+            summary = fallback
+        return {
+            "result_summary": summary,
+            "final_answer": render_result_summary(summary),
+        }
 
     return result_interpretation_node

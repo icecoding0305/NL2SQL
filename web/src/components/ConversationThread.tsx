@@ -29,6 +29,7 @@ const statusLabel: Record<string, string> = {
   error: "处理失败",
   blocked: "请求已拦截",
   rejected: "请求已驳回",
+  cancelled: "查询已停止",
 };
 
 const stageByNode: Record<string, string> = {

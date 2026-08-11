@@ -50,8 +50,12 @@ def make_plan_generation_node(deps):
     def plan_generation_node(state: NL2SQLState) -> NL2SQLState | dict:
         prompt = build_plan_prompt(state, deps)
         try:
-            raw_plan = deps.llm.complete_structured(prompt, QueryPlan, retries=2)
-            plan, normalizations = normalize_structural_coverage(raw_plan, state.semantic_graph)
+            # plan_generation 走节点级模型(配置里保持 deepseek-v4-pro 保质量,flash
+            # 对嵌套 QueryPlan JSON 不稳定);内部重试 2→1,校验失败由模块 6 图级兜底。
+            raw_plan = deps.llm_for("plan_generation").complete_structured(prompt, QueryPlan, retries=1)
+            plan, normalizations = normalize_structural_coverage(
+                raw_plan, state.semantic_graph, state.output_bindings
+            )
             query_mschema = build_query_mschema(state)
             logical_plan = build_logical_plan(plan, state)
             out: dict[str, Any] = {

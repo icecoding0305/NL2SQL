@@ -33,6 +33,7 @@ import {
   saveActiveSession,
 } from "../components/activeSessions";
 import PlanPreviewCard from "../components/PlanPreviewCard";
+import { APPROVAL_ENABLED } from "../config/features";
 import SqlPreviewCard from "../components/SqlPreviewCard";
 import { PIPELINE_NODES, type PipelineEvent, type QueryRecord, type SchemaHit } from "../types";
 
@@ -56,7 +57,7 @@ interface Session {
   trace_id: string;
   query: string;
   data_scope: string[];
-  status: "running" | "pending_review" | "done" | "error" | "rejected" | "blocked";
+  status: "running" | "pending_review" | "done" | "error" | "rejected" | "blocked" | "cancelled";
   steps: Record<string, StepState>;
   trace_steps: string[];
   node_latencies: Record<string, number>;
@@ -87,13 +88,14 @@ export function stepsFromState(data: Record<string, any>): Record<string, StepSt
   if (data.execution_result !== undefined && data.execution_result !== null)
     steps.sandbox_execution = mk({ execution_result: data.execution_result });
   if (data.execution_error) steps.sandbox_execution = { status: "error", data: { error: data.execution_error }, retries: [] };
-  if (data.final_answer) steps.result_interpretation = mk({ final_answer: data.final_answer });
+  if (data.final_answer || data.result_summary)
+    steps.result_interpretation = mk({ final_answer: data.final_answer, result_summary: data.result_summary });
   return steps;
 }
 
 function sessionFromRecord(rec: QueryRecord): Session {
   const status: Session["status"] = [
-    "running", "pending_review", "done", "error", "rejected", "blocked",
+    "running", "pending_review", "done", "error", "rejected", "blocked", "cancelled",
   ].includes(rec.status) ? rec.status as Session["status"] : "done";
   return {
     trace_id: rec.trace_id,
@@ -224,7 +226,9 @@ export function StepCard({
     case "sensitive_check":
       content = data.is_sensitive ? (
         <Space direction="vertical">
-          <Tag color="red">命中敏感规则,需人工确认</Tag>
+          <Tag color={APPROVAL_ENABLED ? "red" : "orange"}>
+            {APPROVAL_ENABLED ? "命中敏感规则,需人工确认" : "命中敏感规则,审批已临时关闭"}
+          </Tag>
           {(data.sensitive_reasons || []).map((r: string) => (
             <Text key={r} type="secondary">
               - {r}
@@ -236,7 +240,9 @@ export function StepCard({
       );
       break;
     case "human_review":
-      content =
+      content = !APPROVAL_ENABLED ? (
+        <Text type="secondary">人工审批已临时关闭</Text>
+      ) :
         step.status === "interrupt" ? (
           <Space direction="vertical">
             <Tag icon={<ClockCircleOutlined />} color="warning">
@@ -257,7 +263,9 @@ export function StepCard({
         ) : null;
       break;
     case "result_interpretation":
-      content = data.final_answer ? <AnswerCard answer={data.final_answer} /> : null;
+      content = data.final_answer || data.result_summary ? (
+        <AnswerCard answer={data.final_answer} summary={data.result_summary} />
+      ) : null;
       break;
     default:
       content = null;

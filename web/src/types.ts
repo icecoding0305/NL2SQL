@@ -45,18 +45,30 @@ export interface DecisionSummary {
   warnings: string[];
 }
 
+export interface ResultSummary {
+  status: "success" | "empty" | "partial";
+  headline: string;
+  overview: string;
+  key_findings: string[];
+  caveats: string[];
+  row_count: number;
+  summarized_row_count: number;
+  truncated: boolean;
+}
+
 export interface QueryRecord {
   trace_id: string;
   user_id: string;
   user_query: string;
   data_scope: string[];
-  status: "running" | "done" | "pending_review" | "error" | "rejected" | "blocked";
+  status: "running" | "done" | "pending_review" | "error" | "rejected" | "blocked" | "cancelled";
   generated_sql?: string | null;
   plan_json?: Record<string, unknown> | null;
   retrieved_schema?: SchemaHit[];
   sensitive_reasons?: string[];
   execution_result?: Record<string, unknown>[] | null;
   execution_error?: string | null;
+  result_summary?: ResultSummary | null;
   final_answer?: string | null;
   trace_steps?: string[];
   node_latencies?: Record<string, number>;

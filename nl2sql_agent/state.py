@@ -57,10 +57,16 @@ class SemanticSubject(BaseModel):
 
 
 class SemanticOutput(BaseModel):
+    """A user-requested result item before it is grounded to physical Schema."""
+
     id: str
     subject_id: str
     concept: str
+    grounding_concept: Optional[str] = None
     source_text: str = ""
+    source_span: list[int] = Field(default_factory=list)
+    required: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class SemanticPredicate(BaseModel):
@@ -150,11 +156,25 @@ class DecisionSummary(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ResultSummary(BaseModel):
+    """Business-facing explanation of an executed query result."""
+
+    status: Literal["success", "empty", "partial"] = "success"
+    headline: str
+    overview: str
+    key_findings: list[str] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+    row_count: int = Field(default=0, ge=0)
+    summarized_row_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+
+
 class FieldCandidate(BaseModel):
     """一个查询槽位对应的字段候选及可解释评分。"""
 
     table_name: str
     column_name: str
+    column_comment: str = ""
     query_slot: str
     semantic_role: str = ""
     data_type: str = ""
@@ -243,6 +263,7 @@ class OutputFieldSpec(_PlanPart):
     aggregation: Optional[Literal[
         "count", "count_distinct", "sum", "avg", "min", "max",
     ]] = None
+    source_output_ids: list[str] = Field(default_factory=list)
 
 
 class OutputGrain(_PlanPart):
@@ -271,6 +292,7 @@ class QueryPlan(BaseModel):
     output_fields: list[OutputFieldSpec] = Field(default_factory=list)
     output_grain: OutputGrain = Field(default_factory=OutputGrain)
     covered_atom_ids: list[str] = Field(default_factory=list)
+    covered_output_ids: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
@@ -308,6 +330,7 @@ class QueryMSchema(BaseModel):
     tables: list[QuerySchemaTable] = Field(default_factory=list)
     relations: list[QuerySchemaRelation] = Field(default_factory=list)
     semantic_bindings: dict[str, dict] = Field(default_factory=dict)
+    output_bindings: dict[str, dict] = Field(default_factory=dict)
 
 
 class LogicalOperation(_PlanPart):
@@ -355,6 +378,10 @@ class NL2SQLState(BaseModel):
     semantic_graph: Optional[SemanticGraph] = None
     # atom_id -> 已选物理字段及业务谓词约束，仅由 Schema Grounding 产生。
     semantic_bindings: dict[str, dict] = Field(default_factory=dict)
+    # output_id -> 已选物理返回字段；显式返回要求必须全部绑定并进入 QueryPlan。
+    output_bindings: dict[str, dict] = Field(default_factory=dict)
+    # 模型识别到但当前可访问 Schema 无法绑定的必需返回概念。
+    unsupported_outputs: list[str] = Field(default_factory=list)
     business_clarification: Optional[BusinessClarification] = None
     # 选项到物理字段的内部绑定；API 不得下发给普通用户。
     business_option_bindings: dict[str, str] = Field(default_factory=dict)
@@ -411,6 +438,7 @@ class NL2SQLState(BaseModel):
     # ---------- 模块 10/11:执行与结果解释 ----------
     execution_result: Optional[list[dict]] = None
     execution_error: Optional[str] = None
+    result_summary: Optional[ResultSummary] = None
     final_answer: Optional[str] = None
 
     # ---------- 身份与权限(入口注入,下游只读) ----------
@@ -423,4 +451,6 @@ class NL2SQLState(BaseModel):
     # ---------- 追踪(预留:反馈闭环/语义缓存可在下游扩展) ----------
     trace_id: str = ""
     node_latencies: dict = Field(default_factory=dict)
+    node_latency_history: dict[str, list[float]] = Field(default_factory=dict)
+    llm_calls: list[dict] = Field(default_factory=list)
     trace_steps: list[str] = Field(default_factory=list)

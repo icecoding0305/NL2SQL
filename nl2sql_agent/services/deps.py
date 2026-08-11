@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from nl2sql_agent.services.config_loader import ConfigLoader
 from nl2sql_agent.services.executor import SQLExecutor
 from nl2sql_agent.services.few_shot_store import FewShotStore
-from nl2sql_agent.services.llm import BaseLLMClient, build_llm, build_sql_llm
+from nl2sql_agent.services.llm import BaseLLMClient, build_llm, build_sql_llm, get_model_for_node
 from nl2sql_agent.services.prompt_loader import PromptLoader
 from nl2sql_agent.services.schema_catalog import SchemaCatalog
 from nl2sql_agent.services.sql_dialect import SqlDialect
@@ -50,6 +50,7 @@ class AppConfig:
     complexity_rules: dict = field(default_factory=dict)
     sensitive_rules: dict = field(default_factory=dict)
     performance: dict = field(default_factory=dict)
+    approval_enabled: bool = True
 
 
 @dataclass
@@ -68,9 +69,97 @@ class Deps:
     # SQL 专用模型(可选,未配置则 SQL 生成回退 llm)
     sql_llm: BaseLLMClient | None = None
 
+    # 节点级模型路由(如 query_resolution 用 flash 提速,plan_generation 保持 pro 保质量)。
+    # 未配置的节点回退 llm;测试环境不注入 → 恒回退 FakeLLM。
+    node_llms: dict[str, BaseLLMClient] = field(default_factory=dict)
+
     # 预留扩展点:反馈闭环、语义缓存(暂不实现,先留接口)
     feedback_sink: object = None
     semantic_cache: object = None
+
+    def llm_for(self, node_key: str) -> BaseLLMClient:
+        """返回节点专用模型;未配置该节点则回退主模型 llm。"""
+        return self.node_llms.get(node_key) or self.llm
+
+    def model_routes(self) -> dict[str, dict[str, str | None]]:
+        """Return the effective runtime routes without exposing credentials or URLs."""
+        def describe(
+            client: BaseLLMClient | None, source: str, scope: str
+        ) -> dict[str, str | None]:
+            if client is None:
+                return {"provider": None, "model": None, "source": source, "scope": scope}
+            provider = type(client).__name__.removesuffix("LLMClient").lower()
+            return {
+                "provider": provider,
+                "model": getattr(client, "model", None),
+                "source": source,
+                "scope": scope,
+            }
+
+        routes = {
+            "default": describe(self.llm, "model_config.runtime", "online_shared"),
+            "query_resolution": describe(
+                self.llm_for("query_resolution"),
+                "nodes.query_resolution" if "query_resolution" in self.node_llms else "model_config.runtime",
+                "online_query",
+            ),
+            "plan_generation": describe(
+                self.llm_for("plan_generation"),
+                "nodes.plan_generation" if "plan_generation" in self.node_llms else "model_config.runtime",
+                "online_query",
+            ),
+            "result_interpretation": describe(
+                self.llm, "model_config.runtime", "online_query_optional"
+            ),
+            "sql_model": describe(
+                self.sql_llm,
+                "runtime.unified" if self.sql_llm is self.llm else "environment.sql_model",
+                "online_query_fallback",
+            ),
+            "sql_generation": {
+                "provider": "deterministic",
+                "model": None,
+                "source": "query_plan_compiler",
+                "scope": "online_query",
+            },
+            "schema_comment_generation": describe(
+                self.llm_for("schema_comment_generation"),
+                "nodes.schema_comment_generation"
+                if "schema_comment_generation" in self.node_llms
+                else "model_config.runtime",
+                "offline_schema_ingest",
+            ),
+        }
+        for node_key, client in self.node_llms.items():
+            if node_key not in routes:
+                routes[node_key] = describe(
+                    client,
+                    f"nodes.{node_key}",
+                    "offline_schema_ingest" if node_key == "schema_comment_generation" else "configured_node",
+                )
+        return routes
+
+
+def _build_node_llms(loader: ConfigLoader) -> dict[str, BaseLLMClient]:
+    """从 config/model_config.yaml 的 nodes 预构建节点级模型。
+
+    只有配置了 model 的节点才会被构建;未配置 → 空 dict,节点回退主模型 llm。
+    构建失败(如缺 API key)也回退,不阻塞启动。
+    """
+    model_config = loader.load("model_config.yaml") or {}
+    runtime = model_config.get("runtime") or {}
+    if runtime.get("unified", False):
+        return {}
+    nodes = model_config.get("nodes", {})
+    out: dict[str, BaseLLMClient] = {}
+    for key, cfg in nodes.items():
+        if cfg.get("inherit", "runtime") == "runtime":
+            continue
+        try:
+            out[key] = get_model_for_node(key)
+        except Exception:  # noqa: BLE001 - 缺 key 等环境问题降级回主模型
+            continue
+    return out
 
 
 def build_executor_from_url(url: str) -> SQLExecutor:
@@ -155,6 +244,7 @@ def build_deps(
         complexity_rules=loader.load("complexity_rules.yaml").get("complexity_rules", {}),
         sensitive_rules=loader.load("sensitive_rules.yaml").get("sensitive_rules", {}),
         performance=settings.get("performance", {}),
+        approval_enabled=bool(settings.get("approval", {}).get("enabled", True)),
     )
 
     term_mapping = TermMappingService(loader)
@@ -162,13 +252,11 @@ def build_deps(
     sql = SqlDialect(config.dialect)
 
     model_runtime = loader.load("model_config.yaml").get("runtime", {})
-    sql_llm = sql_llm or build_sql_llm()  # SQL 专用模型(可选,未配置回退主模型)
     if llm is None:
-        if model_runtime.get("main_model_source", "default") == "sql" and sql_llm is not None:
-            # 计划、复杂问题理解、结果解释与 SQL 生成复用同一客户端和模型。
-            llm = sql_llm
-        else:
-            llm = build_llm()
+        llm = build_llm(model_runtime if model_runtime.get("provider") else None)
+    if sql_llm is None:
+        sql_llm = llm if model_runtime.get("unified", False) else build_sql_llm()
+    node_llms = _build_node_llms(loader)
 
     # 向量存储:显式读 config/vector_store.yaml 选择后端
     if vector_store is None:
@@ -189,6 +277,7 @@ def build_deps(
         loader=loader,
         llm=llm,
         sql_llm=sql_llm,
+        node_llms=node_llms,
         term_mapping=term_mapping,
         catalog=catalog,
         vector_store=vector_store,
