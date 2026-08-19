@@ -22,6 +22,8 @@ from nl2sql_agent.services.term_mapping import TermResolutionStatus
 def _iter_referenced_fields(plan: QueryPlan):
     for f in plan.filters:
         yield f"{f.table}.{f.column}" if f.table else f.column
+    for f in plan.having:
+        yield f"{f.table}.{f.column}" if f.table else f.column
     for col in plan.group_by:
         yield str(col)
     if plan.metric_logic:
@@ -29,6 +31,9 @@ def _iter_referenced_fields(plan: QueryPlan):
     for output in plan.output_fields:
         if output.table and output.column:
             yield f"{output.table}.{output.column}"
+    for order in plan.order_by:
+        if order.table and order.column:
+            yield f"{order.table}.{order.column}"
     yield from plan.output_grain.keys
 
 
@@ -64,16 +69,29 @@ def validate_plan(
     semantic_graph=None,
     semantic_bindings: dict | None = None,
     output_bindings: dict | None = None,
+    semantic_coverage: dict | None = None,
 ) -> list[str]:
     errors: list[str] = []
     known_tables = {h.table_name for h in retrieved_schema}
     table_cols = {h.table_name: {c["name"] for c in h.columns} for h in retrieved_schema}
     target_tables = set(plan.target_tables)
 
+    uncovered = list((semantic_coverage or {}).get("uncovered_mentions") or [])
+    if uncovered:
+        errors.append(f"原问题仍有高影响内容未被语义契约覆盖：{uncovered}")
+
+    if semantic_graph is not None and semantic_graph.query_action == "aggregate":
+        if not any(field.aggregation for field in plan.output_fields):
+            errors.append("用户要求统计/汇总，但 QueryPlan 没有任何聚合输出")
+        if semantic_graph.group_by and not plan.group_by:
+            errors.append("统计问题已声明业务分组粒度，但 QueryPlan 缺少 GROUP BY")
+
     # 0. 所有高影响语义原子必须显式进入计划，禁止静默漏掉用户条件。
     required_atoms = required_atom_ids(semantic_graph)
     implemented_atoms: set[str] = set()
     for item in plan.filters:
+        implemented_atoms.update(item.source_atom_ids)
+    for item in plan.having:
         implemented_atoms.update(item.source_atom_ids)
     for item in plan.join_logic:
         implemented_atoms.update(item.source_atom_ids)
@@ -93,17 +111,23 @@ def validate_plan(
         )
     atom_map = semantic_atom_map(semantic_graph)
     semantic_bindings = semantic_bindings or {}
-    for filter_spec in plan.filters:
+    for filter_spec in [*plan.filters, *plan.having]:
         for atom_id in filter_spec.source_atom_ids:
             atom = atom_map.get(atom_id)
-            if atom and atom.predicate_type in {"comparison", "aggregate_comparison", "status"}:
+            binding = semantic_bindings.get(atom_id)
+            # Schema 绑定可能基于字段值域对原始值进行规范化（上海 → 上海市）。
+            # 此时绑定是语义在物理库中的最终实现，不能再同时要求原始字面值。
+            if (
+                not binding
+                and atom
+                and atom.predicate_type in {"comparison", "aggregate_comparison", "status"}
+            ):
                 if filter_spec.operator != atom.operator or filter_spec.value != atom.value:
                     errors.append(
                         f"语义条件 {atom_id} 的操作符/值与计划不一致: "
                         f"语义={atom.operator} {atom.value!r}, "
                         f"计划={filter_spec.operator} {filter_spec.value!r}"
                     )
-            binding = semantic_bindings.get(atom_id)
             if binding and (
                 filter_spec.table != binding.get("table_name")
                 or filter_spec.column != binding.get("column_name")
@@ -115,6 +139,20 @@ def validate_plan(
                     f"期望={binding.get('table_name')}.{binding.get('column_name')} "
                     f"{binding.get('operator')} {binding.get('value')!r}"
                 )
+
+    if any(item.aggregation for item in plan.filters):
+        errors.append("普通 WHERE filters 不得包含聚合表达式，聚合条件必须放入 having")
+    if any(not item.aggregation for item in plan.having):
+        errors.append("HAVING 条件必须声明 aggregation")
+    atom_types = {
+        atom_id: atom.predicate_type for atom_id, atom in atom_map.items()
+    }
+    for item in plan.filters:
+        if any(atom_types.get(atom_id) == "aggregate_comparison" for atom_id in item.source_atom_ids):
+            errors.append("aggregate_comparison 被错误放入 WHERE，必须使用 HAVING")
+    for item in plan.having:
+        if any(atom_types.get(atom_id) != "aggregate_comparison" for atom_id in item.source_atom_ids):
+            errors.append("HAVING 引用了非聚合比较语义条件")
 
     # 0.5 所有明确返回要求必须进入 output_fields，不能用实体主键替代属性。
     required_outputs = {
@@ -180,6 +218,60 @@ def validate_plan(
                         f"展开返回字段 {field.table}.{field.column} 必须使用业务别名 "
                         f"{labels[key]!r}"
                     )
+
+        semantic_output = next((
+            item for item in (semantic_graph.outputs if semantic_graph else [])
+            if item.id == output_id
+        ), None)
+        expected_aggregation = (
+            semantic_output.aggregation if semantic_output is not None
+            else output_bindings[output_id].get("aggregation")
+        )
+        for field in plan.output_fields:
+            if output_id in field.source_output_ids and field.aggregation != expected_aggregation:
+                errors.append(
+                    f"返回要求 {output_id} 聚合方式不一致："
+                    f"期望={expected_aggregation!r}，计划={field.aggregation!r}"
+                )
+
+    if semantic_graph is not None:
+        if semantic_graph.limit != plan.limit:
+            errors.append(
+                f"用户要求的 TopN/LIMIT 未完整实现："
+                f"期望={semantic_graph.limit!r}，计划={plan.limit!r}"
+            )
+        if len(semantic_graph.order_by) != len(plan.order_by):
+            errors.append("用户要求的排序数量与 QueryPlan 不一致")
+        else:
+            for expected, actual in zip(semantic_graph.order_by, plan.order_by):
+                if expected.direction != actual.direction:
+                    errors.append(
+                        f"排序方向不一致：{expected.concept} 期望 {expected.direction}，"
+                        f"计划为 {actual.direction}"
+                    )
+        if semantic_graph.group_by:
+            if plan.output_grain.level != "aggregate" or not plan.group_by:
+                errors.append("用户要求按维度统计，但 QueryPlan 缺少分组聚合")
+
+    # Aggregating measures from multiple fact/detail tables after a flat JOIN can
+    # multiply amounts.  Only the deterministic pre-aggregation compiler may
+    # handle these plans, and it currently requires one shared grain with no
+    # unscoped row filters.
+    aggregate_tables = {
+        field.table for field in plan.output_fields
+        if field.aggregation and field.table
+    }
+    if len(aggregate_tables) > 1:
+        if len(plan.group_by) != 1 or "." not in plan.group_by[0]:
+            errors.append("多事实指标必须声明一个明确的共同分组粒度，禁止直接 JOIN 后聚合")
+        if plan.group_by:
+            group_table, group_column = plan.group_by[0].rsplit(".", 1)
+            dimensions = [field for field in plan.output_fields if not field.aggregation]
+            if not dimensions or any(
+                field.table != group_table or field.column != group_column
+                for field in dimensions
+            ):
+                errors.append("多事实指标的非聚合输出必须与共同分组字段一致")
 
     # 1. target_tables 必须都在检索结果内
     for t in plan.target_tables:
@@ -269,6 +361,7 @@ def make_plan_validation_node(deps):
                 state.semantic_graph,
                 state.semantic_bindings,
                 state.output_bindings,
+                state.semantic_coverage,
             )
             if state.logical_plan is None:
                 errors.append("LogicalPlan 未生成")
@@ -278,17 +371,31 @@ def make_plan_validation_node(deps):
                 errors.extend(validate_logical_plan(state.logical_plan, state.query_mschema))
 
         # retry_count 只统计失败后的重试，不把首次成功校验计为一次重试。
-        new_count = state.plan_retry_count + (1 if errors else 0)
+        non_retryable = state.plan_generation_error_kind in {
+            "output_truncated", "empty_response", "provider_non_retryable"
+        }
+        new_count = (
+            state.max_plan_retries
+            if errors and non_retryable
+            else state.plan_retry_count + (1 if errors else 0)
+        )
         out: dict[str, Any] = {
             "plan_validation_errors": errors,
             "plan_retry_count": new_count,
         }
         if errors and new_count >= state.max_plan_retries:
-            # 反复生成不对的计划通常说明问题本身有歧义,不要继续重试
-            out["final_answer"] = (
-                "查询计划多次生成失败,问题可能存在歧义,请人工介入\n"
-                + "；".join(errors[:5])
-            )
+            out["terminal_status"] = "error"
+            if state.plan_generation_error_kind == "output_truncated":
+                headline = "模型生成查询计划时输出被截断，未能生成可执行 SQL。"
+            elif state.plan_generation_error_kind == "empty_response":
+                headline = "模型没有返回有效的查询计划正文，未能生成可执行 SQL。"
+            elif state.plan_generation_error_kind == "generation_error":
+                headline = "模型服务或结构化计划生成失败，未能生成可执行 SQL。"
+            elif state.plan_generation_error_kind == "provider_non_retryable":
+                headline = "模型服务拒绝了查询计划请求，请检查模型配置、权限或账户状态。"
+            else:
+                headline = "查询计划未通过完整性校验，未能生成可执行 SQL。"
+            out["final_answer"] = headline + "\n" + "；".join(errors[:5])
         return out
 
     return plan_validation_node

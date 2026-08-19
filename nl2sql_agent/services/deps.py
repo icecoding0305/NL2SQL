@@ -210,6 +210,9 @@ def build_vector_store(
 def build_deps(
     base_dir: str | Path | None = None,
     *,
+    database_url: str | None = None,
+    m_schema_path: str | Path | None = None,
+    relation_overrides: list[dict] | None = None,
     llm: BaseLLMClient | None = None,
     sql_llm: BaseLLMClient | None = None,
     executor: SQLExecutor | None = None,
@@ -220,7 +223,8 @@ def build_deps(
     loader = ConfigLoader(base_dir)
     settings = loader.load("settings.yaml")
     db_url = (
-        settings.get("database_url")
+        database_url
+        or settings.get("database_url")
         or os.getenv("DATABASE_URL")
         or os.getenv("PG_DATABASE_URL")
         or settings.get("pg_database_url")
@@ -248,7 +252,11 @@ def build_deps(
     )
 
     term_mapping = TermMappingService(loader)
-    catalog = SchemaCatalog(loader)
+    catalog = SchemaCatalog(
+        loader,
+        m_schema_path=m_schema_path,
+        relation_overrides=relation_overrides,
+    )
     sql = SqlDialect(config.dialect)
 
     model_runtime = loader.load("model_config.yaml").get("runtime", {})

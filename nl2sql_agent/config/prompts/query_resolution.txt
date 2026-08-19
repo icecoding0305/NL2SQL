@@ -3,6 +3,10 @@
 当前问题：{user_query}
 会话上文：{conversation_history}
 
+补充语义完整性要求：
+- “逾期情况、贷款情况、代偿情况、还款情况、风险表现”等宽泛业务主题必须作为 broad=true 的 required output 保留，不能因为尚未看到 Schema 而删除；后续节点会在查询级候选字段中具体化。
+- query_action 必须反映用户动作：查询为 lookup，列出/展示为 detail，统计/汇总/计算为 aggregate，排名为 rank；不得把“统计”降级成普通主键列表。
+
 要求：
 - 只理解和改写业务语义，不选择物理表、字段或 JOIN
 - 可以消除口语、省略和会话中的明确指代
@@ -15,5 +19,8 @@
 - attributes 必须与 semantic_graph.outputs 的 grounding_concept 保持一致，禁止只保留实体编号而遗漏明确返回属性
 - “有/存在/发生过/没有”不能丢弃，必须形成 status + exists/not_exists 语义
 - semantic_graph 不得包含物理表名、字段名或 SQL
+- semantic_graph 必须保留通用查询契约：group_by 表示用户要求的业务分组维度；order_by 表示排序概念与方向；limit 表示“前N条/TopN”
+- 每个输出必须区分业务概念与计算方式：累计/合计/总计使用 sum，平均使用 avg，数量/笔数优先使用 count_distinct；不得把这些完整短语假设成物理字段名
+- 同一个基础概念可以形成多个独立输出，例如贷款总金额和平均贷款金额都以“贷款金额”为 grounding_concept，但 aggregation 分别为 sum 和 avg
 - 本阶段禁止接收或请求任何数据库 Schema；只能根据用户问题和会话上文理解业务语义
 - 输出必须符合调用方给定的 JSON Schema

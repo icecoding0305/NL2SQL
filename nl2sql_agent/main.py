@@ -16,8 +16,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -25,6 +26,7 @@ from nl2sql_agent.api import get_deps, router as api_router
 from nl2sql_agent.graph import build_graph
 from nl2sql_agent.services.checkpoint import create_sqlite_checkpointer
 from nl2sql_agent.services.deps import load_env
+from nl2sql_agent.security import platform_access_required, verify_platform_token
 
 load_env()  # 加载项目根目录 .env(ANTHROPIC_API_KEY / ANTHROPIC_MODEL / NL2SQL_DEMO 等)
 
@@ -44,6 +46,32 @@ class ApproveRequest(BaseModel):
 
 
 app = FastAPI(title="NL2SQL Agent", version="0.1.0")
+
+
+@app.middleware("http")
+async def require_platform_access(request: Request, call_next):
+    """Protect business and administration APIs behind one shared access code."""
+    path = request.url.path
+    protected = (
+        path.startswith("/api/")
+        or path == "/query"
+        or path == "/approve"
+        or path.startswith("/thread/")
+    )
+    if protected and path != "/api/access/status":
+        if not verify_platform_token(request.headers.get("X-Platform-Token")):
+            return JSONResponse(status_code=401, content={"detail": "访问密码无效或已失效"})
+    return await call_next(request)
+
+
+@app.get("/api/access/status")
+def access_status():
+    return {"required": platform_access_required()}
+
+
+@app.post("/api/access/verify")
+def access_verify():
+    return {"status": "ok"}
 
 # 前端开发服务器跨域(Web 前端默认 http://localhost:5173)
 app.add_middleware(

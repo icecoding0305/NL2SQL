@@ -29,10 +29,10 @@ _COMPARISONS = {
 _COMPARISON_RE = re.compile(
     rf"(?P<field>[\u4e00-\u9fffA-Za-z_][\u4e00-\u9fffA-Za-z_ ]{{0,23}}?)"
     rf"(?P<word>{'|'.join(sorted(_COMPARISONS, key=len, reverse=True))})"
-    rf"(?P<value>-?\d+(?:\.\d+)?)"
+    rf"\s*(?P<value>-?\d+(?:\.\d+)?)"
 )
 _TEXT_FILTER_RE = re.compile(
-    r"(?P<field>[\u4e00-\u9fffA-Za-z_]{1,16}?)(?P<word>等于|为)"
+    r"(?P<field>[\u4e00-\u9fffA-Za-z_]{1,16}?)(?P<word>等于|为|是)"
     r"(?P<value>[\u4e00-\u9fffA-Za-z_]{1,16}?)(?:的|并且|且|$)"
 )
 _MEASURE_RE = re.compile(
@@ -54,6 +54,15 @@ _CONCEPT_ALIASES = {
 }
 
 
+def is_generic_projection(value: str) -> bool:
+    """Match both bare and entity-qualified vague projections."""
+    text = str(value or "")
+    return (
+        any(projection in text for projection in _GENERIC_PROJECTIONS)
+        or any(f"{entity}信息" in text for entity in _ENTITY_WORDS)
+    )
+
+
 def _fallback_output_phrases(query: str) -> list[str]:
     """Conservative safety net for explicit result lists when the LLM is unavailable.
 
@@ -69,14 +78,20 @@ def _fallback_output_phrases(query: str) -> list[str]:
         or re.search(r"\d", tail)
     ):
         return []
-    parts = [item.strip(" 的") for item in re.split(r"和|与|以及|、", tail)]
+    parts = [item.strip(" 的") for item in re.split(r"以及|和|与|及|、", tail)]
     # A lone open-vocabulary tail (e.g. “逾期本金”“借据笔数”) may be a metric,
     # not a projection. The model handles that case; fallback only protects an
     # unmistakable explicit list. Generic entity projections are handled by the
     # existing entity policy rather than pretending they are one physical field.
     if len(parts) < 2:
         return []
-    return [item for item in parts if 1 <= len(item) <= 16 and item not in _ENTITY_WORDS]
+    cleaned: list[str] = []
+    for item in parts:
+        # 保留“客户姓名”“借据编号”等实体限定词。去掉限定词会把明确的
+        # 输出要求退化成“姓名”“编号”，从而在宽表中误选其他同名字段。
+        if 1 <= len(item) <= 16 and item not in _ENTITY_WORDS:
+            cleaned.append(item)
+    return cleaned
 
 
 def normalize_semantic_text(value: str) -> str:
@@ -88,6 +103,9 @@ def normalize_semantic_text(value: str) -> str:
 
 def _clean_measure_phrase(value: str) -> str:
     text = value.strip()
+    # 连续条件中的金额单位和连接词属于上一条件，例如
+    # “贷款金额超过1000元且逾期本金余额大于0”。
+    text = re.sub(r"^(?:亿元|万元|元)?(?:并且|且)", "", text)
     for prefix in _PREFIXES:
         if text.startswith(prefix):
             text = text[len(prefix):]
@@ -149,6 +167,10 @@ def parse_query_intent(query: str) -> QueryIntent:
     attributes: list[IntentSlot] = []
     for phrase in ("基本信息", "详细信息", "联系方式", "明细"):
         if phrase in query:
+            attributes.append(IntentSlot(text=phrase, role="attribute"))
+    for entity in entities:
+        phrase = f"{entity.text}信息"
+        if phrase in query and phrase not in {item.text for item in attributes}:
             attributes.append(IntentSlot(text=phrase, role="attribute"))
     for phrase in _fallback_output_phrases(query):
         if phrase not in {item.text for item in attributes}:
@@ -218,7 +240,7 @@ def rank_field_candidates(
     slots = {
         slot.text: slot
         for slot in [*intent.measures, *intent.filters, *intent.attributes, *intent.dimensions]
-        if slot.text and slot.text not in _GENERIC_PROJECTIONS
+        if slot.text and not is_generic_projection(slot.text)
     }
     candidates: list[FieldCandidate] = []
     for slot_text, slot in slots.items():
@@ -311,6 +333,7 @@ def ground_output_bindings(
     graph: SemanticGraph | None,
     candidates: list[FieldCandidate],
     overrides: dict[str, str] | None = None,
+    tables: list[TableDef] | None = None,
 ) -> dict[str, dict]:
     """Bind required outputs; broad result-only concepts may expand safely."""
     if graph is None:
@@ -325,6 +348,53 @@ def ground_output_bindings(
         if not output.required:
             continue
         concept = output.grounding_concept or output.concept
+        if output.aggregation == "count_distinct" and tables:
+            grain = normalize_semantic_text(output.distinct_grain or concept)
+            identifiers: list[tuple[float, TableDef, dict]] = []
+            for table in tables:
+                table_text = normalize_semantic_text(f"{table.name}{table.comment}")
+                table_affinity = 0.35 if grain and grain in table_text else 0.0
+                for column in table.columns:
+                    name = str(column.get("name") or "")
+                    comment = str(column.get("comment") or "")
+                    column_text = normalize_semantic_text(f"{name}{comment}")
+                    identifier_hint = any(token in comment for token in ("编号", "编码", "号码", "号"))
+                    score = table_affinity
+                    if column.get("primary_key"):
+                        score += 1.0
+                    elif column.get("unique"):
+                        score += 0.85
+                    elif identifier_hint:
+                        score += 0.45
+                    if grain and grain in column_text:
+                        score += 0.35
+                    if re.search(r"(?:^|_)(?:id|no|code)$", name, re.IGNORECASE):
+                        score += 0.2
+                    if score >= 0.65:
+                        identifiers.append((score, table, column))
+            if identifiers:
+                score, table, column = max(
+                    identifiers,
+                    key=lambda item: (item[0], bool(item[2].get("primary_key")), bool(item[2].get("unique"))),
+                )
+                bindings[output.id] = {
+                    "concept": output.concept,
+                    "grounding_concept": concept,
+                    "table_name": table.name,
+                    "column_name": str(column.get("name") or ""),
+                    "confidence": min(1.0, score),
+                    "required": True,
+                    "aggregation": output.aggregation,
+                    "distinct_grain": output.distinct_grain,
+                    "binding_mode": "derived",
+                    "bindings": [{
+                        "table_name": table.name,
+                        "column_name": str(column.get("name") or ""),
+                        "label": output.concept,
+                        "confidence": min(1.0, score),
+                    }],
+                }
+                continue
         options = by_slot.get(concept, [])
         override = overrides.get(concept)
         if override:
@@ -332,6 +402,29 @@ def ground_output_bindings(
                 item for item in options
                 if f"{item.table_name}.{item.column_name}" == override
             ]
+        # A grouping entity is a result grain, not merely a readable label.
+        # Prefer a non-null primary/unique identifier over another semantically
+        # similar code (for example CUST_ID over a nullable source CORE_NO).
+        is_grouping_entity = any(
+            normalize_semantic_text(group) == normalize_semantic_text(concept)
+            for group in graph.group_by
+        ) and not output.aggregation
+        if is_grouping_entity and tables and not override:
+            column_meta = {
+                (table.name, str(column.get("name") or "")): column
+                for table in tables
+                for column in table.columns
+            }
+            options = sorted(
+                options,
+                key=lambda item: (
+                    bool(column_meta.get((item.table_name, item.column_name), {}).get("primary_key")),
+                    bool(column_meta.get((item.table_name, item.column_name), {}).get("unique")),
+                    not bool(column_meta.get((item.table_name, item.column_name), {}).get("nullable", True)),
+                    item.final_score,
+                ),
+                reverse=True,
+            )
         if not options or options[0].final_score < 0.42:
             continue
         selected = options[0]
@@ -367,6 +460,8 @@ def ground_output_bindings(
             "column_name": selected.column_name,
             "confidence": selected.final_score,
             "required": True,
+            "aggregation": output.aggregation,
+            "distinct_grain": output.distinct_grain,
             "binding_mode": "expanded" if len(physical_bindings) > 1 else "exact",
             "bindings": physical_bindings,
         }
@@ -392,6 +487,17 @@ def _entity_table_score(entity: str, table: TableDef) -> float:
     if wanted and wanted in column_text:
         return 0.55
     return 0.0
+
+
+def _profile_table_score(table: TableDef) -> float:
+    """Prefer readable entity profiles over measure-heavy aggregate tables."""
+    readable = [
+        column for column in table.columns
+        if column.get("comment")
+        and not column.get("primary_key")
+        and not _is_numeric(column)
+    ]
+    return min(0.25, len(readable) / 12 * 0.25)
 
 
 def _usable_relation(relation: dict) -> bool:
@@ -449,7 +555,7 @@ def build_schema_plan(
     ordered_slots = list(dict.fromkeys(
         item.text
         for item in [*intent.measures, *intent.filters, *intent.attributes, *intent.dimensions]
-        if item.text and item.text not in _GENERIC_PROJECTIONS
+        if item.text and not is_generic_projection(item.text)
     ))
     for slot in ordered_slots:
         options = by_slot.get(slot, [])
@@ -468,8 +574,15 @@ def build_schema_plan(
     dimensions: dict[str, PlannedTable] = {}
     dimension_slots = {item.text for item in intent.dimensions}
     attribute_slots = {item.text for item in intent.attributes}
+    fact_slots = {item.text for item in [*intent.measures, *intent.filters]}
     for candidate in selected:
-        if candidate.query_slot in dimension_slots or candidate.query_slot in attribute_slots:
+        # 同一字段可同时出现在 WHERE 与 SELECT 中；筛选/度量的事实角色
+        # 优先，不能因为它也是返回属性就把事实锚点降级为维表。
+        is_result_dimension = (
+            candidate.query_slot in dimension_slots
+            or candidate.query_slot in attribute_slots
+        ) and candidate.query_slot not in fact_slots
+        if is_result_dimension:
             existing_dimension = dimensions.get(candidate.table_name)
             if existing_dimension:
                 if candidate.column_name not in existing_dimension.selected_columns:
@@ -506,9 +619,41 @@ def build_schema_plan(
                 score=candidate.final_score,
             )
 
+    wants_profile = any(is_generic_projection(item.text) for item in intent.attributes)
     for entity in intent.entities:
+        # 明确列举返回字段时，如果已选字段所在的事实表已经覆盖该实体，
+        # 就直接复用该表；只有“基本信息”等宽泛投影才主动寻找画像表。
+        entity_text = normalize_semantic_text(entity.text)
+        covered_by_anchor = any(
+            candidate.table_name in anchors
+            and (
+                entity_text in normalize_semantic_text(candidate.column_comment)
+                or entity_text in normalize_semantic_text(
+                    table_by_name[candidate.table_name].comment
+                )
+            )
+            for candidate in selected
+        )
+        if covered_by_anchor and not wants_profile:
+            continue
+
+        def entity_rank(table: TableDef) -> float:
+            score = _entity_table_score(entity.text, table)
+            if wants_profile:
+                score += _profile_table_score(table)
+                if table.name in anchors:
+                    score += 0.18
+                elif any(
+                    _shortest_path(
+                        anchor_name, table.name, relations, set(table_by_name), max_hops
+                    )[0]
+                    for anchor_name in anchors
+                ):
+                    score += 0.22
+            return score
+
         ranked = sorted(
-            ((table, _entity_table_score(entity.text, table)) for table in tables),
+            ((table, entity_rank(table)) for table in tables),
             key=lambda pair: (-pair[1], pair[0].name),
         )
         if not ranked or ranked[0][1] < 0.5:
@@ -536,9 +681,21 @@ def build_schema_plan(
                     score=score,
                 )
 
+    # 同一物理表可能同时承载筛选度量和返回属性。关系规划前将它合并为
+    # 一个事实锚点，避免产生 table -> table 的伪自关联路径。
+    for table_name in set(anchors) & set(dimensions):
+        dimension = dimensions.pop(table_name)
+        anchor = anchors[table_name]
+        anchor.selected_columns = list(dict.fromkeys([
+            *anchor.selected_columns,
+            *dimension.selected_columns,
+        ]))
+        anchor.score = max(anchor.score, dimension.score)
+        anchor.reason = f"{anchor.reason}；{dimension.reason}"
+
     bridges: dict[str, PlannedTable] = {}
     selected_relations: list[dict] = []
-    connected_targets = list(anchors) + list(dimensions)
+    connected_targets = list(dict.fromkeys([*anchors, *dimensions]))
     if len(connected_targets) > 1:
         root = connected_targets[0]
         for target in connected_targets[1:]:
@@ -583,3 +740,100 @@ def plan_table_names(plan: SchemaPlan) -> list[str]:
         *(item.table_name for item in plan.bridge_tables),
         *(item.table_name for item in plan.dimension_tables),
     ]))
+
+
+def extend_schema_plan_for_output_bindings(
+    plan: SchemaPlan,
+    bindings: dict[str, dict],
+    tables: list[TableDef],
+    relations: list[dict],
+    *,
+    max_hops: int = 3,
+) -> SchemaPlan:
+    """Ensure every grounded required output belongs to the planned relation subgraph."""
+    updated = plan.model_copy(deep=True)
+    table_by_name = {table.name: table for table in tables}
+    planned = {
+        item.table_name: item
+        for item in [
+            *updated.anchor_tables, *updated.dimension_tables, *updated.bridge_tables,
+        ]
+    }
+    required_by_table: dict[str, list[str]] = {}
+    for binding in bindings.values():
+        for field in output_binding_fields(binding):
+            table = str(field.get("table_name") or "")
+            column = str(field.get("column_name") or "")
+            if table and column:
+                required_by_table.setdefault(table, []).append(column)
+
+    root = next(iter(planned), None)
+    selected_relations = list(updated.relations)
+    for table_name, columns in required_by_table.items():
+        if table_name in planned:
+            planned[table_name].selected_columns = list(dict.fromkeys([
+                *planned[table_name].selected_columns, *columns,
+            ]))
+            continue
+        if table_name not in table_by_name:
+            updated.unresolved_slots.append(f"输出字段表不存在:{table_name}")
+            continue
+        if root is None:
+            root = table_name
+            path, edges = [table_name], []
+        else:
+            path, edges = _shortest_path(
+                root, table_name, relations, set(table_by_name), max_hops
+            )
+        if not path:
+            updated.unresolved_slots.append(f"输出关联路径:{root}->{table_name}")
+            continue
+        selected_relations.extend(edge for edge in edges if edge not in selected_relations)
+        for path_table in path[1:-1]:
+            if path_table in planned:
+                continue
+            relation_columns: list[str] = []
+            for edge in edges:
+                if edge.get("source_table") == path_table:
+                    relation_columns.extend(edge.get("source_columns", []))
+                if edge.get("target_table") == path_table:
+                    relation_columns.extend(edge.get("target_columns", []))
+            bridge = PlannedTable(
+                table_name=path_table,
+                role="bridge",
+                selected_columns=list(dict.fromkeys(relation_columns)),
+                reason=f"连接 {root} 与 {table_name}",
+                score=1.0,
+            )
+            updated.bridge_tables.append(bridge)
+            planned[path_table] = bridge
+        anchor = PlannedTable(
+            table_name=table_name,
+            role="secondary_fact" if updated.anchor_tables else "primary_fact",
+            selected_columns=list(dict.fromkeys(columns)),
+            reason="承载已确认的用户返回字段",
+            score=float(bindings[next(
+                key for key, value in bindings.items()
+                if any(
+                    field.get("table_name") == table_name
+                    for field in output_binding_fields(value)
+                )
+            )].get("confidence") or 0.75),
+        )
+        updated.anchor_tables.append(anchor)
+        planned[table_name] = anchor
+
+    # Relation keys are part of the minimal query schema even when they were not
+    # direct user outputs.
+    for relation in selected_relations:
+        for table_name, columns in (
+            (relation.get("source_table"), relation.get("source_columns", [])),
+            (relation.get("target_table"), relation.get("target_columns", [])),
+        ):
+            if table_name in planned:
+                planned[table_name].selected_columns = list(dict.fromkeys([
+                    *planned[table_name].selected_columns, *columns,
+                ]))
+    updated.relations = selected_relations
+    updated.unresolved_slots = list(dict.fromkeys(updated.unresolved_slots))
+    return updated

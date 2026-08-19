@@ -9,6 +9,26 @@ runtime:
   api_key_env: DEEPSEEK_API_KEY
   # DeepSeek 当前走纯 JSON 文本解析；切换支持 function calling 的 OpenAI 兼容模型时可设 true。
   supports_tool_calling: false
+  request:
+    nodes:
+      query_resolution:
+        max_tokens: 2500
+        # 结构化解析需要短而完整的 JSON，不让默认思考过程占满输出预算。
+        extra_body:
+          thinking:
+            type: disabled
+      plan_generation:
+        # 计划由语义图和最小 Schema 约束，非思考模式更快且能稳定输出完整 JSON。
+        max_tokens: 4096
+        extra_body:
+          thinking:
+            type: disabled
+      schema_retrieval:
+        # 仅在模糊投影具体化时调用，要求快速返回短结构化字段选择。
+        max_tokens: 1800
+        extra_body:
+          thinking:
+            type: disabled
 
 embedding:
   # local:本地 sentence-transformers(需可下载/离线缓存模型)
@@ -28,6 +48,8 @@ nodes:
   query_resolution:
     inherit: runtime
   plan_generation:
+    inherit: runtime
+  projection_resolution:
     inherit: runtime
   schema_comment_generation:
     inherit: runtime

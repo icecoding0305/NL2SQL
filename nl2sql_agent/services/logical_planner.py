@@ -159,7 +159,7 @@ def build_logical_plan(plan: QueryPlan, state: NL2SQLState) -> LogicalPlan:
         ))
         root = "filter_1"
 
-    if plan.metric_logic or plan.group_by:
+    if plan.metric_logic or plan.group_by or any(field.aggregation for field in plan.output_fields):
         operations.append(LogicalOperation(
             id="aggregate_1",
             kind="aggregate",
@@ -170,15 +170,46 @@ def build_logical_plan(plan: QueryPlan, state: NL2SQLState) -> LogicalPlan:
         ))
         root = "aggregate_1"
 
+    if plan.having:
+        operations.append(LogicalOperation(
+            id="having_1",
+            kind="having",
+            inputs=[root],
+            predicates=plan.having,
+            source_atom_ids=list(dict.fromkeys(
+                atom_id for item in plan.having for atom_id in item.source_atom_ids
+            )),
+        ))
+        root = "having_1"
+
     operations.append(LogicalOperation(
         id="project_1",
         kind="project",
         inputs=[root],
         fields=plan.output_fields,
     ))
+    root = "project_1"
+    if plan.order_by:
+        operations.append(LogicalOperation(
+            id="sort_1",
+            kind="sort",
+            inputs=[root],
+            sort_by=[
+                f"{item.concept} {item.direction.upper()}" for item in plan.order_by
+            ],
+        ))
+        root = "sort_1"
+    if plan.limit:
+        operations.append(LogicalOperation(
+            id="limit_1",
+            kind="limit",
+            inputs=[root],
+            limit=plan.limit,
+        ))
+        root = "limit_1"
     return LogicalPlan(
         operations=operations,
-        root_operation_id="project_1",
+        root_operation_id=root,
         output_fields=plan.output_fields,
         output_grain=plan.output_grain,
         covered_atom_ids=plan.covered_atom_ids,

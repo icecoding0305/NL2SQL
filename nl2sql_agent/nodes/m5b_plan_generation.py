@@ -12,6 +12,11 @@ from typing import Any
 
 from nl2sql_agent.services.prompt_context import compact_schema_facts, conversation_facts, effective_query, prompt_json, term_facts
 from nl2sql_agent.services.logical_planner import build_logical_plan, build_query_mschema
+from nl2sql_agent.services.llm import (
+    LLMOutputTruncatedError,
+    LLMResponseError,
+    classify_llm_error,
+)
 from nl2sql_agent.services.plan_normalizer import normalize_structural_coverage
 from nl2sql_agent.state import NL2SQLState, QueryPlan
 
@@ -52,9 +57,12 @@ def make_plan_generation_node(deps):
         try:
             # plan_generation 走节点级模型(配置里保持 deepseek-v4-pro 保质量,flash
             # 对嵌套 QueryPlan JSON 不稳定);内部重试 2→1,校验失败由模块 6 图级兜底。
-            raw_plan = deps.llm_for("plan_generation").complete_structured(prompt, QueryPlan, retries=1)
+            raw_plan = deps.llm_for("plan_generation").complete_structured(prompt, QueryPlan, retries=0)
             plan, normalizations = normalize_structural_coverage(
-                raw_plan, state.semantic_graph, state.output_bindings
+                raw_plan,
+                state.semantic_graph,
+                state.output_bindings,
+                state.semantic_bindings,
             )
             query_mschema = build_query_mschema(state)
             logical_plan = build_logical_plan(plan, state)
@@ -65,14 +73,33 @@ def make_plan_generation_node(deps):
                 "plan_normalizations": normalizations,
                 # 成功生成即清空历史校验错误,避免把上一轮的失败带到下一轮
                 "plan_validation_errors": [],
+                "plan_generation_error_kind": None,
             }
             return out
-        except Exception as e:  # noqa: BLE001
-            # 结构化解析失败:记入 plan_validation_errors,由 plan_validation 判定重试
+        except LLMOutputTruncatedError as e:
             return {
                 "query_plan": None,
                 "logical_plan": None,
                 "plan_normalizations": [],
+                "plan_generation_error_kind": "output_truncated",
+                "plan_validation_errors": [f"计划生成失败（模型输出被截断）：{e}"],
+            }
+        except LLMResponseError as e:
+            return {
+                "query_plan": None,
+                "logical_plan": None,
+                "plan_normalizations": [],
+                "plan_generation_error_kind": "empty_response",
+                "plan_validation_errors": [f"计划生成失败（模型未返回有效正文）：{e}"],
+            }
+        except Exception as e:  # noqa: BLE001
+            # 结构化解析失败:记入 plan_validation_errors,由 plan_validation 判定重试
+            error_kind = classify_llm_error(e)
+            return {
+                "query_plan": None,
+                "logical_plan": None,
+                "plan_normalizations": [],
+                "plan_generation_error_kind": error_kind,
                 "plan_validation_errors": [f"计划生成失败(结构化输出解析): {e}"],
             }
 

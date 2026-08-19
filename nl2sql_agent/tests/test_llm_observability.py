@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
 from nl2sql_agent.graph import _traced
 from nl2sql_agent.services.deps import Deps
-from nl2sql_agent.services.llm import DeepSeekLLMClient
+from nl2sql_agent.services.llm import DeepSeekLLMClient, LLMOutputTruncatedError
 from nl2sql_agent.services.llm_telemetry import begin_capture, end_capture
 from nl2sql_agent.services.query_store import QueryStore
 from nl2sql_agent.state import NL2SQLState
@@ -45,6 +47,54 @@ def test_deepseek_call_metadata_is_captured_without_content():
     assert call["completion_tokens"] == 7
     assert call["total_tokens"] == 19
     assert "secret prompt" not in str(call)
+
+
+def test_plan_generation_uses_node_budget_and_stops_on_empty_length_response():
+    class EmptyMessage:
+        content = None
+        reasoning_content = "thinking"
+
+    class EmptyCompletions:
+        last_kwargs = None
+
+        def create(self, **kwargs):
+            self.last_kwargs = kwargs
+            usage = type("Usage", (), {
+                "prompt_tokens": 100,
+                "completion_tokens": 4096,
+                "total_tokens": 4196,
+            })()
+            choice = type("Choice", (), {
+                "message": EmptyMessage(), "finish_reason": "length",
+            })()
+            return type("Response", (), {
+                "id": "req-truncated", "choices": [choice], "usage": usage,
+            })()
+
+    completions = EmptyCompletions()
+    client_obj = type("Client", (), {
+        "chat": type("Chat", (), {"completions": completions})(),
+    })()
+    client = DeepSeekLLMClient(
+        client_obj,
+        model="deepseek-v4-flash",
+        request_config={"nodes": {"plan_generation": {
+            "max_tokens": 4096,
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }}},
+    )
+    tokens = begin_capture("plan_generation", "trace-truncated")
+    try:
+        with pytest.raises(LLMOutputTruncatedError):
+            client.complete("plan prompt")
+    finally:
+        calls = end_capture(tokens)
+
+    assert completions.last_kwargs["max_tokens"] == 4096
+    assert completions.last_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert len(calls) == 1
+    assert calls[0]["error_type"] == "LLMOutputTruncatedError"
+    assert calls[0]["completion_tokens"] == 4096
 
 
 def test_repeated_node_latencies_are_accumulated_and_preserved():

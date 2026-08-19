@@ -14,8 +14,6 @@ from __future__ import annotations
 import json
 import re
 
-import yaml
-
 from nl2sql_agent.services.config_loader import ConfigLoader
 from nl2sql_agent.services.deps import CONFIG_DIR
 from nl2sql_agent.services.schema_ingest.comment_generator import (
@@ -134,6 +132,12 @@ def test_ingest_quality_gate(tmp_path, monkeypatch):
     from nl2sql_agent.services.schema_catalog import SchemaCatalog
     from nl2sql_agent.services.vector_store.memory import InMemoryVectorStore
 
+    (tmp_path / "settings.yaml").write_text(
+        "schema_source:\n"
+        "  mode: m_schema\n"
+        "  m_schema_path: schema_artifacts/ds/m-schema.json\n",
+        encoding="utf-8",
+    )
     runtime_catalog = SchemaCatalog(ConfigLoader(tmp_path))
     embed_calls = 0
 
@@ -331,20 +335,22 @@ def test_extract_constraints_and_generate_mschema(tmp_path):
     assert data["tables"]["loan"]["fields"]["AMT"]["dim_or_meas"] == "measure"
     assert (tmp_path / "schema_artifacts" / "ds" / "manifest.json").exists()
 
-    catalog = yaml.safe_load((tmp_path / "schema_catalog.yaml").read_text(encoding="utf-8"))
     manifest = json.loads(
         (tmp_path / "schema_artifacts" / "ds" / "manifest.json").read_text(encoding="utf-8")
     )
-    assert catalog["_meta"]["source"] == "effective-m-schema"
-    assert catalog["_meta"]["semantic_hash"] == manifest["semantic_hash"]
-    projected = catalog["risk_mart"]["tables"][0]
-    assert projected["name"] == "loan"
-    assert projected["columns"][0]["primary_key"] is True
+    assert not (tmp_path / "schema_catalog.yaml").exists()
 
     from nl2sql_agent.services.schema_catalog import SchemaCatalog
 
+    (tmp_path / "settings.yaml").write_text(
+        "schema_source:\n"
+        "  mode: m_schema\n"
+        "  m_schema_path: schema_artifacts/ds/m-schema.json\n",
+        encoding="utf-8",
+    )
     runtime_catalog = SchemaCatalog(ConfigLoader(tmp_path))
     assert runtime_catalog.metadata["snapshot_id"] == report.snapshot_id
+    assert runtime_catalog.metadata["semantic_hash"] == manifest["semantic_hash"]
     assert runtime_catalog.tables_for_scope(["risk_mart"])[0].name == "loan"
 
 

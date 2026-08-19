@@ -533,6 +533,59 @@ def test_query_resolution_keeps_missing_time_as_business_question(deps):
     assert "时间范围" in out["resolved_query"].unresolved_business_slots
 
 
+def test_query_resolution_does_not_let_empty_model_fields_erase_explicit_outputs(deps):
+    from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
+    from nl2sql_agent.state import ResolvedQuery
+
+    class IncompleteResolutionLLM:
+        def complete_structured(self, prompt, model, retries=0):
+            assert model is ResolvedQuery
+            return ResolvedQuery(
+                original_query="",
+                rewritten_query="统计有逾期的客户姓名及地址",
+                query_type="unknown",
+                confidence=0,
+            )
+
+    deps.config.clarification_rules.setdefault("query_resolution", {})["use_llm"] = True
+    deps.node_llms["query_resolution"] = IncompleteResolutionLLM()
+    out = make_query_resolution_node(deps)(
+        NL2SQLState(**make_input("统计有逾期的客户姓名及地址"))
+    )
+
+    resolved = out["resolved_query"]
+    assert resolved.query_type != "unknown"
+    assert {"客户姓名", "地址"} <= set(resolved.attributes)
+    assert [item.concept for item in out["semantic_graph"].outputs] == ["客户姓名", "地址"]
+
+
+def test_broad_topic_defers_model_metric_scope_question_to_schema(deps):
+    from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
+    from nl2sql_agent.state import ResolvedQuery
+
+    query = "统计户籍地址为上海的客户的逾期情况"
+
+    class MetricScopeQuestionLLM:
+        def complete_structured(self, prompt, model, retries=0):
+            assert model is ResolvedQuery
+            return ResolvedQuery(
+                original_query=query,
+                rewritten_query=query,
+                query_type="aggregation",
+                unresolved_business_slots=["统计指标口径"],
+                confidence=0.9,
+            )
+
+    deps.config.clarification_rules.setdefault("query_resolution", {})["use_llm"] = True
+    deps.node_llms["query_resolution"] = MetricScopeQuestionLLM()
+
+    out = make_query_resolution_node(deps)(NL2SQLState(**make_input(query)))
+
+    assert out["need_clarification"] is False
+    assert out["resolved_query"].unresolved_business_slots == []
+    assert any(item.broad for item in out["semantic_graph"].outputs)
+
+
 def test_semantic_graph_preserves_comparison_and_overdue_existence(deps):
     from nl2sql_agent.services.semantic_parser import (
         build_semantic_graph,

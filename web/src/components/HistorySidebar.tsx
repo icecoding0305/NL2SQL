@@ -17,7 +17,7 @@ const { Text } = Typography;
 
 interface Props {
   records: QueryRecord[];
-  activeTrace: string | null;
+  activeConversation: string | null;
   onOpen: (record: QueryRecord) => void;
   onNew: () => void;
   onRefresh: () => void;
@@ -34,11 +34,11 @@ const statusLabels: Record<string, string> = {
   cancelled: "已停止",
 };
 
-export default function HistorySidebar({ records, activeTrace, onOpen, onNew, onRefresh, onDelete }: Props) {
+export default function HistorySidebar({ records, activeConversation, onOpen, onNew, onRefresh, onDelete }: Props) {
   const [collapsed, setCollapsed] = useState(false);
   const [keyword, setKeyword] = useState("");
   const filtered = useMemo(
-    () => records.filter((record) => record.user_query.toLowerCase().includes(keyword.trim().toLowerCase())),
+    () => records.filter((record) => (record.title || record.user_query).toLowerCase().includes(keyword.trim().toLowerCase())),
     [records, keyword],
   );
 
@@ -76,16 +76,19 @@ export default function HistorySidebar({ records, activeTrace, onOpen, onNew, on
         <div className="history-list">
           {filtered.map((record) => (
             <div
-              key={record.trace_id}
-              className={`history-item ${record.trace_id === activeTrace ? "active" : ""}`}
+              key={record.conversation_id || record.trace_id}
+              className={`history-item ${(record.conversation_id || record.trace_id) === activeConversation ? "active" : ""}`}
               onClick={() => onOpen(record)}
               role="button"
               tabIndex={0}
               onKeyDown={(event) => event.key === "Enter" && onOpen(record)}
             >
-              <div className="history-item-title" title={record.user_query}>{record.user_query}</div>
+              <div className="history-item-title" title={record.title || record.user_query}>
+                {record.title || record.user_query}
+              </div>
               <div className="history-item-meta">
-                <span>{record.created_at ? dayjs(record.created_at).format("MM-DD HH:mm") : "刚刚"}</span>
+                <span>{record.updated_at || record.created_at ? dayjs(record.updated_at || record.created_at).format("MM-DD HH:mm") : "刚刚"}</span>
+                {(record.turn_count || 1) > 1 && <span>· {record.turn_count} 轮</span>}
                 <span>·</span>
                 <span>{statusLabels[record.status] || record.status}</span>
               </div>
@@ -94,7 +97,7 @@ export default function HistorySidebar({ records, activeTrace, onOpen, onNew, on
                 menu={{
                   items: [
                     { key: "open", label: "打开会话" },
-                    { key: "copy", icon: <CopyOutlined />, label: "复制 Trace ID" },
+                    { key: "copy", icon: <CopyOutlined />, label: "复制会话 ID" },
                     { type: "divider" },
                     {
                       key: "delete",
@@ -108,13 +111,13 @@ export default function HistorySidebar({ records, activeTrace, onOpen, onNew, on
                     domEvent.stopPropagation();
                     if (key === "open") onOpen(record);
                     if (key === "copy") {
-                      navigator.clipboard.writeText(record.trace_id);
-                      message.success("Trace ID 已复制");
+                      navigator.clipboard.writeText(record.conversation_id || record.trace_id);
+                      message.success("会话 ID 已复制");
                     }
                     if (key === "delete") {
                       Modal.confirm({
                         title: "删除这条对话？",
-                        content: "查询记录、反馈和恢复状态将一并删除，且无法撤销。",
+                        content: "该对话中的全部查询、反馈和恢复状态将一并删除，且无法撤销。",
                         okText: "删除",
                         cancelText: "取消",
                         okButtonProps: { danger: true },

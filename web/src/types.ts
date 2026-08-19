@@ -43,6 +43,9 @@ export interface DecisionSummary {
   assumptions: string[];
   confidence: Record<string, number>;
   warnings: string[];
+  resolved_outputs: string[];
+  excluded_outputs: string[];
+  missing_outputs: string[];
 }
 
 export interface ResultSummary {
@@ -58,6 +61,8 @@ export interface ResultSummary {
 
 export interface QueryRecord {
   trace_id: string;
+  conversation_id?: string;
+  database_id?: string;
   user_id: string;
   user_query: string;
   data_scope: string[];
@@ -86,10 +91,58 @@ export interface QueryRecord {
   semantic_graph?: Record<string, unknown> | null;
   business_clarification?: BusinessClarification | null;
   decision_summary?: DecisionSummary | null;
+  projection_decision?: Record<string, unknown> | null;
   clarification_reason?: string;
   created_at?: string;
+  updated_at?: string;
+  title?: string;
+  turn_count?: number;
   finished_at?: string;
   feedbacks?: { id: number; node: string; feedback_type: string; comment: string }[];
+}
+
+export interface DatabaseConfig {
+  id: string;
+  name: string;
+  engine: "mysql" | "postgres";
+  host: string;
+  port: number;
+  database_name: string;
+  username: string;
+  namespace: string;
+  is_default: boolean;
+  password_configured: boolean;
+  schema_status: "not_synced" | "syncing" | "ready" | "error";
+  schema_message?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface SchemaOptionColumn {
+  name: string;
+  comment: string;
+  type: string;
+}
+
+export interface SchemaOptionTable {
+  table_name: string;
+  comment: string;
+  columns: SchemaOptionColumn[];
+}
+
+export interface DatabaseRelation {
+  id: string;
+  database_id: string;
+  source_table: string;
+  source_columns: string[];
+  target_table: string;
+  target_columns: string[];
+  cardinality: "one_to_one" | "one_to_many" | "many_to_one" | "many_to_many" | "unknown";
+  preferred_join_type: "inner" | "left";
+  description?: string;
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
 }
 
 // WebSocket 推送的 pipeline 节点事件(node 与后端节点名一致)
@@ -102,6 +155,7 @@ export interface PipelineEvent {
     | "interrupt"
     | "final"
     | "error"
+    | "cancelled"
     | "done"
     | "ping"
     | "restore";

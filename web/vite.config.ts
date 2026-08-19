@@ -9,6 +9,8 @@ export default defineConfig({
     // 监听所有接口,避免只监听 IPv6 [::1] 导致浏览器(IPv4)访问 localhost 打不开
     host: "0.0.0.0",
     port: 5173,
+    // 仅允许当前 Tailscale Funnel 域名，避免关闭 Vite 的 Host 校验。
+    allowedHosts: ["wangbing-pc.tailac8797.ts.net"],
     proxy: {
       "/api": {
         target: process.env.VITE_PROXY_TARGET || "http://localhost:8000",

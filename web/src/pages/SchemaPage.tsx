@@ -20,6 +20,7 @@ import {
   ReloadOutlined,
 } from "@ant-design/icons";
 import { apiGet, apiPost } from "../api";
+import type { DatabaseConfig } from "../types";
 
 const { Text } = Typography;
 
@@ -52,7 +53,7 @@ interface ReviewItem {
 
 // ---------------- 表结构浏览 + 补充注释 ----------------
 
-function SchemaBrowse({ businessLine }: { businessLine: string }) {
+function SchemaBrowse({ databaseId }: { databaseId?: string }) {
   const [tables, setTables] = useState<TableInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [editTarget, setEditTarget] = useState<{
@@ -63,13 +64,21 @@ function SchemaBrowse({ businessLine }: { businessLine: string }) {
   const [editText, setEditText] = useState("");
 
   const load = useCallback(async () => {
+    if (!databaseId) {
+      setTables([]);
+      return;
+    }
     setLoading(true);
-    const data = await apiGet<TableInfo[]>(`/api/schema?business_line=${businessLine}`).catch(
-      () => [],
-    );
-    setTables(data);
-    setLoading(false);
-  }, [businessLine]);
+    try {
+      const data = await apiGet<TableInfo[]>(`/api/schema?database_id=${encodeURIComponent(databaseId)}`);
+      setTables(data);
+    } catch (error) {
+      setTables([]);
+      message.error(error instanceof Error ? error.message : "表结构加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [databaseId]);
 
   useEffect(() => {
     load();
@@ -86,7 +95,7 @@ function SchemaBrowse({ businessLine }: { businessLine: string }) {
     const url = column
       ? `/api/schema/${table}/${column}/comment`
       : `/api/schema/${table}/comment`;
-    await apiPost(`${url}?business_line=${businessLine}`, { comment: editText });
+    await apiPost(`${url}?database_id=${encodeURIComponent(databaseId || "")}`, { comment: editText });
     message.success("已保存(写入系统覆盖层,不改数据库 DDL)");
     setEditTarget(null);
     load();
@@ -153,8 +162,8 @@ function SchemaBrowse({ businessLine }: { businessLine: string }) {
       <Space style={{ marginBottom: 8 }}>
         <Text type="secondary">共 {tables.length} 张表。点击"补充/修改"为字段写注释,保存即写入系统覆盖层。</Text>
       </Space>
-      {tables.length === 0 && <Text type="secondary">该系统暂无表,请先 running ingest_schema.py</Text>}
-      <Collapse items={tableItems} />
+      {tables.length === 0 && !loading && <Text type="secondary">该数据库暂无已同步的表，请返回数据库连接页面同步 Schema。</Text>}
+      <Collapse items={tableItems} ghost={tables.length === 0} />
 
       <Modal
         title={editTarget ? `补充注释: ${editTarget.column || editTarget.table}` : ""}
@@ -176,7 +185,7 @@ function SchemaBrowse({ businessLine }: { businessLine: string }) {
 
 // ---------------- 待审核注释队列 ----------------
 
-function ReviewQueue({ businessLine }: { businessLine: string }) {
+function ReviewQueue({ databaseId }: { databaseId?: string }) {
   const [items, setItems] = useState<ReviewItem[]>([]);
   const [target, setTarget] = useState<ReviewItem | null>(null);
   const [editText, setEditText] = useState("");
@@ -185,11 +194,15 @@ function ReviewQueue({ businessLine }: { businessLine: string }) {
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
+    if (!databaseId) {
+      setItems([]);
+      return;
+    }
     const data = await apiGet<ReviewItem[]>(
-      `/api/schema/review?datasource=${businessLine}&status=pending`,
+      `/api/schema/review?database_id=${encodeURIComponent(databaseId)}&status=pending`,
     ).catch(() => []);
     setItems(data);
-  }, [businessLine]);
+  }, [databaseId]);
 
   useEffect(() => {
     load();
@@ -229,7 +242,9 @@ function ReviewQueue({ businessLine }: { businessLine: string }) {
 
   const reingest = async () => {
     setRefreshing(true);
-    const r = await apiPost<{ status: string }>("/api/schema/review/reingest");
+    const r = await apiPost<{ status: string }>(
+      `/api/schema/review/reingest?database_id=${encodeURIComponent(databaseId || "")}`,
+    );
     message.success(`已重新入库,更新 schema/m-schema`);
     setRefreshing(false);
     load();
@@ -326,27 +341,48 @@ function ReviewQueue({ businessLine }: { businessLine: string }) {
 // ---------------- 页面入口 ----------------
 
 export default function SchemaPage() {
-  const [businessLine, setBusinessLine] = useState("risk_mart");
+  const [databases, setDatabases] = useState<DatabaseConfig[]>([]);
+  const [databaseId, setDatabaseId] = useState<string>();
+
+  useEffect(() => {
+    apiGet<DatabaseConfig[]>("/api/databases")
+      .then((items) => {
+        setDatabases(items);
+        const preferred = items.find((item) => item.is_default && item.schema_status === "ready")
+          || items.find((item) => item.schema_status === "ready");
+        setDatabaseId((current) => (
+          current && items.some((item) => item.id === current && item.schema_status === "ready")
+            ? current
+            : preferred?.id
+        ));
+      })
+      .catch((error) => message.error(error instanceof Error ? error.message : "数据库列表加载失败"));
+  }, []);
 
   return (
     <Card
       title="表结构与注释审核"
       extra={
         <Space>
-          <Text>系统:</Text>
+          <Text>数据库:</Text>
           <Select
-            value={businessLine}
-            onChange={setBusinessLine}
-            style={{ width: 160 }}
-            options={["risk_mart", "dw", "core"].map((v) => ({ value: v, label: v }))}
+            value={databaseId}
+            onChange={setDatabaseId}
+            placeholder="选择已同步的数据库"
+            style={{ width: 240 }}
+            options={databases.map((item) => ({
+              value: item.id,
+              label: `${item.name}${item.is_default ? "（默认）" : ""}`,
+              disabled: item.schema_status !== "ready",
+            }))}
           />
         </Space>
       }
     >
       <Tabs
         items={[
-          { key: "browse", label: "表结构 / 补充字段注释", children: <SchemaBrowse businessLine={businessLine} /> },
-          { key: "queue", label: "待审核注释", children: <ReviewQueue businessLine={businessLine} /> },
+          { key: "browse", label: "表结构 / 补充字段注释", children: <SchemaBrowse databaseId={databaseId} /> },
+          { key: "queue", label: "待审核注释", children: <ReviewQueue databaseId={databaseId} /> },
         ]}
       />
     </Card>

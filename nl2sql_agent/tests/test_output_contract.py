@@ -1,4 +1,5 @@
-from nl2sql_agent.nodes.m6_plan_validation import validate_plan
+from nl2sql_agent.nodes.m6_plan_validation import make_plan_validation_node, validate_plan
+from nl2sql_agent.nodes.m2_query_resolution import _prefer_complete_graph
 from nl2sql_agent.nodes.m8_static_validation import make_static_validation_node
 from nl2sql_agent.services.plan_normalizer import normalize_structural_coverage
 from nl2sql_agent.services.schema_catalog import TableDef
@@ -30,6 +31,38 @@ def test_explicit_result_items_become_required_semantic_outputs():
     assert [slot.text for slot in intent.attributes] == ["姓名", "地址"]
 
 
+def test_overdue_customer_name_and_address_keeps_both_explicit_outputs():
+    query = "统计有逾期的客户姓名及地址"
+    graph = build_semantic_graph(query)
+
+    assert [output.concept for output in graph.outputs] == ["客户姓名", "地址"]
+    assert all(output.required for output in graph.outputs)
+
+
+def test_model_canonical_names_do_not_duplicate_outputs_or_weaken_overdue_predicate(deps):
+    query = "统计有逾期的客户姓名及地址"
+    fallback = build_semantic_graph(
+        query, deps.loader.load("business_predicates.yaml")
+    )
+    candidate = SemanticGraph.model_validate({
+        "subjects": [{"id": "1", "kind": "entity", "concept": "客户"}],
+        "outputs": [
+            {"id": "out1", "subject_id": "1", "concept": "客户姓名", "grounding_concept": "customer.name", "source_text": "姓名"},
+            {"id": "out2", "subject_id": "1", "concept": "客户地址", "grounding_concept": "customer.address", "source_text": "地址"},
+        ],
+        "predicate": {
+            "atom_id": "atom1", "predicate_type": "exists", "subject_id": "1",
+            "concept": "存在逾期", "source_text": "有逾期", "materiality": "high",
+        },
+    })
+
+    merged = _prefer_complete_graph(candidate, fallback)
+
+    assert [item.source_text for item in merged.outputs] == ["客户姓名", "地址"]
+    assert merged.predicate is not None
+    assert any(item.predicate_type == "status" for item in merged.predicate.children)
+
+
 def test_output_slots_drive_schema_projection_and_physical_bindings():
     graph, intent = _graph_and_intent()
     tables = [
@@ -56,6 +89,40 @@ def test_output_slots_drive_schema_projection_and_physical_bindings():
         "output_1": ("customer", "NAME"),
         "output_2": ("customer", "RESIADDR"),
     }
+
+
+def test_grouping_entity_prefers_non_null_primary_identifier():
+    graph = SemanticGraph(
+        outputs=[SemanticOutput(
+            id="customer_output",
+            subject_id="customer",
+            concept="客户",
+            grounding_concept="客户",
+            source_text="客户",
+        )],
+        group_by=["客户"],
+    )
+    candidates = [
+        FieldCandidate(
+            table_name="customer", column_name="CORE_NO",
+            column_comment="源系统客户编码", query_slot="客户", final_score=0.9,
+        ),
+        FieldCandidate(
+            table_name="customer", column_name="CUST_ID",
+            column_comment="ECIF客户编号", query_slot="客户", final_score=0.8,
+        ),
+    ]
+    tables = [TableDef("customer", "客户信息", "risk", [
+        {"name": "CORE_NO", "comment": "源系统客户编码", "nullable": True},
+        {
+            "name": "CUST_ID", "comment": "ECIF客户编号",
+            "primary_key": True, "unique": True, "nullable": False,
+        },
+    ])]
+
+    binding = ground_output_bindings(graph, candidates, tables=tables)["customer_output"]
+
+    assert binding["column_name"] == "CUST_ID"
 
 
 def test_plan_cannot_pass_when_explicit_outputs_are_missing(deps):
@@ -125,7 +192,8 @@ def test_output_trace_ids_are_normalized_only_for_matching_bindings():
     assert normalized.covered_output_ids == ["output_1", "output_2"]
     assert normalized.output_fields[0].source_output_ids == ["output_1"]
     assert normalized.output_fields[1].source_output_ids == ["output_2"]
-    assert len(changes) == 2
+    assert len(changes) == 3
+    assert changes[-1] == "按用户语义输出契约重建返回字段"
 
 
 def test_sql_validation_rejects_missing_planned_projection(deps):
@@ -152,6 +220,21 @@ def test_sql_validation_rejects_missing_planned_projection(deps):
 
     assert any("SQL SELECT 遗漏计划返回字段 customer.NAME" in error for error in out["validation_errors"])
     assert any("SQL SELECT 遗漏计划返回字段 customer.RESIADDR" in error for error in out["validation_errors"])
+
+
+def test_truncated_plan_is_terminal_error_without_graph_retry(deps):
+    state = NL2SQLState(
+        user_query="统计有逾期的客户姓名及地址",
+        user_id="u1",
+        plan_generation_error_kind="output_truncated",
+        plan_validation_errors=["计划生成失败（模型输出被截断）"],
+    )
+
+    out = make_plan_validation_node(deps)(state)
+
+    assert out["plan_retry_count"] == state.max_plan_retries
+    assert out["terminal_status"] == "error"
+    assert "输出被截断" in out["final_answer"]
 
 
 def test_broad_address_output_expands_only_customer_own_full_addresses(deps):

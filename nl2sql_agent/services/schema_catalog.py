@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from nl2sql_agent.services.config_loader import ConfigLoader
 from nl2sql_agent.state import SchemaHit
@@ -25,8 +28,14 @@ class TableDef:
 
 
 class SchemaCatalog:
-    def __init__(self, loader: ConfigLoader):
-        data = loader.load("schema_catalog.yaml") or {}
+    def __init__(
+        self,
+        loader: ConfigLoader,
+        m_schema_path: str | Path | None = None,
+        relation_overrides: list[dict] | None = None,
+    ):
+        data = self._load_runtime_data(loader, m_schema_path)
+        self.relation_overrides = [dict(item) for item in (relation_overrides or [])]
         self.metadata = dict(data.get("_meta") or {})
         source_path = self.metadata.get("m_schema_path")
         if source_path and not Path(source_path).is_absolute():
@@ -48,6 +57,118 @@ class SchemaCatalog:
                     self._shared_tables.append(tbl)
                 else:
                     self._tables_by_line.setdefault(line, []).append(tbl)
+
+    @staticmethod
+    def _settings(loader: ConfigLoader) -> dict:
+        try:
+            return loader.load("settings.yaml") or {}
+        except FileNotFoundError:
+            return {}
+
+    @staticmethod
+    def _auto_mschema_path(loader: ConfigLoader) -> Path | None:
+        """Resolve data/schema/<database>/m-schema.json from DATABASE_URL."""
+        settings = SchemaCatalog._settings(loader)
+        db_url = settings.get("database_url") or os.getenv("DATABASE_URL")
+        if not db_url:
+            return None
+        try:
+            database = urlsplit(str(db_url)).path.strip("/").split("/")[0]
+        except ValueError:
+            return None
+        if not database:
+            return None
+        return loader.base_dir.parent.parent / "data" / "schema" / database / "m-schema.json"
+
+    @classmethod
+    def _configured_mschema_path(cls, loader: ConfigLoader) -> Path | None:
+        settings = cls._settings(loader)
+        source = settings.get("schema_source") or {}
+        mode = str(source.get("mode", "catalog")).lower()
+        if mode not in {"m_schema", "mschema", "auto"}:
+            return None
+        configured = source.get("m_schema_path")
+        if configured and str(configured).lower() != "auto":
+            path = Path(str(configured))
+            return path if path.is_absolute() else (loader.base_dir / path).resolve()
+        return cls._auto_mschema_path(loader)
+
+    @staticmethod
+    def _projection_from_mschema(path: Path) -> dict | None:
+        """Build the runtime catalog view directly from an effective M-Schema."""
+        if not path.exists():
+            return None
+        try:
+            mschema = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        namespace = str(mschema.get("namespace") or "default")
+        tables = []
+        for table_name, table in (mschema.get("tables") or {}).items():
+            columns = []
+            for column_name, field_data in (table.get("fields") or {}).items():
+                column = {
+                    "name": column_name,
+                    "type": field_data.get("type", ""),
+                    "comment": field_data.get("comment", ""),
+                    "raw_type": field_data.get("raw_type") or field_data.get("type", ""),
+                    "nullable": bool(field_data.get("nullable", True)),
+                    "primary_key": bool(field_data.get("primary_key", False)),
+                    "unique": bool(field_data.get("unique", False)),
+                    "indexed": bool(field_data.get("indexed", False)),
+                    "category": field_data.get("category", ""),
+                    "semantic_role": field_data.get("dim_or_meas", ""),
+                    # 字段画像只供服务端值绑定与排序使用；Query M-Schema 的
+                    # 提示词投影不会复制 examples/profile。
+                    "examples": list(field_data.get("examples") or []),
+                    "profile": dict(field_data.get("profile") or {}),
+                }
+                if field_data.get("time_granularity"):
+                    column["time_granularity"] = field_data["time_granularity"]
+                if field_data.get("sensitive"):
+                    column["sensitive"] = True
+                columns.append(column)
+            tables.append({
+                "name": table_name,
+                "comment": table.get("comment", ""),
+                "business_line": namespace,
+                "shared": bool(table.get("shared", False)),
+                "columns": columns,
+            })
+
+        manifest = {}
+        manifest_path = path.with_name("manifest.json")
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                manifest = {}
+        return {
+            "_meta": {
+                "source": "effective-m-schema",
+                "datasource": mschema.get("db_id", ""),
+                "m_schema_format_version": mschema.get("format_version", ""),
+                "snapshot_id": manifest.get("snapshot_id", ""),
+                "semantic_hash": manifest.get("semantic_hash", ""),
+                "generated_at": manifest.get("generated_at", ""),
+                "m_schema_path": str(path.resolve()),
+            },
+            namespace: {"tables": tables},
+        }
+
+    @classmethod
+    def _load_runtime_data(
+        cls, loader: ConfigLoader, m_schema_path: str | Path | None = None
+    ) -> dict:
+        explicit_path = m_schema_path is not None
+        mschema_path = Path(m_schema_path) if explicit_path else cls._configured_mschema_path(loader)
+        if mschema_path is not None:
+            projection = cls._projection_from_mschema(mschema_path)
+            if projection is not None:
+                return projection
+            if explicit_path:
+                return {"_meta": {"source": "effective-m-schema", "m_schema_path": str(mschema_path)}}
+        return loader.load("schema_catalog.yaml") or {}
 
     def tables_for_scope(self, data_scope: list[str]) -> list[TableDef]:
         """data_scope 命中的业务线表 + 所有共享表。

@@ -15,6 +15,8 @@ from nl2sql_agent.services.semantic_parser import (
     iter_semantic_atoms,
     semantic_graph_to_query_intent,
 )
+from nl2sql_agent.services.semantic_query import enrich_semantic_graph
+from nl2sql_agent.services.semantic_coverage import ensure_semantic_coverage
 from nl2sql_agent.state import DecisionSummary, NL2SQLState, ResolvedQuery
 
 
@@ -80,30 +82,79 @@ def _prefer_complete_graph(candidate, fallback):
     """模型主导理解，但确定性识别出的条件和显式输出都不允许静默遗漏。"""
     if candidate is None:
         return fallback
-    fallback_sources = {
-        atom.source_text
-        for atom in iter_semantic_atoms(fallback.predicate if fallback else None)
-        if atom.materiality == "high" and atom.source_text
-    }
-    candidate_text = " ".join(
-        atom.source_text
-        for atom in iter_semantic_atoms(candidate.predicate)
+    fallback_atoms = [
+        atom for atom in iter_semantic_atoms(fallback.predicate if fallback else None)
         if atom.materiality == "high"
-    )
-    base = candidate if all(source in candidate_text for source in fallback_sources) else fallback
+    ]
+    candidate_atoms = [
+        atom for atom in iter_semantic_atoms(candidate.predicate)
+        if atom.materiality == "high"
+    ]
+
+    # “来源文字出现过”不足以证明语义完整。例如模型只给出 exists(有逾期)，
+    # 但规则已经解析为 exists + status(OVD_BAL > 0)，此时必须保留更精确的后者。
+    def _concept(value: str | None) -> str:
+        return re.sub(r"[\s._-]+", "", str(value or "")).lower()
+
+    generic_concepts = {"比较", "条件", "筛选", "过滤", "comparison", "condition", "filter"}
+    generic_projection_sources = {"基本信息", "详细信息", "联系方式", "明细"}
+
+    def _covers(required) -> bool:
+        required_concept = _concept(required.grounding_concept or required.concept)
+        return any(
+            actual.predicate_type == required.predicate_type
+            and _concept(actual.grounding_concept or actual.concept) not in generic_concepts
+            and (
+                not required_concept
+                or required_concept in _concept(actual.grounding_concept or actual.concept)
+                or _concept(actual.grounding_concept or actual.concept) in required_concept
+            )
+            for actual in candidate_atoms
+        )
+
+    base = candidate if all(_covers(atom) for atom in fallback_atoms) else fallback
     if base is None or fallback is None:
         return base
 
-    outputs = list(base.outputs)
+    def _business_output(output):
+        grounding = str(output.grounding_concept or "")
+        # query-resolution 阶段只允许业务概念，不接受 customer.name 之类
+        # 尚未落到 Schema 的逻辑路径，否则会被字段检索当成真实字段短语。
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", grounding):
+            replacement = output.concept or output.source_text
+            return output.model_copy(update={"grounding_concept": replacement})
+        return output
+
+    def _premature_projection(output) -> bool:
+        source = re.sub(r"\s+", "", str(output.source_text or ""))
+        concept = re.sub(r"\s+", "", str(output.concept or ""))
+        return (
+            source in generic_projection_sources
+            and concept != source
+        )
+
+    outputs = [
+        _business_output(output)
+        for output in base.outputs
+        if not _premature_projection(output)
+    ]
     known_concepts = {
         re.sub(r"\s+", "", output.grounding_concept or output.concept).lower()
         for output in outputs
     }
+    known_sources = {
+        re.sub(r"\s+", "", output.source_text).lower()
+        for output in outputs if output.source_text
+    }
     used_ids = {output.id for output in outputs}
     for graph in (candidate, fallback):
         for output in graph.outputs:
+            if _premature_projection(output):
+                continue
+            output = _business_output(output)
             concept = re.sub(r"\s+", "", output.grounding_concept or output.concept).lower()
-            if concept in known_concepts:
+            source = re.sub(r"\s+", "", output.source_text).lower()
+            if concept in known_concepts or (source and source in known_sources):
                 continue
             output_id = output.id
             if output_id in used_ids:
@@ -113,17 +164,21 @@ def _prefer_complete_graph(candidate, fallback):
                 output_id = f"output_{index}"
             outputs.append(output.model_copy(update={"id": output_id}))
             known_concepts.add(concept)
+            if source:
+                known_sources.add(source)
             used_ids.add(output_id)
 
     subjects = list(base.subjects)
-    known_subjects = {(item.id, item.concept) for item in subjects}
+    known_subjects = {re.sub(r"\s+", "", item.concept).lower() for item in subjects}
     for graph in (candidate, fallback):
         for item in graph.subjects:
-            key = (item.id, item.concept)
+            key = re.sub(r"\s+", "", item.concept).lower()
             if key not in known_subjects:
                 subjects.append(item)
                 known_subjects.add(key)
-    capabilities = list(base.capabilities)
+    capabilities = list(dict.fromkeys([
+        *base.capabilities, *candidate.capabilities, *fallback.capabilities,
+    ]))
     if outputs and "entity_output" not in capabilities:
         capabilities.append("entity_output")
     return base.model_copy(update={
@@ -159,6 +214,7 @@ def make_query_resolution_node(deps):
         query = state.user_query.strip()
         predicate_config = deps.loader.load("business_predicates.yaml")
         resolved = _fallback_resolution(query, predicate_config)
+        fallback_resolved = resolved
         resolution_config = deps.config.clarification_rules.get("query_resolution", {})
         use_llm = _should_use_llm_resolution(state, resolved, resolution_config)
         if use_llm:
@@ -169,11 +225,49 @@ def make_query_resolution_node(deps):
                 # 原始问题由服务端锁定，避免模型改写审计事实。
                 fallback_graph = resolved.semantic_graph
                 graph = _prefer_complete_graph(candidate.semantic_graph, fallback_graph)
+                if graph is not None:
+                    graph = enrich_semantic_graph(query, graph)
+                merged_intent = semantic_graph_to_query_intent(
+                    graph, candidate.rewritten_query or query, predicate_config
+                )
+                graph_is_authoritative = bool(graph and graph.confidence >= 0.8)
+
+                # LLM 负责语义理解，确定性解析负责守住用户显式表达的最低契约。
+                # 某些推理模型可能耗尽预算后仍返回一个“合法但空”的对象；不能因此
+                # 丢掉姓名、地址、逾期等直接写在问题中的返回项和筛选条件。
+                # SemanticGraph 是唯一语义事实，ResolvedQuery 的兼容字段只从
+                # 合并后的图派生，不能再次混入模型的“比较/customer.name”等占位词。
+                merged_filters = [
+                    {"subject": item.text, "operator": item.operator, "value": item.value}
+                    for item in merged_intent.filters
+                ]
                 resolved = candidate.model_copy(update={
                     "original_query": query,
+                    "rewritten_query": candidate.rewritten_query or fallback_resolved.rewritten_query,
+                    "query_type": (
+                        candidate.query_type
+                        if candidate.query_type != "unknown"
+                        else merged_intent.query_type
+                    ),
+                    "entities": list(dict.fromkeys([
+                        *candidate.entities,
+                        *fallback_resolved.entities,
+                        *[item.text for item in merged_intent.entities],
+                    ])),
+                    "measures": list(dict.fromkeys([
+                        *candidate.measures,
+                        *fallback_resolved.measures,
+                        *[item.text for item in merged_intent.measures],
+                    ])),
+                    "filters": merged_filters,
+                    "dimensions": list(dict.fromkeys([
+                        *candidate.dimensions,
+                        *fallback_resolved.dimensions,
+                        *[item.text for item in merged_intent.dimensions],
+                    ])),
                     "semantic_graph": graph,
                     "attributes": list(dict.fromkeys([
-                        *candidate.attributes,
+                        *fallback_resolved.attributes,
                         *[
                             output.grounding_concept or output.concept
                             for output in (graph.outputs if graph else [])
@@ -188,9 +282,10 @@ def make_query_resolution_node(deps):
                         ],
                     ],
                     "unresolved_business_slots": list(dict.fromkeys([
-                        *candidate.unresolved_business_slots,
+                        *([] if graph_is_authoritative else candidate.unresolved_business_slots),
                         *(graph.unresolved_slots if graph else []),
                     ])),
+                    "confidence": max(candidate.confidence, fallback_resolved.confidence),
                 })
             except Exception:  # noqa: BLE001 - 降级到确定性解析，不中断查询服务
                 pass
@@ -207,6 +302,49 @@ def make_query_resolution_node(deps):
         )
 
         unresolved = list(resolved.unresolved_business_slots)
+        # Establish original-query coverage before deciding whether an LLM
+        # unresolved slot needs user clarification.  Otherwise wording such as
+        # "统计指标口径" can block a broad topic before schema-aware projection
+        # has a chance to concretize it.
+        preview_graph = resolved.semantic_graph or build_semantic_graph(
+            resolved.rewritten_query, predicate_config
+        )
+        preview_graph = enrich_semantic_graph(query, preview_graph)
+        preview_graph, _ = ensure_semantic_coverage(query, preview_graph)
+        resolved = resolved.model_copy(update={"semantic_graph": preview_graph})
+        broad_topics = [
+            output.grounding_concept or output.source_text or output.concept
+            for output in (preview_graph.outputs if preview_graph else [])
+            if output.broad or any(
+                str(value or "").endswith(("情况", "表现", "信息", "明细"))
+                for value in (output.concept, output.grounding_concept, output.source_text)
+            )
+        ]
+        if broad_topics:
+            # Broad result topics are intentionally resolved after bounded Schema
+            # retrieval.  Asking users to choose “逾期笔数/金额/客户数” here would
+            # reintroduce the old metric-mapping and clarification bottleneck.
+            def schema_resolvable(slot: str) -> bool:
+                return (
+                    any(marker in slot for marker in (
+                        "统计粒度", "统计指标", "指标口径", "具体指标",
+                        "具体内容", "返回内容", "返回字段",
+                    ))
+                    or any(topic.removesuffix("情况").removesuffix("表现") in slot for topic in broad_topics)
+                )
+
+            unresolved = [slot for slot in unresolved if not schema_resolvable(slot)]
+            if preview_graph is not None:
+                preview_graph = preview_graph.model_copy(update={
+                    "unresolved_slots": [
+                        slot for slot in preview_graph.unresolved_slots
+                        if not schema_resolvable(slot)
+                    ],
+                })
+            resolved = resolved.model_copy(update={
+                "semantic_graph": preview_graph,
+                "unresolved_business_slots": unresolved,
+            })
         if time_question and "时间范围" not in unresolved:
             unresolved.append("时间范围")
             resolved = resolved.model_copy(update={"unresolved_business_slots": unresolved})
@@ -216,10 +354,14 @@ def make_query_resolution_node(deps):
         semantic_graph = resolved.semantic_graph or build_semantic_graph(
             resolved.rewritten_query, predicate_config
         )
+        semantic_graph = enrich_semantic_graph(query, semantic_graph)
+        semantic_graph, semantic_coverage = ensure_semantic_coverage(query, semantic_graph)
+        resolved = resolved.model_copy(update={"semantic_graph": semantic_graph})
         out = {
             "clarified_query": resolved.rewritten_query,
             "resolved_query": resolved,
             "semantic_graph": semantic_graph,
+            "semantic_coverage": semantic_coverage,
             "query_intent": semantic_graph_to_query_intent(
                 semantic_graph, resolved.rewritten_query, predicate_config
             ),

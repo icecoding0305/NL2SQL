@@ -38,6 +38,8 @@ class QueryStore:
                 """
                 CREATE TABLE IF NOT EXISTS queries (
                     trace_id        TEXT PRIMARY KEY,
+                    conversation_id TEXT,
+                    database_id     TEXT,
                     user_id         TEXT,
                     user_query      TEXT,
                     data_scope      TEXT,
@@ -65,8 +67,10 @@ class QueryStore:
                     query_intent   TEXT,
                     resolved_query TEXT,
                     semantic_graph TEXT,
+                    semantic_coverage TEXT,
                     business_clarification TEXT,
                     decision_summary TEXT,
+                    projection_decision TEXT,
                     field_candidates TEXT,
                     field_ambiguities TEXT,
                     schema_plan    TEXT,
@@ -89,6 +93,8 @@ class QueryStore:
             )
             # 旧库迁移:补齐新增列
             for col in (
+                "conversation_id TEXT",
+                "database_id TEXT",
                 "next_node TEXT",
                 "logical_plan TEXT",
                 "query_mschema TEXT",
@@ -97,8 +103,10 @@ class QueryStore:
                 "query_intent TEXT",
                 "resolved_query TEXT",
                 "semantic_graph TEXT",
+                "semantic_coverage TEXT",
                 "business_clarification TEXT",
                 "decision_summary TEXT",
+                "projection_decision TEXT",
                 "field_candidates TEXT",
                 "field_ambiguities TEXT",
                 "schema_plan TEXT",
@@ -132,6 +140,7 @@ class QueryStore:
             else:
                 base = {
                     "trace_id": trace_id,
+                    "conversation_id": trace_id,
                     "user_query": "",
                     "data_scope": "[]",
                     "status": "running",
@@ -197,6 +206,62 @@ class QueryStore:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def list_conversation(self, conversation_id: str) -> list[dict]:
+        """Return every query turn in a conversation, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM queries "
+                "WHERE COALESCE(conversation_id, trace_id) = ? "
+                "ORDER BY created_at ASC, trace_id ASC",
+                (conversation_id,),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def list_conversations(
+        self, user_id: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        """Return one summary per conversation, ordered by real activity time."""
+        sql = "SELECT * FROM queries"
+        params: list[Any] = []
+        if user_id:
+            sql += " WHERE user_id = ?"
+            params.append(user_id)
+        sql += " ORDER BY created_at ASC, trace_id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        grouped: dict[str, dict] = {}
+        for row in rows:
+            item = self._row_to_dict(row)
+            conversation_id = item["conversation_id"]
+            if conversation_id not in grouped:
+                grouped[conversation_id] = {
+                    "trace_id": item["trace_id"],
+                    "conversation_id": conversation_id,
+                    "user_id": item.get("user_id"),
+                    "user_query": item.get("user_query") or "新对话",
+                    "title": item.get("user_query") or "新对话",
+                    "data_scope": item.get("data_scope") or [],
+                    "status": item.get("status"),
+                    "created_at": item.get("created_at"),
+                    "turn_count": 1,
+                    "updated_at": item.get("created_at"),
+                }
+                continue
+            summary = grouped[conversation_id]
+            summary.update({
+                "trace_id": item["trace_id"],
+                "status": item.get("status"),
+                "data_scope": item.get("data_scope") or [],
+                "updated_at": item.get("created_at"),
+                "turn_count": int(summary["turn_count"]) + 1,
+            })
+        return sorted(
+            grouped.values(),
+            key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+            reverse=True,
+        )[:limit]
+
     def list_pending_approvals(self) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -217,14 +282,36 @@ class QueryStore:
             conn.execute("DELETE FROM queries WHERE trace_id = ?", (trace_id,))
             return True
 
+    def delete_conversation(self, conversation_id: str) -> list[str]:
+        """Delete all turns and feedback in one conversation; return trace ids."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT trace_id FROM queries "
+                "WHERE COALESCE(conversation_id, trace_id) = ?",
+                (conversation_id,),
+            ).fetchall()
+            trace_ids = [str(row["trace_id"]) for row in rows]
+            if not trace_ids:
+                return []
+            placeholders = ",".join("?" for _ in trace_ids)
+            conn.execute(
+                f"DELETE FROM feedbacks WHERE trace_id IN ({placeholders})", trace_ids
+            )
+            conn.execute(
+                f"DELETE FROM queries WHERE trace_id IN ({placeholders})", trace_ids
+            )
+            return trace_ids
+
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:
         d = dict(row)
+        d["conversation_id"] = d.get("conversation_id") or d.get("trace_id")
         for key in (
             "data_scope", "plan_json", "logical_plan", "query_mschema", "retrieved_schema", "sensitive_reasons",
             "execution_result", "result_summary", "trace_steps", "node_latencies", "node_latency_history",
             "llm_calls", "retrieval_candidates",
-            "query_intent", "resolved_query", "semantic_graph", "business_clarification", "decision_summary",
+            "query_intent", "resolved_query", "semantic_graph", "semantic_coverage", "business_clarification", "decision_summary",
+            "projection_decision",
             "field_candidates", "field_ambiguities", "schema_plan",
         ):
             if isinstance(d.get(key), str):

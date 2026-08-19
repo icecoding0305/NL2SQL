@@ -29,6 +29,7 @@ from langgraph.graph import END, START, StateGraph
 
 from nl2sql_agent.services.checkpoint import checkpoint_serializer
 from nl2sql_agent.services.llm_telemetry import begin_capture, end_capture
+from nl2sql_agent.services.query_cancellation import QueryExecutionCancelled
 from nl2sql_agent.nodes import (
     human_review,
     m1_entry,
@@ -88,10 +89,12 @@ def _emit(sink, event: str, node: str, trace_id: str, data=None) -> None:
         pass
 
 
-def _traced(name: str, fn, sink=None):
+def _traced(name: str, fn, sink=None, cancellation_check=None):
     """记录节点延迟/顺序到 state,并通过 event_sink 推送 node_start / node_complete。"""
 
     def wrapped(state: NL2SQLState):
+        if cancellation_check is not None and cancellation_check():
+            raise QueryExecutionCancelled("query cancelled by user")
         _emit(sink, "node_start", name, state.trace_id)
         t0 = time.perf_counter()
         capture_tokens = begin_capture(name, state.trace_id)
@@ -100,6 +103,11 @@ def _traced(name: str, fn, sink=None):
         finally:
             node_llm_calls = end_capture(capture_tokens)
         latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        # A model or database call cannot be interrupted safely from another
+        # Python thread. Discard its result as soon as the call returns instead
+        # of allowing the cancelled graph to advance to the next node.
+        if cancellation_check is not None and cancellation_check():
+            raise QueryExecutionCancelled("query cancelled by user")
         if isinstance(out, dict):
             out = dict(out)
             latencies = dict(state.node_latencies or {})
@@ -185,7 +193,7 @@ def route_sandbox(state: NL2SQLState) -> str:
 
 # ---------------- 图构建 ----------------
 
-def build_graph(deps: Deps, checkpointer=None, event_sink=None):
+def build_graph(deps: Deps, checkpointer=None, event_sink=None, cancellation_check=None):
     """编译 LangGraph。
 
     event_sink:可选同步回调,接收节点事件(dict),用于 WebSocket 流式推送。
@@ -194,7 +202,7 @@ def build_graph(deps: Deps, checkpointer=None, event_sink=None):
     g = StateGraph(NL2SQLState)
 
     def t(name, fn):
-        return _traced(name, fn, event_sink)
+        return _traced(name, fn, event_sink, cancellation_check)
 
     g.add_node("entry", t("entry", m1_entry.make_entry_node(deps)))
     g.add_node("query_resolution", t("query_resolution", m2_query_resolution.make_query_resolution_node(deps)))

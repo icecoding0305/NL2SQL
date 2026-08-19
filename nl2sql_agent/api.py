@@ -14,39 +14,94 @@ import asyncio
 import json
 import os
 import secrets
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from nl2sql_agent.graph import build_graph
 from nl2sql_agent.services.checkpoint import create_sqlite_checkpointer
+from nl2sql_agent.services.database_store import DatabaseConfigStore
 from nl2sql_agent.services.deps import build_deps, load_env
 from nl2sql_agent.services.query_store import QueryStore
+from nl2sql_agent.services.query_cancellation import QueryExecutionCancelled
+from nl2sql_agent.services.relation_store import DatabaseRelationStore
+from nl2sql_agent.services.query_terminal import finalize_query_state
+from nl2sql_agent.services.text_encoding import normalize_query_payload, repair_mojibake
+from nl2sql_agent.security import verify_platform_token
 
 router = APIRouter(prefix="/api")
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-_deps = None
+load_env()
+_deps: dict[str, tuple[str, Any]] = {}
 _store = QueryStore(DATA_DIR / "nl2sql.db")
+_database_store = DatabaseConfigStore(DATA_DIR / "nl2sql.db", DATA_DIR.parent)
+_relation_store = DatabaseRelationStore(DATA_DIR / "nl2sql.db")
+_deps_lock = threading.Lock()
+_active_query_cancellations: dict[str, threading.Event] = {}
+_active_query_cancellations_lock = threading.Lock()
 
 
 # 全局共享 checkpointer:查询与审批(resume)必须用同一实例,否则无法恢复线程状态
 _checkpointer = create_sqlite_checkpointer(DATA_DIR / "langgraph_checkpoints.db")
 
 
-def get_deps():
-    global _deps
-    if _deps is None:
-        load_env()
-        _deps = build_deps()
-    return _deps
+def get_deps(database_id: str | None = None):
+    """Return dependencies bound to one configured physical database."""
+    load_env()
+    record = _database_store.get(database_id, include_secret=True)
+    if not record:
+        raise KeyError(f"数据库配置 {database_id or 'default'} 不存在")
+    cache_key = str(record["id"])
+    version = str(record.get("updated_at") or "")
+    with _deps_lock:
+        cached = _deps.get(cache_key)
+        if cached and cached[0] == version:
+            return cached[1]
+        schema_path = _database_store.schema_path(cache_key)
+        deps = build_deps(
+            database_url=_database_store.connection_url(cache_key),
+            m_schema_path=schema_path,
+            relation_overrides=_relation_store.runtime_relations(cache_key),
+        )
+        _deps[cache_key] = (version, deps)
+        return deps
+
+
+def _invalidate_deps(database_id: str | None = None) -> None:
+    with _deps_lock:
+        if database_id is None:
+            _deps.clear()
+        else:
+            _deps.pop(database_id, None)
+
+
+def _query_cancel_event(trace_id: str) -> threading.Event:
+    """Return the process-local cancellation signal for one running trace."""
+    with _active_query_cancellations_lock:
+        return _active_query_cancellations.setdefault(trace_id, threading.Event())
+
+
+def _release_query_cancel_event(trace_id: str, event: threading.Event) -> None:
+    with _active_query_cancellations_lock:
+        if _active_query_cancellations.get(trace_id) is event:
+            _active_query_cancellations.pop(trace_id, None)
+
+
+def _query_is_cancelled(trace_id: str, event: threading.Event) -> bool:
+    if event.is_set():
+        return True
+    row = _store.get_query(trace_id)
+    return bool(row and row.get("status") == "cancelled")
 
 
 # ---------------- 事件桥接 ----------------
@@ -107,6 +162,7 @@ def _state_to_dict(state: dict) -> dict:
         "query_intent": state["query_intent"].model_dump() if state.get("query_intent") else None,
         "resolved_query": state["resolved_query"].model_dump() if state.get("resolved_query") else None,
         "semantic_graph": state["semantic_graph"].model_dump() if state.get("semantic_graph") else None,
+        "semantic_coverage": state.get("semantic_coverage") or {},
         "business_clarification": (
             state["business_clarification"].model_dump()
             if state.get("business_clarification") else None
@@ -114,6 +170,10 @@ def _state_to_dict(state: dict) -> dict:
         "decision_summary": (
             state["decision_summary"].model_dump()
             if state.get("decision_summary") else None
+        ),
+        "projection_decision": (
+            state["projection_decision"].model_dump()
+            if state.get("projection_decision") else None
         ),
         "field_candidates": [item.model_dump() for item in (state.get("field_candidates") or [])],
         "field_ambiguities": {
@@ -160,8 +220,10 @@ def _persist(
         query_intent=d["query_intent"],
         resolved_query=d["resolved_query"],
         semantic_graph=d["semantic_graph"],
+        semantic_coverage=d["semantic_coverage"],
         business_clarification=d["business_clarification"],
         decision_summary=d["decision_summary"],
+        projection_decision=d["projection_decision"],
         field_candidates=d["field_candidates"],
         field_ambiguities=d["field_ambiguities"],
         schema_plan=d["schema_plan"],
@@ -172,14 +234,25 @@ def _persist(
     )
 
 
-def _run_query(input_data: dict, trace_id: str, sink) -> None:
+def _run_query(input_data: dict, trace_id: str, sink, database_id: str | None = None) -> None:
     """同步执行图(线程内),按结果推送 final/interrupt/error 并落库。"""
+    cancel_event = _query_cancel_event(trace_id)
+    is_cancelled = lambda: _query_is_cancelled(trace_id, cancel_event)
     try:
-        graph = build_graph(get_deps(), checkpointer=_checkpointer, event_sink=sink)
+        if is_cancelled():
+            raise QueryExecutionCancelled("query cancelled by user")
+        graph = build_graph(
+            get_deps(database_id),
+            checkpointer=_checkpointer,
+            event_sink=sink,
+            cancellation_check=is_cancelled,
+        )
         config = {"configurable": {"thread_id": trace_id}}
         graph.invoke(input_data, config)
         snap = graph.get_state(config)
-        state = snap.values
+        state = dict(snap.values)
+        if is_cancelled():
+            raise QueryExecutionCancelled("query cancelled by user")
         if snap.next:
             # 停在人工确认 / 候选澄清 / 低置信澄清(节点名与实际暂停节点一致)
             pause_node = snap.next[0]
@@ -187,20 +260,54 @@ def _run_query(input_data: dict, trace_id: str, sink) -> None:
                   "data": _state_to_dict(state)})
             _persist(trace_id, state, status="pending_review", next_node=pause_node)
         else:
-            terminal_status = "blocked" if state.get("blocked_reason") else "done"
+            state, terminal_status = finalize_query_state(state)
             sink({"event": "final", "data": _state_to_dict(state), "trace_id": trace_id})
             _persist(trace_id, state, status=terminal_status, next_node=None)
+    except QueryExecutionCancelled:
+        _store.update_query(
+            trace_id,
+            status="cancelled",
+            next_node=None,
+            final_answer="查询已由用户停止。",
+            finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+        sink({"event": "cancelled", "node": None, "trace_id": trace_id})
     except Exception as e:  # noqa: BLE001
+        if is_cancelled():
+            _store.update_query(
+                trace_id,
+                status="cancelled",
+                next_node=None,
+                final_answer="查询已由用户停止。",
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+            sink({"event": "cancelled", "node": None, "trace_id": trace_id})
+            return
         sink({"event": "error", "node": None, "message": str(e), "trace_id": trace_id})
         _store.update_query(trace_id, status="error", finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
     finally:
+        _release_query_cancel_event(trace_id, cancel_event)
         sink({"event": "done", "trace_id": trace_id})
 
 
 # ---------------- WebSocket:流式查询 ----------------
 
 async def _ws_query_handler(ws: WebSocket, msg: dict) -> None:
+    msg = normalize_query_payload(msg)
     trace_id = msg.get("trace_id") or f"t{int(time.time() * 1000)}{secrets.token_hex(3)}"
+    conversation_id = msg.get("conversation_id") or trace_id
+    database = _database_store.get(msg.get("database_id"))
+    if not database:
+        await ws.send_json({"event": "error", "trace_id": trace_id, "node": None,
+                            "message": "请选择有效的数据库"})
+        await ws.close()
+        return
+    database_id = database["id"]
+    if database.get("schema_status") != "ready":
+        await ws.send_json({"event": "error", "trace_id": trace_id, "node": None,
+                            "message": "所选数据库尚未完成 Schema 同步"})
+        await ws.close()
+        return
     await ws.send_json({"event": "trace", "trace_id": trace_id, "node": None})
 
     existing = _store.get_query(trace_id)
@@ -225,7 +332,7 @@ async def _ws_query_handler(ws: WebSocket, msg: dict) -> None:
     input_data = {
         "user_query": user_query,
         "user_id": msg.get("user_id", ""),
-        "data_scope": msg.get("data_scope", []),
+        "data_scope": [database.get("namespace") or "risk_mart"],
         "conversation_history": msg.get("conversation_history", []),
         "trace_id": trace_id,
     }
@@ -234,10 +341,16 @@ async def _ws_query_handler(ws: WebSocket, msg: dict) -> None:
         user_id=input_data["user_id"],
         user_query=input_data["user_query"],
         data_scope=input_data["data_scope"],
+        conversation_id=conversation_id,
+        database_id=database_id,
     )
     loop = asyncio.get_running_loop()
     stream = EventStream(loop)
-    threading.Thread(target=_run_query, args=(input_data, trace_id, stream.emit), daemon=True).start()
+    threading.Thread(
+        target=_run_query,
+        args=(input_data, trace_id, stream.emit, database_id),
+        daemon=True,
+    ).start()
 
     while True:
         try:
@@ -245,7 +358,10 @@ async def _ws_query_handler(ws: WebSocket, msg: dict) -> None:
         except asyncio.TimeoutError:
             await ws.send_json({"event": "ping", "trace_id": trace_id})
             continue
-        await ws.send_json(event)
+        # 数据库驱动会把 DECIMAL、日期等值作为 Python 原生对象返回。
+        # 节点事件必须先转成 JSON 安全类型，否则查询虽已执行成功，
+        # WebSocket 仍会在结果展示前因序列化异常而断开。
+        await ws.send_json(jsonable_encoder(event))
         if event.get("event") in ("final", "interrupt", "error", "done"):
             break
     await ws.close()
@@ -259,6 +375,10 @@ async def ws_query(ws: WebSocket):
     except (WebSocketDisconnect, ValueError):
         await ws.close()
         return
+    if not verify_platform_token(msg.pop("platform_token", None)):
+        await ws.send_json({"event": "error", "node": None, "message": "访问密码无效或已失效"})
+        await ws.close(code=4401)
+        return
     await _ws_query_handler(ws, msg)
 
 
@@ -269,14 +389,30 @@ class QueryRequest(BaseModel):
     user_id: str
     data_scope: list[str]
     conversation_history: list[dict] = Field(default_factory=list)
+    conversation_id: str | None = None
+    database_id: str | None = None
     trace_id: str | None = None
 
 
 @router.post("/query")
 async def api_query(req: QueryRequest):
     """非流式提交:同步执行并返回结果或"待审批"状态(供轮询/页面刷新恢复)。"""
+    user_query = repair_mojibake(req.user_query)
+    conversation_history = normalize_query_payload(req.conversation_history)
     trace_id = req.trace_id or f"t{int(time.time() * 1000)}{secrets.token_hex(3)}"
-    _store.save_query(trace_id, user_id=req.user_id, user_query=req.user_query, data_scope=list(req.data_scope))
+    conversation_id = req.conversation_id or trace_id
+    database = _database_store.get(req.database_id)
+    if not database:
+        raise HTTPException(400, "请选择有效的数据库")
+    database_id = database["id"]
+    _store.save_query(
+        trace_id,
+        conversation_id=conversation_id,
+        database_id=database_id,
+        user_id=req.user_id,
+        user_query=user_query,
+        data_scope=[database.get("namespace") or "risk_mart"],
+    )
 
     result: dict = {}
 
@@ -284,14 +420,15 @@ async def api_query(req: QueryRequest):
         nonlocal result
         _run_query(
             {
-                "user_query": req.user_query,
+                "user_query": user_query,
                 "user_id": req.user_id,
-                "data_scope": req.data_scope,
-                "conversation_history": req.conversation_history,
+                "data_scope": [database.get("namespace") or "risk_mart"],
+                "conversation_history": conversation_history,
                 "trace_id": trace_id,
             },
             trace_id,
             sink=lambda e: None,
+            database_id=database_id,
         )
         result = _store.get_query(trace_id) or {}
 
@@ -312,6 +449,31 @@ async def api_query_status(trace_id: str):
     return row
 
 
+@router.post("/query/{trace_id}/cancel")
+async def api_cancel_query(trace_id: str):
+    """Stop an active query and prevent late worker results from overwriting it."""
+    row = _store.get_query(trace_id)
+    if not row:
+        raise HTTPException(404, f"trace {trace_id} 不存在")
+    status = row.get("status")
+    if status == "cancelled":
+        return {"trace_id": trace_id, "status": "cancelled"}
+    if status not in {"running", "pending_review"}:
+        raise HTTPException(409, f"当前状态 {status} 的查询不能停止")
+    with _active_query_cancellations_lock:
+        event = _active_query_cancellations.get(trace_id)
+        if event is not None:
+            event.set()
+    _store.update_query(
+        trace_id,
+        status="cancelled",
+        next_node=None,
+        final_answer="查询已由用户停止。",
+        finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+    return {"trace_id": trace_id, "status": "cancelled"}
+
+
 class ApproveRequest(BaseModel):
     approved: bool
     reason: str = ""
@@ -320,11 +482,11 @@ class ApproveRequest(BaseModel):
 
 @router.post("/query/{trace_id}/approve")
 async def api_approve(trace_id: str, body: ApproveRequest):
-    if not get_deps().config.approval_enabled:
-        raise HTTPException(404, "查询审批功能已临时关闭")
     row = _store.get_query(trace_id)
     if not row:
         raise HTTPException(404, f"trace {trace_id} 不存在")
+    if not get_deps(row.get("database_id")).config.approval_enabled:
+        raise HTTPException(404, "查询审批功能已临时关闭")
     if row.get("status") != "pending_review":
         raise HTTPException(400, f"当前状态 {row.get('status')} 不可审批(需 pending_review)")
     # 先标记为进行中,避免前端把旧的 pending_review 误判成"又停在澄清"
@@ -333,7 +495,11 @@ async def api_approve(trace_id: str, body: ApproveRequest):
     def _resume():
         print(f"[approve] start trace={trace_id}", flush=True)
         try:
-            graph = build_graph(get_deps(), checkpointer=_checkpointer, event_sink=None)
+            graph = build_graph(
+                get_deps(row.get("database_id")),
+                checkpointer=_checkpointer,
+                event_sink=None,
+            )
             config = {"configurable": {"thread_id": trace_id}}
             graph.invoke(Command(resume={"approved": body.approved, "comment": body.reason}), config)
             snap = graph.get_state(config)
@@ -375,7 +541,11 @@ async def api_resume(trace_id: str, body: ResumeRequest):
 
     def _resume():
         try:
-            graph = build_graph(get_deps(), checkpointer=_checkpointer, event_sink=None)
+            graph = build_graph(
+                get_deps(row.get("database_id")),
+                checkpointer=_checkpointer,
+                event_sink=None,
+            )
             config = {"configurable": {"thread_id": trace_id}}
             graph.invoke(Command(resume=body.resume), config)
             snap = graph.get_state(config)
@@ -384,7 +554,10 @@ async def api_resume(trace_id: str, body: ResumeRequest):
             if snap.next:
                 _persist(trace_id, state, status="pending_review", next_node=next_node)
             else:
-                terminal_status = "blocked" if state.get("blocked_reason") else "done"
+                terminal_status = (
+                    state.get("terminal_status")
+                    or ("blocked" if state.get("blocked_reason") else "done")
+                )
                 _persist(trace_id, state, status=terminal_status, next_node=None)
         except Exception as e:  # noqa: BLE001
             import traceback
@@ -414,6 +587,41 @@ async def api_history(
     limit: int = 200,
 ):
     return _store.list_queries(user_id, business_line, start_date, end_date, limit)
+
+
+@router.get("/conversations")
+async def api_conversations(user_id: str | None = None, limit: int = 50):
+    """Return one sidebar item per multi-turn conversation."""
+    return _store.list_conversations(user_id=user_id, limit=limit)
+
+
+@router.get("/conversation/{conversation_id}")
+async def api_conversation(conversation_id: str):
+    turns = _store.list_conversation(conversation_id)
+    if not turns:
+        raise HTTPException(404, f"conversation {conversation_id} 不存在")
+    return turns
+
+
+@router.delete("/conversation/{conversation_id}")
+async def api_delete_conversation(conversation_id: str):
+    """Delete every completed query turn belonging to one conversation."""
+    turns = _store.list_conversation(conversation_id)
+    if not turns:
+        raise HTTPException(404, f"conversation {conversation_id} 不存在")
+    if any(turn.get("status") in {"running", "pending_review"} for turn in turns):
+        raise HTTPException(409, "包含运行中或待确认查询的对话不能删除")
+    trace_ids = _store.delete_conversation(conversation_id)
+    for trace_id in trace_ids:
+        try:
+            _checkpointer.delete_thread(trace_id)
+        except Exception:
+            pass
+    return {
+        "status": "deleted",
+        "conversation_id": conversation_id,
+        "trace_ids": trace_ids,
+    }
 
 
 @router.delete("/query/{trace_id}")
@@ -458,6 +666,274 @@ class FeedbackRequest(BaseModel):
 async def api_feedback(body: FeedbackRequest):
     _store.add_feedback(body.trace_id, body.node, body.feedback_type, body.comment)
     return {"status": "ok"}
+
+
+# ---------------- 数据库连接管理 ----------------
+
+class DatabaseConfigInput(BaseModel):
+    name: str
+    engine: str = "mysql"
+    host: str
+    port: int = 3306
+    database_name: str
+    username: str
+    password: str = ""
+    namespace: str = "risk_mart"
+    is_default: bool = False
+
+
+class DatabaseConfigUpdate(BaseModel):
+    name: str | None = None
+    engine: str | None = None
+    host: str | None = None
+    port: int | None = None
+    database_name: str | None = None
+    username: str | None = None
+    password: str | None = None
+    namespace: str | None = None
+
+
+class DatabaseRelationInput(BaseModel):
+    source_table: str
+    source_columns: list[str] = Field(min_length=1)
+    target_table: str
+    target_columns: list[str] = Field(min_length=1)
+    cardinality: str = "many_to_one"
+    preferred_join_type: str = "inner"
+    description: str = ""
+    enabled: bool = True
+
+
+class DatabaseRelationUpdate(BaseModel):
+    source_table: str | None = None
+    source_columns: list[str] | None = None
+    target_table: str | None = None
+    target_columns: list[str] | None = None
+    cardinality: str | None = None
+    preferred_join_type: str | None = None
+    description: str | None = None
+    enabled: bool | None = None
+
+
+def _schema_options(database_id: str) -> list[dict]:
+    database = _database_store.get(database_id)
+    if not database:
+        raise HTTPException(404, "数据库配置不存在")
+    path = _database_store.schema_path(database_id)
+    if not path.exists():
+        raise HTTPException(409, "该数据库尚未同步 Schema")
+    try:
+        schema = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(500, "M-Schema 文件无法读取") from exc
+    return [
+        {
+            "table_name": table_name,
+            "comment": table.get("comment") or table.get("preliminary_description") or "",
+            "columns": [
+                {
+                    "name": column_name,
+                    "comment": field.get("comment") or "",
+                    "type": field.get("type") or field.get("raw_type") or "",
+                }
+                for column_name, field in (table.get("fields") or {}).items()
+            ],
+        }
+        for table_name, table in (schema.get("tables") or {}).items()
+    ]
+
+
+def _validate_relation(database_id: str, values: dict, current: dict | None = None) -> dict:
+    merged = {**(current or {}), **values}
+    source_table = str(merged.get("source_table") or "").strip()
+    target_table = str(merged.get("target_table") or "").strip()
+    source_columns = list(merged.get("source_columns") or [])
+    target_columns = list(merged.get("target_columns") or [])
+    if not source_table or not target_table or source_table == target_table:
+        raise HTTPException(400, "关系两端必须是不同的表")
+    if not source_columns or len(source_columns) != len(target_columns):
+        raise HTTPException(400, "关系两端的字段数量必须相同且不能为空")
+    tables = {item["table_name"]: item for item in _schema_options(database_id)}
+    if source_table not in tables or target_table not in tables:
+        raise HTTPException(400, "关系引用了当前数据库中不存在的表")
+    source_available = {item["name"] for item in tables[source_table]["columns"]}
+    target_available = {item["name"] for item in tables[target_table]["columns"]}
+    if not set(source_columns) <= source_available or not set(target_columns) <= target_available:
+        raise HTTPException(400, "关系引用了表中不存在的字段")
+    if merged.get("cardinality", "many_to_one") not in {
+        "one_to_one", "one_to_many", "many_to_one", "many_to_many", "unknown",
+    }:
+        raise HTTPException(400, "不支持的关系基数")
+    if merged.get("preferred_join_type", "inner") not in {"inner", "left"}:
+        raise HTTPException(400, "关联方式仅支持 inner 或 left")
+    return {
+        key: merged[key]
+        for key in (
+            "source_table", "source_columns", "target_table", "target_columns",
+            "cardinality", "preferred_join_type", "description", "enabled",
+        )
+        if key in merged
+    }
+
+
+@router.get("/databases")
+async def api_databases():
+    """List selectable databases. Passwords are never returned."""
+    return _database_store.list()
+
+
+@router.post("/databases")
+async def api_create_database(body: DatabaseConfigInput):
+    if body.engine not in {"mysql", "postgres"}:
+        raise HTTPException(400, "仅支持 mysql 或 postgres")
+    try:
+        record = _database_store.create(body.model_dump())
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "数据库配置已存在") from exc
+    return record
+
+
+@router.put("/databases/{database_id}")
+async def api_update_database(database_id: str, body: DatabaseConfigUpdate):
+    record = _database_store.update(database_id, body.model_dump(exclude_unset=True))
+    if not record:
+        raise HTTPException(404, "数据库配置不存在")
+    _invalidate_deps(database_id)
+    return record
+
+
+@router.delete("/databases/{database_id}")
+async def api_delete_database(database_id: str):
+    record = _database_store.get(database_id)
+    if not record:
+        raise HTTPException(404, "数据库配置不存在")
+    if record.get("is_default") and len(_database_store.list()) > 1:
+        raise HTTPException(409, "请先将其他数据库设为默认")
+    if not _database_store.delete(database_id):
+        raise HTTPException(404, "数据库配置不存在")
+    _relation_store.delete_for_database(database_id)
+    _invalidate_deps(database_id)
+    return {"status": "deleted", "id": database_id}
+
+
+@router.post("/databases/{database_id}/default")
+async def api_default_database(database_id: str):
+    if not _database_store.set_default(database_id):
+        raise HTTPException(404, "数据库配置不存在")
+    return {"status": "ok", "id": database_id}
+
+
+@router.post("/databases/{database_id}/test")
+async def api_test_database(database_id: str):
+    from nl2sql_agent.services.deps import build_executor_from_url
+
+    try:
+        record = _database_store.get(database_id)
+        executor = build_executor_from_url(_database_store.connection_url(database_id))
+        probe_sql = (
+            "SELECT DATABASE() AS database_name"
+            if record and record.get("engine") == "mysql"
+            else "SELECT current_database() AS database_name"
+        )
+        rows = executor.execute(probe_sql, timeout_seconds=8)
+        return {"status": "ok", "database": rows[0].get("database_name") if rows else None}
+    except KeyError as exc:
+        raise HTTPException(404, "数据库配置不存在") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"连接失败：{exc}") from exc
+
+
+@router.post("/databases/{database_id}/sync-schema")
+async def api_sync_database_schema(database_id: str):
+    record = _database_store.get(database_id)
+    if not record:
+        raise HTTPException(404, "数据库配置不存在")
+    if record.get("schema_status") == "syncing":
+        raise HTTPException(409, "Schema 正在同步")
+    _database_store.set_schema_status(database_id, "syncing", "正在提取数据库结构")
+    _invalidate_deps(database_id)
+
+    def _sync() -> None:
+        try:
+            from nl2sql_agent.services.config_loader import ConfigLoader
+            from nl2sql_agent.services.deps import CONFIG_DIR
+            from nl2sql_agent.services.schema_ingest.diff_sync import sync
+            from nl2sql_agent.services.schema_ingest.review_queue import ReviewStore
+
+            deps = get_deps(database_id)
+            ingest_config = ConfigLoader(CONFIG_DIR).load("schema_ingest.yaml") or {}
+            datasource = _database_store.artifact_key(database_id)
+            path = _database_store.schema_path(database_id)
+            mode = "incremental" if path.exists() else "full"
+            report = sync(
+                datasource,
+                record["database_name"] if record["engine"] == "mysql" else "public",
+                deps,
+                ingest_config,
+                ReviewStore(DATA_DIR / "schema_ingest.db"),
+                mode=mode,
+                business_line=record["namespace"],
+            )
+            message = f"入库 {report.ingested}，待审核 {report.queued}，跳过 {report.skipped}"
+            _database_store.set_schema_status(database_id, "ready", message)
+            _invalidate_deps(database_id)
+        except Exception as exc:  # noqa: BLE001
+            _database_store.set_schema_status(database_id, "error", str(exc))
+            _invalidate_deps(database_id)
+
+    threading.Thread(target=_sync, daemon=True).start()
+    return {"status": "syncing", "id": database_id}
+
+
+@router.get("/databases/{database_id}/schema-options")
+async def api_database_schema_options(database_id: str):
+    return _schema_options(database_id)
+
+
+@router.get("/databases/{database_id}/relations")
+async def api_database_relations(database_id: str):
+    if not _database_store.get(database_id):
+        raise HTTPException(404, "数据库配置不存在")
+    return _relation_store.list(database_id)
+
+
+@router.post("/databases/{database_id}/relations")
+async def api_create_database_relation(database_id: str, body: DatabaseRelationInput):
+    values = _validate_relation(database_id, body.model_dump())
+    try:
+        relation = _relation_store.create(database_id, values)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "相同的表关系已经存在") from exc
+    _invalidate_deps(database_id)
+    return relation
+
+
+@router.put("/databases/{database_id}/relations/{relation_id}")
+async def api_update_database_relation(
+    database_id: str, relation_id: str, body: DatabaseRelationUpdate
+):
+    current = _relation_store.get(relation_id)
+    if not current or current.get("database_id") != database_id:
+        raise HTTPException(404, "表关系不存在")
+    values = _validate_relation(
+        database_id, body.model_dump(exclude_unset=True), current=current
+    )
+    try:
+        relation = _relation_store.update(relation_id, values)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "相同的表关系已经存在") from exc
+    _invalidate_deps(database_id)
+    return relation
+
+
+@router.delete("/databases/{database_id}/relations/{relation_id}")
+async def api_delete_database_relation(database_id: str, relation_id: str):
+    current = _relation_store.get(relation_id)
+    if not current or current.get("database_id") != database_id:
+        raise HTTPException(404, "表关系不存在")
+    _relation_store.delete(relation_id)
+    _invalidate_deps(database_id)
+    return {"status": "deleted", "id": relation_id}
 
 
 # ---------------- 配置管理(术语映射) ----------------
@@ -525,11 +1001,16 @@ def _review_store():
 
 
 @router.get("/schema")
-async def api_schema(business_line: str = "risk_mart"):
+async def api_schema(business_line: str = "risk_mart", database_id: str | None = None):
     """返回某系统的表结构(每表字段名/类型/已有注释/是否有 override)。供前端浏览与补充注释。"""
-    deps = get_deps()
-    tables = deps.catalog.tables_for_scope([business_line])
-    overrides = _review_store().overrides(business_line)
+    database = _database_store.get(database_id) if database_id else None
+    if database_id and not database:
+        raise HTTPException(404, "数据库配置不存在")
+    deps = get_deps(database_id)
+    scope = str(database.get("namespace") or business_line) if database else business_line
+    datasource = _database_store.artifact_key(database_id) if database_id else business_line
+    tables = deps.catalog.tables_for_scope([scope])
+    overrides = _review_store().overrides(datasource)
     result = []
     for t in tables:
         cols = []
@@ -556,8 +1037,16 @@ async def api_schema(business_line: str = "risk_mart"):
 
 
 @router.get("/schema/review")
-async def api_review_list(datasource: str = "risk_mart", status: str = "pending"):
+async def api_review_list(
+    datasource: str = "risk_mart",
+    status: str = "pending",
+    database_id: str | None = None,
+):
     """待审核注释队列。"""
+    if database_id:
+        if not _database_store.get(database_id):
+            raise HTTPException(404, "数据库配置不存在")
+        datasource = _database_store.artifact_key(database_id)
     return _review_store().list_reviews(status=status, datasource=datasource)
 
 
@@ -593,25 +1082,44 @@ class CommentReq(BaseModel):
 
 
 @router.post("/schema/{table_name}/comment")
-async def api_set_comment(table_name: str, body: CommentReq, business_line: str = "risk_mart"):
+async def api_set_comment(
+    table_name: str,
+    body: CommentReq,
+    business_line: str = "risk_mart",
+    database_id: str | None = None,
+):
     """补充/修改某张表的注释(写入系统覆盖层,不改数据库),并标记该表已解决评审未决项。"""
     review_store = _review_store()
-    review_store.set_override(business_line, table_name, None, body.comment)
+    if database_id and not _database_store.get(database_id):
+        raise HTTPException(404, "数据库配置不存在")
+    datasource = _database_store.artifact_key(database_id) if database_id else business_line
+    review_store.set_override(datasource, table_name, None, body.comment)
     return {"status": "ok", "table_name": table_name, "comment": body.comment}
 
 
 @router.post("/schema/{table_name}/{column_name}/comment")
 async def api_set_column_comment(
-    table_name: str, column_name: str, body: CommentReq, business_line: str = "risk_mart"
+    table_name: str,
+    column_name: str,
+    body: CommentReq,
+    business_line: str = "risk_mart",
+    database_id: str | None = None,
 ):
     """补充/修改某字段注释(写入系统覆盖层,不改数据库)。"""
     review_store = _review_store()
-    review_store.set_override(business_line, table_name, column_name, body.comment)
+    if database_id and not _database_store.get(database_id):
+        raise HTTPException(404, "数据库配置不存在")
+    datasource = _database_store.artifact_key(database_id) if database_id else business_line
+    review_store.set_override(datasource, table_name, column_name, body.comment)
     return {"status": "ok", "table_name": table_name, "column_name": column_name, "comment": body.comment}
 
 
 @router.post("/schema/reingest")
-async def api_reingest(datasource: str = "risk_mart", business_line: str = "risk_mart"):
+async def api_reingest(
+    datasource: str = "risk_mart",
+    business_line: str = "risk_mart",
+    database_id: str | None = None,
+):
     """审核/补充注释后重跑入库,更新 schema_catalog 与向量索引、重建映射。"""
     import sys
     from pathlib import Path as _P
@@ -622,10 +1130,24 @@ async def api_reingest(datasource: str = "risk_mart", business_line: str = "risk
     from nl2sql_agent.services.schema_ingest.diff_sync import sync
     from nl2sql_agent.services.schema_ingest.review_queue import ReviewStore
 
+    database = _database_store.get(database_id) if database_id else None
+    if database_id and not database:
+        raise HTTPException(404, "数据库配置不存在")
+    if database:
+        datasource = _database_store.artifact_key(database_id)
+        business_line = str(database.get("namespace") or business_line)
+    deps = get_deps(database_id)
     config = ConfigLoader(CONFIG_DIR).load("schema_ingest.yaml") or {}
     store = ReviewStore(DATA_DIR / "schema_ingest.db")
-    db_name = getattr(get_deps().executor, "conn_kwargs", {}).get("database") or datasource
-    report = sync(datasource, db_name, get_deps(), config, store, mode="incremental", business_line=business_line)
+    db_name = getattr(deps.executor, "conn_kwargs", {}).get("database") or datasource
+    report = sync(datasource, db_name, deps, config, store, mode="incremental", business_line=business_line)
+    if database_id:
+        _database_store.set_schema_status(
+            database_id,
+            "ready",
+            f"入库 {report.ingested}，待审核 {report.queued}，跳过 {report.skipped}",
+        )
+        _invalidate_deps(database_id)
     return {
         "status": "ok",
         "ingested": report.ingested,
@@ -636,6 +1158,6 @@ async def api_reingest(datasource: str = "risk_mart", business_line: str = "risk
 
 
 @router.post("/schema/review/reingest")
-async def api_review_reingest():
+async def api_review_reingest(database_id: str | None = None):
     """前端在审核页操作后调用:重跑入库,把 override 注释落到 schema_catalog/m-schema。"""
-    return await api_reingest()
+    return await api_reingest(database_id=database_id)

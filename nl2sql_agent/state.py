@@ -67,6 +67,20 @@ class SemanticOutput(BaseModel):
     source_span: list[int] = Field(default_factory=list)
     required: bool = True
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    aggregation: Optional[Literal[
+        "count", "count_distinct", "sum", "avg", "min", "max",
+    ]] = None
+    distinct_grain: Optional[str] = None
+    broad: bool = False
+
+
+class SemanticOrder(BaseModel):
+    """Schema-independent ordering requested by the user."""
+
+    concept: str
+    grounding_concept: Optional[str] = None
+    direction: Literal["asc", "desc"] = "asc"
+    source_text: str = ""
 
 
 class SemanticPredicate(BaseModel):
@@ -92,12 +106,35 @@ class SemanticPredicate(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     materiality: Literal["low", "medium", "high"] = "high"
 
+    @field_validator("operator", mode="before")
+    @classmethod
+    def normalize_operator(cls, value):
+        if value is None:
+            return None
+        normalized = " ".join(str(value).strip().lower().split())
+        return {
+            "equals": "=", "equal": "=", "eq": "=",
+            "not_equals": "!=", "not equal": "!=", "ne": "!=",
+            "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
+            "等于": "=", "为": "=", "是": "=", "相等": "=",
+            "不等于": "!=", "不为": "!=", "不是": "!=",
+            "超过": ">", "大于": ">", "高于": ">",
+            "不低于": ">=", "至少": ">=", "大于等于": ">=",
+            "低于": "<", "小于": "<", "少于": "<",
+            "不超过": "<=", "至多": "<=", "小于等于": "<=",
+            "包含": "like", "不包含": "not like",
+        }.get(normalized, normalized)
+
 
 class SemanticGraph(BaseModel):
     """自然语言问题的唯一业务语义事实；后续节点不得重新解析覆盖。"""
 
     subjects: list[SemanticSubject] = Field(default_factory=list)
     outputs: list[SemanticOutput] = Field(default_factory=list)
+    group_by: list[str] = Field(default_factory=list)
+    order_by: list[SemanticOrder] = Field(default_factory=list)
+    limit: Optional[int] = Field(default=None, ge=1)
+    query_action: Literal["lookup", "detail", "aggregate", "rank", "unknown"] = "unknown"
     predicate: Optional[SemanticPredicate] = None
     capabilities: list[str] = Field(default_factory=list)
     assumptions: list[QueryAssumption] = Field(default_factory=list)
@@ -145,6 +182,36 @@ class DecisionSource(BaseModel):
     reason: str = ""
 
 
+class ProjectionFieldSelection(BaseModel):
+    """A model-selected physical field after query-scoped Schema retrieval."""
+
+    table_name: str
+    column_name: str
+    business_label: str
+    reason: str = ""
+    aggregation: Optional[Literal[
+        "count", "count_distinct", "sum", "avg", "min", "max",
+    ]] = None
+    distinct_grain: Optional[str] = None
+
+
+class ProjectionFieldExclusion(BaseModel):
+    business_label: str
+    reason: str
+
+
+class ProjectionDecision(BaseModel):
+    """Auditable concretization of a vague result request, not model chain-of-thought."""
+
+    request: str
+    target_entity: str
+    understood_description: str
+    selected_fields: list[ProjectionFieldSelection] = Field(default_factory=list)
+    excluded_fields: list[ProjectionFieldExclusion] = Field(default_factory=list)
+    missing_concepts: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
 class DecisionSummary(BaseModel):
     """可向用户展示的决策摘要，不包含模型内部思维链。"""
 
@@ -154,6 +221,9 @@ class DecisionSummary(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
     confidence: dict[str, float] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    resolved_outputs: list[str] = Field(default_factory=list)
+    excluded_outputs: list[str] = Field(default_factory=list)
+    missing_outputs: list[str] = Field(default_factory=list)
 
 
 class ResultSummary(BaseModel):
@@ -237,11 +307,20 @@ class FilterSpec(_PlanPart):
     value: Any = None
     table: Optional[str] = None
     source_atom_ids: list[str] = Field(default_factory=list)
+    scope: Literal["row", "cohort", "measure"] = "row"
+    aggregation: Optional[Literal[
+        "count", "count_distinct", "sum", "avg", "min", "max",
+    ]] = None
 
     @field_validator("operator", mode="before")
     @classmethod
     def normalize_operator(cls, value):
-        return " ".join(str(value).strip().lower().split())
+        normalized = " ".join(str(value).strip().lower().split())
+        return {
+            "equals": "=", "equal": "=", "eq": "=",
+            "not_equals": "!=", "not equal": "!=", "ne": "!=",
+            "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
+        }.get(normalized, normalized)
 
 
 class MetricSpec(_PlanPart):
@@ -266,6 +345,15 @@ class OutputFieldSpec(_PlanPart):
     source_output_ids: list[str] = Field(default_factory=list)
 
 
+class OrderSpec(_PlanPart):
+    concept: str = ""
+    table: Optional[str] = None
+    column: Optional[str] = None
+    expression: Optional[str] = None
+    direction: Literal["asc", "desc"] = "asc"
+    source_output_id: Optional[str] = None
+
+
 class OutputGrain(_PlanPart):
     """The semantic grain of one output row."""
 
@@ -287,8 +375,11 @@ class QueryPlan(BaseModel):
     target_tables: list[str] = Field(min_length=1)
     join_logic: list[JoinSpec] = Field(default_factory=list)
     filters: list[FilterSpec] = Field(default_factory=list)
+    having: list[FilterSpec] = Field(default_factory=list)
     metric_logic: Optional[MetricSpec] = None
     group_by: list[str] = Field(default_factory=list)
+    order_by: list[OrderSpec] = Field(default_factory=list)
+    limit: Optional[int] = Field(default=None, ge=1)
     output_fields: list[OutputFieldSpec] = Field(default_factory=list)
     output_grain: OutputGrain = Field(default_factory=OutputGrain)
     covered_atom_ids: list[str] = Field(default_factory=list)
@@ -337,7 +428,7 @@ class LogicalOperation(_PlanPart):
     id: str
     kind: Literal[
         "scan", "filter", "join", "semi_join", "anti_join",
-        "aggregate", "project", "sort", "limit",
+        "aggregate", "having", "project", "sort", "limit",
     ]
     inputs: list[str] = Field(default_factory=list)
     table: Optional[str] = None
@@ -376,6 +467,7 @@ class NL2SQLState(BaseModel):
     # ---------- 模块 2:问题理解、改写与业务消歧 ----------
     resolved_query: Optional[ResolvedQuery] = None
     semantic_graph: Optional[SemanticGraph] = None
+    semantic_coverage: dict[str, Any] = Field(default_factory=dict)
     # atom_id -> 已选物理字段及业务谓词约束，仅由 Schema Grounding 产生。
     semantic_bindings: dict[str, dict] = Field(default_factory=dict)
     # output_id -> 已选物理返回字段；显式返回要求必须全部绑定并进入 QueryPlan。
@@ -386,6 +478,7 @@ class NL2SQLState(BaseModel):
     # 选项到物理字段的内部绑定；API 不得下发给普通用户。
     business_option_bindings: dict[str, str] = Field(default_factory=dict)
     decision_summary: Optional[DecisionSummary] = None
+    projection_decision: Optional[ProjectionDecision] = None
 
     # ---------- 模块 2.5:查询理解 ----------
     query_intent: Optional[QueryIntent] = None
@@ -416,8 +509,10 @@ class NL2SQLState(BaseModel):
     logical_plan: Optional[LogicalPlan] = None
     plan_normalizations: list[str] = Field(default_factory=list)
     plan_validation_errors: list[str] = Field(default_factory=list)
+    plan_generation_error_kind: Optional[str] = None
     plan_retry_count: int = 0
     max_plan_retries: int = 2
+    terminal_status: Optional[str] = None
 
     # ---------- 模块 7/8:SQL 生成与校验 ----------
     generated_sql: Optional[str] = None

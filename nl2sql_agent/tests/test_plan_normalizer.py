@@ -7,7 +7,7 @@ from nl2sql_agent.state import NL2SQLState, QueryPlan, SchemaHit, SemanticGraph,
 
 def test_positive_exists_parent_is_attached_to_join_and_covered(deps):
     graph = build_semantic_graph(
-        "统计贷款金额超过1000且有逾期的客户信息",
+        "统计贷款金额超过1000且有逾期的客户",
         deps.loader.load("business_predicates.yaml"),
     )
     raw = QueryPlan(
@@ -69,6 +69,48 @@ def test_negative_exists_is_never_inferred():
     assert changes == []
     assert normalized.covered_atom_ids == ["status_filter"]
     assert "missing_event" not in normalized.filters[0].source_atom_ids
+
+
+def test_confirmed_text_value_binding_overrides_model_filter_value():
+    graph = SemanticGraph(predicate=SemanticPredicate(
+        atom_id="address_filter", predicate_type="comparison",
+        concept="户籍地址", operator="=", value="上海",
+    ))
+    raw = QueryPlan(
+        target_tables=["customer"],
+        filters=[{
+            "table": "customer", "column": "HHDIST", "operator": "=", "value": "上海",
+            "source_atom_ids": ["address_filter"],
+        }],
+    )
+
+    normalized, changes = normalize_structural_coverage(
+        raw,
+        graph,
+        semantic_bindings={
+            "address_filter": {
+                "table_name": "customer", "column_name": "HHDIST",
+                "operator": "=", "value": "上海市",
+            },
+        },
+    )
+
+    assert normalized.filters[0].value == "上海市"
+    assert changes == ["address_filter 已采用确认的 Schema 字段和值绑定"]
+    schema = [SchemaHit(table_name="customer", columns=[{"name": "HHDIST"}])]
+    assert validate_plan(
+        normalized,
+        schema,
+        term_mapping=None,
+        data_scope=["test"],
+        semantic_graph=graph,
+        semantic_bindings={
+            "address_filter": {
+                "table_name": "customer", "column_name": "HHDIST",
+                "operator": "=", "value": "上海市",
+            },
+        },
+    ) == []
 
 
 def test_plan_generation_node_normalizes_exists_before_validation(deps):

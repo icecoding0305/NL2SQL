@@ -3,6 +3,7 @@ import {
   CodeOutlined,
   ExclamationCircleOutlined,
   RobotOutlined,
+  StopOutlined,
 } from "@ant-design/icons";
 import { Card, Collapse, Space, Spin, Tag, Typography } from "antd";
 import { PIPELINE_NODES } from "../types";
@@ -10,16 +11,21 @@ import { PIPELINE_NODES } from "../types";
 const { Text, Title } = Typography;
 
 interface ThreadSession {
+  trace_id: string;
   query: string;
   status: string;
-  steps: Record<string, { status: string; data?: Record<string, unknown> }>;
+  steps: Record<string, {
+    status: "idle" | "running" | "done" | "interrupt" | "error";
+    data?: Record<string, unknown>;
+    retries: { attempt: number; reason: string }[];
+  }>;
   trace_steps?: string[];
   node_latencies?: Record<string, number>;
 }
 
 interface Props {
-  session?: ThreadSession;
-  renderStep: (node: string, title: string) => React.ReactNode;
+  sessions: ThreadSession[];
+  renderStep: (session: ThreadSession, node: string, title: string) => React.ReactNode;
 }
 
 const statusLabel: Record<string, string> = {
@@ -66,19 +72,13 @@ const technicalNodes = new Set([
   "sensitive_check",
 ]);
 
-export default function ConversationThread({ session, renderStep }: Props) {
-  if (!session) {
-    return (
-      <div className="conversation-empty">
-        <div>
-          <div className="empty-orb"><RobotOutlined /></div>
-          <Title level={3} style={{ marginBottom: 8 }}>今天想了解哪些数据？</Title>
-          <Text type="secondary">用自然语言提问，我会先说明理解，再返回结果。</Text>
-        </div>
-      </div>
-    );
-  }
-
+function ConversationTurn({
+  session,
+  renderStep,
+}: {
+  session: ThreadSession;
+  renderStep: (node: string, title: string) => React.ReactNode;
+}) {
   const runningNode = PIPELINE_NODES.find(({ node }) => session.steps[node]?.status === "running");
   const lastNode = session.trace_steps?.[session.trace_steps.length - 1];
   const runningLabel = stageByNode[runningNode?.node || lastNode || "entry"] || "正在准备查询";
@@ -99,7 +99,7 @@ export default function ConversationThread({ session, renderStep }: Props) {
   );
 
   return (
-    <div className="conversation-thread">
+    <>
       <div className="message-row user">
         <div className="message-bubble user-bubble">{session.query}</div>
       </div>
@@ -147,6 +147,14 @@ export default function ConversationThread({ session, renderStep }: Props) {
                 </Space>
               </Card>
             )}
+            {session.status === "cancelled" && (
+              <Card className="pipeline-card cancelled-card" size="small">
+                <Space>
+                  <StopOutlined />
+                  <Text>查询已停止，不会继续生成或执行 SQL。</Text>
+                </Space>
+              </Card>
+            )}
             {detailNodes.length > 0 && (
               <Collapse
                 className="technical-details"
@@ -171,6 +179,32 @@ export default function ConversationThread({ session, renderStep }: Props) {
           </div>
         </div>
       </div>
+    </>
+  );
+}
+
+export default function ConversationThread({ sessions, renderStep }: Props) {
+  if (sessions.length === 0) {
+    return (
+      <div className="conversation-empty">
+        <div>
+          <div className="empty-orb"><RobotOutlined /></div>
+          <Title level={3} style={{ marginBottom: 8 }}>今天想了解哪些数据？</Title>
+          <Text type="secondary">用自然语言提问，我会先说明理解，再返回结果。</Text>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="conversation-thread">
+      {sessions.map((session) => (
+        <ConversationTurn
+          key={session.trace_id}
+          session={session}
+          renderStep={(node, title) => renderStep(session, node, title)}
+        />
+      ))}
     </div>
   );
 }

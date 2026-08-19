@@ -10,6 +10,7 @@ import re
 from typing import Iterable
 
 from nl2sql_agent.services.schema_planner import parse_query_intent
+from nl2sql_agent.services.semantic_query import enrich_semantic_graph, metric_semantics
 from nl2sql_agent.state import (
     IntentSlot,
     QueryAssumption,
@@ -25,6 +26,16 @@ _STATUS_PATTERN = re.compile(
     r"(?P<polarity>没有|不存在|无|未发生|有|存在|出现|发生过|发生)"
     r"(?P<concept>逾期|代偿|核销|还款)"
 )
+_AGGREGATE_COMPARISON_RE = re.compile(
+    r"(?P<prefix>累计|合计|总计|平均|最大|最高|最小|最低)"
+    r"(?P<field>[\u4e00-\u9fffA-Za-z_]{1,20}?)"
+    r"(?P<word>不低于|至少|超过|大于|高于|不超过|至多|低于|小于|少于|等于)"
+    r"\s*(?P<value>-?\d+(?:\.\d+)?)"
+)
+_COMPARISON_OPERATORS = {
+    "不低于": ">=", "至少": ">=", "超过": ">", "大于": ">", "高于": ">",
+    "不超过": "<=", "至多": "<=", "低于": "<", "小于": "<", "少于": "<", "等于": "=",
+}
 
 
 def _predicate_rules(config: dict | None) -> dict[str, dict]:
@@ -79,26 +90,83 @@ def build_semantic_graph(query: str, config: dict | None = None) -> SemanticGrap
     atoms: list[SemanticPredicate] = []
     atom_index = 1
     for item in legacy.filters:
-        if not isinstance(item.value, (int, float)):
-            continue
+        if isinstance(item.value, (int, float)):
+            operator_words = "超过|大于|高于|不低于|至少|不超过|至多|低于|少于|等于"
+        else:
+            operator_words = "等于|为|是"
         text_pattern = re.compile(
-            rf"{re.escape(item.text)}.*?(?:超过|大于|高于|不低于|至少|不超过|至多|低于|少于|等于)"
-            rf"{re.escape(str(item.value))}"
+            rf"{re.escape(item.text)}.*?(?:{operator_words})"
+            rf"\s*{re.escape(str(item.value))}"
         )
         match = text_pattern.search(query)
+        aggregate_prefix = next((
+            prefix for prefix in ("累计", "合计", "总计", "平均", "最大", "最小")
+            if f"{prefix}{item.text}" in query
+        ), None)
+        aggregate_label = f"{aggregate_prefix or ''}{item.text}"
+        base_concept, aggregation, _ = metric_semantics(aggregate_label)
         atoms.append(SemanticPredicate(
             atom_id=f"atom_{atom_index}",
-            predicate_type="comparison",
+            predicate_type="aggregate_comparison" if aggregation else "comparison",
             subject_id=subject_ids.get("贷款", subjects[0].id),
             concept=item.text,
+            grounding_concept=base_concept if aggregation else None,
             operator=item.operator,
             value=item.value,
-            scope="same_record" if "贷款" in query else "record",
+            scope=(
+                "per_entity" if aggregation and legacy.dimensions
+                else "global" if aggregation
+                else "same_record" if "贷款" in query
+                else "record"
+            ),
             source_text=match.group(0) if match else item.text,
             source_span=list(match.span()) if match else [],
             confidence=0.96,
         ))
         atom_index += 1
+
+    # Repair aggregate-result comparisons independently from the legacy slot
+    # parser, which intentionally strips words such as “累计/平均” when ranking
+    # physical fields.  Those modifiers determine WHERE versus HAVING and must
+    # remain in the semantic contract.
+    for match in _AGGREGATE_COMPARISON_RE.finditer(query):
+        raw_value = match.group("value")
+        value = float(raw_value) if "." in raw_value else int(raw_value)
+        label = f"{match.group('prefix')}{match.group('field')}"
+        base, aggregation, _ = metric_semantics(label)
+        replacement = SemanticPredicate(
+            atom_id="",
+            predicate_type="aggregate_comparison",
+            subject_id=subject_ids.get("贷款", subjects[0].id),
+            concept=label,
+            grounding_concept=base,
+            operator=_COMPARISON_OPERATORS[match.group("word")],
+            value=value,
+            scope="per_entity" if legacy.dimensions else "global",
+            source_text=match.group(0),
+            source_span=list(match.span()),
+            confidence=0.98,
+        )
+        existing_index = next((
+            index for index, atom in enumerate(atoms)
+            if atom.value == value
+            and atom.operator == replacement.operator
+            and atom.predicate_type == "comparison"
+            and (
+                not atom.source_span
+                or not (
+                    atom.source_span[1] <= match.start()
+                    or atom.source_span[0] >= match.end()
+                )
+            )
+        ), None)
+        if existing_index is not None:
+            replacement.atom_id = atoms[existing_index].atom_id
+            atoms[existing_index] = replacement
+        else:
+            replacement.atom_id = f"atom_{atom_index}"
+            atoms.append(replacement)
+            atom_index += 1
 
     assumptions: list[QueryAssumption] = []
     unresolved: list[str] = []
@@ -190,7 +258,7 @@ def build_semantic_graph(query: str, config: dict | None = None) -> SemanticGrap
     ):
         if enabled:
             capabilities.append(capability)
-    return SemanticGraph(
+    return enrich_semantic_graph(query, SemanticGraph(
         subjects=subjects,
         outputs=outputs,
         predicate=predicate,
@@ -198,7 +266,7 @@ def build_semantic_graph(query: str, config: dict | None = None) -> SemanticGrap
         assumptions=assumptions,
         unresolved_slots=list(dict.fromkeys(unresolved)),
         confidence=min((item.confidence for item in atoms), default=0.72),
-    )
+    ))
 
 
 def iter_semantic_atoms(predicate: SemanticPredicate | None) -> Iterable[SemanticPredicate]:
@@ -236,11 +304,17 @@ def semantic_graph_to_query_intent(
     filters: list[IntentSlot] = []
     measures: list[IntentSlot] = []
     for atom in iter_semantic_atoms(graph.predicate):
-        if atom.predicate_type == "comparison":
+        if atom.predicate_type in {"comparison", "aggregate_comparison"}:
             filters.append(IntentSlot(
-                text=atom.concept, role="measure", operator=atom.operator, value=atom.value
+                text=atom.grounding_concept or atom.concept,
+                role="measure" if isinstance(atom.value, (int, float)) else "attribute",
+                operator=atom.operator,
+                value=atom.value,
             ))
-            measures.append(IntentSlot(text=atom.concept, role="measure"))
+            if isinstance(atom.value, (int, float)):
+                measures.append(IntentSlot(
+                    text=atom.grounding_concept or atom.concept, role="measure"
+                ))
         elif atom.predicate_type == "status":
             rule = _matching_rule(atom.concept, config)
             binding_concept = str(rule.get("binding_concept") or atom.concept)
@@ -250,17 +324,42 @@ def semantic_graph_to_query_intent(
                 operator=str(rule.get("operator") or "="),
                 value=rule.get("value", True),
             ))
-    query_type = "fact_filter" if filters else legacy.query_type
+    aggregate_outputs = [
+        output for output in graph.outputs
+        if output.required and output.aggregation
+    ]
+    query_type = (
+        "fact_filter" if filters
+        else "multi_fact" if len(aggregate_outputs) > 1
+        else "aggregation" if aggregate_outputs or graph.group_by
+        else legacy.query_type
+    )
     output_attributes = [
         IntentSlot(text=output.grounding_concept or output.concept, role="attribute")
         for output in graph.outputs
-        if output.required and (output.grounding_concept or output.concept)
+        if output.required
+        and (not output.aggregation or output.broad)
+        and (output.grounding_concept or output.concept)
     ]
+    output_measures = [
+        IntentSlot(text=output.grounding_concept or output.concept, role="measure")
+        for output in aggregate_outputs
+        if output.aggregation != "count_distinct" and (output.grounding_concept or output.concept)
+    ]
+    dimensions = [IntentSlot(text=item, role="dimension") for item in graph.group_by]
+    entity_names = list(dict.fromkeys([
+        *[item.text for item in legacy.entities],
+        *graph.group_by,
+    ]))
     return legacy.model_copy(update={
         "query_type": query_type,
+        "entities": [IntentSlot(text=item, role="entity") for item in entity_names],
         "filters": filters,
-        "measures": list({item.text: item for item in [*legacy.measures, *measures]}.values()),
-        "attributes": list({
-            item.text: item for item in [*legacy.attributes, *output_attributes]
+        "measures": list({
+            item.text: item for item in [*output_measures, *measures]
         }.values()),
+        "attributes": list({
+            item.text: item for item in output_attributes
+        }.values()),
+        "dimensions": dimensions or legacy.dimensions,
     })

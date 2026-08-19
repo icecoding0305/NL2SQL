@@ -3,6 +3,13 @@
 # SQL 方言(对应不同数据库连接),sqlglot 支持:mysql / postgres / duckdb ...
 dialect: mysql
 
+# 运行时直接以 effective M-Schema 为 Schema 事实源。
+# auto 会从 DATABASE_URL 的数据库名定位 data/schema/<database>/m-schema.json；
+# 旧部署仍可提供 schema_catalog.yaml 作为兼容回退，但当前项目不再生成它。
+schema_source:
+  mode: auto
+  m_schema_path: auto
+
 # Schema 检索:向量兜底的 Top-K
 schema_search_top_k: 5
 

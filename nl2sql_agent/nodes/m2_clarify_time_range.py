@@ -22,7 +22,14 @@ def _history_text(state: NL2SQLState) -> str:
 
 def _check_time_range(query: str, rule: dict) -> str | None:
     """问题表现出时间意图但缺少明确范围 → 返回提示,否则 None。"""
-    intent = [k for k in rule.get("time_intent_keywords", []) if k in query]
+    # “年龄、年月利率”等业务字段包含“年/月/日”，不代表用户提出了时间范围。
+    # 单字时间单位必须出现在明确的时间表达上下文中，避免属性查询误触发澄清。
+    keywords = [str(item) for item in rule.get("time_intent_keywords", [])]
+    intent = [keyword for keyword in keywords if len(keyword) > 1 and keyword in query]
+    if re.search(r"(?:按|每|逐|本|上|下|今|去|明|近)\s*[年月日周]", query):
+        intent.append("时间单位")
+    if re.search(r"\d{2,4}\s*年|\d+\s*个?[年月日周]", query):
+        intent.append("时间数值")
     if not intent:
         return None
     range_present = any(re.search(p, query) for p in rule.get("range_present_patterns", []))

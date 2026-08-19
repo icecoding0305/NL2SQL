@@ -17,15 +17,25 @@
 
 from __future__ import annotations
 
+import re
+
 from nl2sql_agent.services.schema_planner import (
     build_schema_plan,
+    extend_schema_plan_for_output_bindings,
     find_field_ambiguities,
     ground_output_bindings,
     parse_query_intent,
     plan_table_names,
     rank_field_candidates,
 )
+from nl2sql_agent.services.projection_resolver import (
+    materialize_projection_decision,
+    resolve_vague_projection,
+)
 from nl2sql_agent.services.semantic_parser import iter_semantic_atoms
+from nl2sql_agent.services.semantic_coverage import refresh_semantic_coverage
+from nl2sql_agent.services.semantic_query import metric_semantics
+from nl2sql_agent.services.value_grounding import ground_text_binding
 from nl2sql_agent.state import (
     BusinessClarification,
     BusinessClarificationOption,
@@ -47,6 +57,24 @@ def _dedupe(hits: list[SchemaHit]) -> list[SchemaHit]:
             seen.add(h.table_name)
             out.append(h)
     return out
+
+
+def _effective_relations(deps, base_relations: list[dict] | None = None) -> list[dict]:
+    """Merge generated FK facts with user-verified database relationship overlays."""
+    merged: dict[tuple, dict] = {}
+    for relation in [
+        *(base_relations or []),
+        *getattr(deps.catalog, "relation_overrides", []),
+    ]:
+        key = (
+            relation.get("source_table"),
+            tuple(relation.get("source_columns") or []),
+            relation.get("target_table"),
+            tuple(relation.get("target_columns") or []),
+        )
+        if all((key[0], key[1], key[2], key[3])):
+            merged[key] = dict(relation)
+    return list(merged.values())
 
 
 def _business_clarification(deps, scope, field_ambiguities):
@@ -87,7 +115,9 @@ def _business_clarification(deps, scope, field_ambiguities):
     ), bindings
 
 
-def _enrich_decision_summary(state, deps, schema_plan, confidence):
+def _enrich_decision_summary(
+    state, deps, schema_plan, confidence, projection_decision=None
+):
     base = state.decision_summary or DecisionSummary(
         understood_query=state.clarified_query or state.user_query
     )
@@ -117,14 +147,67 @@ def _enrich_decision_summary(state, deps, schema_plan, confidence):
         message = f"Schema 证据不足：{slot}"
         if message not in warnings:
             warnings.append(message)
+    business_steps = list(base.business_steps)
+    resolved_outputs = list(base.resolved_outputs)
+    excluded_outputs = list(base.excluded_outputs)
+    missing_outputs = list(base.missing_outputs)
+    if projection_decision is not None:
+        labels = [item.business_label for item in projection_decision.selected_fields]
+        if labels:
+            business_steps.append(
+                f"将“{projection_decision.request}”具体化为：{'、'.join(labels)}"
+            )
+            resolved_outputs.extend(labels)
+        excluded_outputs.extend(
+            f"{item.business_label}：{item.reason}"
+            for item in projection_decision.excluded_fields
+        )
+        missing_outputs.extend(projection_decision.missing_concepts)
     return base.model_copy(update={
         "data_sources": sources,
+        "business_steps": list(dict.fromkeys(business_steps)),
         "confidence": {**base.confidence, "schema_planning": float(confidence)},
         "warnings": warnings,
+        "resolved_outputs": list(dict.fromkeys(resolved_outputs)),
+        "excluded_outputs": list(dict.fromkeys(excluded_outputs)),
+        "missing_outputs": list(dict.fromkeys(missing_outputs)),
     })
 
 
-def _ground_semantic_atoms(state, candidates):
+def _runtime_value_lookup(deps):
+    """Build a bounded, parameterized lookup for non-sensitive enum values."""
+    quote = "`" if str(deps.config.dialect).lower() == "mysql" else '"'
+
+    def lookup(candidate, column, value: str) -> list[str]:
+        table_name = candidate.table_name
+        column_name = candidate.column_name
+        if not all(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item)
+            for item in (table_name, column_name)
+        ):
+            return []
+        table = f"{quote}{table_name}{quote}"
+        field = f"{quote}{column_name}{quote}"
+        sql = (
+            f"SELECT DISTINCT {field} AS matched_value FROM {table} "
+            f"WHERE {field} LIKE %s LIMIT 5"
+        )
+        try:
+            rows = deps.executor.execute(
+                sql, timeout_seconds=3, params=(f"%{value}%",)
+            )
+        except Exception:  # 值域探测失败时安全降级到离线画像
+            return []
+        return [
+            str(row.get("matched_value"))
+            for row in rows
+            if row.get("matched_value") is not None
+        ]
+
+    return lookup
+
+
+def _ground_semantic_atoms(state, candidates, tables, deps=None):
     """将语义原子绑定到已评分物理字段，形成可确定性校验的 Grounding 证据。"""
     bindings: dict[str, dict] = {}
     if state.semantic_graph is None:
@@ -143,21 +226,38 @@ def _ground_semantic_atoms(state, candidates):
         if not options:
             continue
         selected = options[0]
+        operator = atom.operator
+        value = atom.value
+        value_evidence: list[str] = []
+        if isinstance(value, str) and str(operator or "=").lower() == "=":
+            grounded = ground_text_binding(
+                value,
+                options,
+                tables,
+                value_lookup=_runtime_value_lookup(deps) if deps is not None else None,
+            )
+            if grounded is not None:
+                selected, operator, value, value_evidence = grounded
         bindings[atom.atom_id] = {
             "table_name": selected.table_name,
             "column_name": selected.column_name,
-            "operator": atom.operator,
-            "value": atom.value,
+            "operator": operator,
+            "value": value,
             "confidence": selected.final_score,
-            "evidence": selected.evidence,
+            "evidence": list(dict.fromkeys([*selected.evidence, *value_evidence])),
+            "aggregation": (
+                metric_semantics(atom.source_text or atom.concept)[1]
+                if atom.predicate_type == "aggregate_comparison" else None
+            ),
+            "scope": atom.scope,
         }
     return bindings
 
 
-def _unsupported_output_concepts(state: NL2SQLState, bindings: dict[str, dict]) -> list[str]:
+def _unsupported_output_concepts(graph, bindings: dict[str, dict]) -> list[str]:
     return [
         output.concept
-        for output in (state.semantic_graph.outputs if state.semantic_graph else [])
+        for output in (graph.outputs if graph else [])
         if output.required and output.id not in bindings
     ]
 
@@ -305,7 +405,7 @@ def _join_path_supplements(deps, seed_names: set[str], scope: list[str]) -> list
     mschema, _ = source
     available = _catalog_hits(deps, scope)
     graph: dict[str, set[str]] = {}
-    for relation in mschema.get("relations", []):
+    for relation in _effective_relations(deps, mschema.get("relations", [])):
         left = str(relation.get("source_table") or "")
         right = str(relation.get("target_table") or "")
         if left in available and right in available:
@@ -373,6 +473,7 @@ def make_schema_retrieval_node(deps):
         original_query = state.clarified_query or state.user_query
         query = _expand_query(deps, original_query)
         scope = state.data_scope
+        visible_tables = list(deps.catalog.tables_for_scope(scope))
         # 正常图链路只消费模块2已冻结的语义派生 QueryIntent，禁止再次解析覆盖。
         # 仅保留直接单测/旧调用方未经过模块2时的兼容降级。
         query_intent = state.query_intent or parse_query_intent(original_query)
@@ -462,7 +563,6 @@ def make_schema_retrieval_node(deps):
                     load_mschema_vector_source,
                 )
 
-                visible_tables = list(deps.catalog.tables_for_scope(scope))
                 score_by_table = {hit.table_name: score for hit, score in scored}
                 field_candidates = rank_field_candidates(
                     query_intent, visible_tables, score_by_table
@@ -483,12 +583,24 @@ def make_schema_retrieval_node(deps):
                     item.text for item in query_intent.attributes
                     if item.text not in constrained_slots
                 }
+                # Grouping by an entity (for example “每个客户/产品”) is a
+                # physical identity decision. Resolve it from keys and the
+                # relation graph internally instead of asking users to choose
+                # between customer status, category and identifier columns.
+                entity_identity_slots = {
+                    item for item in (
+                        state.semantic_graph.group_by if state.semantic_graph else []
+                    )
+                }
                 field_ambiguities = {
                     slot: options for slot, options in field_ambiguities.items()
-                    if slot not in output_only_slots
+                    if slot not in output_only_slots and slot not in entity_identity_slots
                 }
                 source = load_mschema_vector_source(getattr(deps.catalog, "metadata", {}))
-                relations = source[0].get("relations", []) if source is not None else []
+                relations = _effective_relations(
+                    deps,
+                    source[0].get("relations", []) if source is not None else [],
+                )
                 max_hops = int(
                     deps.config.clarification_rules.get("retrieval_confidence", {})
                     .get("max_join_path_hops", 3)
@@ -507,6 +619,34 @@ def make_schema_retrieval_node(deps):
                         schema_plan.unresolved_slots.append(marker)
                 if field_ambiguities:
                     schema_plan.confidence *= 0.75
+                projection_decision = resolve_vague_projection(
+                    state, deps, query_intent, schema_plan, visible_tables, field_candidates
+                )
+                effective_graph, query_intent, schema_plan, projection_bindings = (
+                    materialize_projection_decision(
+                        projection_decision,
+                        state.semantic_graph,
+                        query_intent,
+                        schema_plan,
+                    )
+                )
+                semantic_coverage = refresh_semantic_coverage(
+                    original_query, effective_graph, state.semantic_coverage
+                )
+                output_bindings = ground_output_bindings(
+                    effective_graph,
+                    field_candidates,
+                    state.selected_field_overrides,
+                    visible_tables,
+                )
+                output_bindings.update(projection_bindings)
+                schema_plan = extend_schema_plan_for_output_bindings(
+                    schema_plan,
+                    output_bindings,
+                    visible_tables,
+                    relations,
+                    max_hops=max_hops,
+                )
                 planned_names = plan_table_names(schema_plan)
                 available = _catalog_hits(deps, scope)
                 planned_hits = [available[name] for name in planned_names if name in available]
@@ -517,15 +657,19 @@ def make_schema_retrieval_node(deps):
                     business_clarification, option_bindings = _business_clarification(
                         deps, scope, field_ambiguities
                     )
-                    semantic_bindings = _ground_semantic_atoms(state, field_candidates)
-                    output_bindings = ground_output_bindings(
-                        state.semantic_graph,
-                        field_candidates,
-                        state.selected_field_overrides,
+                    semantic_bindings = _ground_semantic_atoms(
+                        state, field_candidates, visible_tables, deps
                     )
-                    unsupported_outputs = _unsupported_output_concepts(
-                        state, output_bindings
-                    )
+                    unsupported_outputs = [
+                        *_unsupported_output_concepts(effective_graph, output_bindings),
+                        *(
+                            projection_decision.missing_concepts
+                            if projection_decision is not None
+                            and not projection_decision.selected_fields
+                            else []
+                        ),
+                    ]
+                    unsupported_outputs = list(dict.fromkeys(unsupported_outputs))
                     main_table_count = max(
                         1,
                         len(schema_plan.anchor_tables) + len(schema_plan.dimension_tables),
@@ -536,6 +680,9 @@ def make_schema_retrieval_node(deps):
                         "retrieval_candidates": candidates,
                         "main_table_count": main_table_count,
                         "query_intent": query_intent,
+                        "semantic_graph": effective_graph,
+                        "semantic_coverage": semantic_coverage,
+                        "projection_decision": projection_decision,
                         "field_candidates": field_candidates[:30],
                         "field_ambiguities": field_ambiguities,
                         "schema_plan": schema_plan,
@@ -547,7 +694,7 @@ def make_schema_retrieval_node(deps):
                         **({"final_answer": _unsupported_output_answer(unsupported_outputs)}
                            if unsupported_outputs else {}),
                         "decision_summary": _enrich_decision_summary(
-                            state, deps, schema_plan, confidence
+                            state, deps, schema_plan, confidence, projection_decision
                         ),
                     }
 
@@ -592,7 +739,7 @@ def make_schema_retrieval_node(deps):
             state.selected_field_overrides,
         )
         unsupported_outputs = (
-            _unsupported_output_concepts(state, output_bindings)
+            _unsupported_output_concepts(state.semantic_graph, output_bindings)
             if field_candidates else []
         )
         return {
@@ -606,7 +753,9 @@ def make_schema_retrieval_node(deps):
             "schema_plan": schema_plan,
             "business_clarification": business_clarification,
             "business_option_bindings": option_bindings,
-            "semantic_bindings": _ground_semantic_atoms(state, field_candidates),
+            "semantic_bindings": _ground_semantic_atoms(
+                state, field_candidates, visible_tables, deps
+            ),
             "output_bindings": output_bindings,
             "unsupported_outputs": unsupported_outputs,
             **({"final_answer": _unsupported_output_answer(unsupported_outputs)}

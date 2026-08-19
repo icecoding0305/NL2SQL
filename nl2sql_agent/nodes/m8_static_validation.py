@@ -100,6 +100,11 @@ def make_static_validation_node(deps):
         for t in expr.find_all(exp.Table):
             if t.alias and t.alias != t.name:
                 alias_map[t.alias] = t.name
+        derived_aliases = {
+            subquery.alias
+            for subquery in expr.find_all(exp.Subquery)
+            if subquery.alias
+        }
 
         table_cols = {h.table_name: {c["name"] for c in h.columns} for h in state.retrieved_schema}
         errors: list[str] = []
@@ -108,8 +113,11 @@ def make_static_validation_node(deps):
         # 每一个显式物理输出，不能生成可执行但缺列的 SQL。
         root_select = next(expr.find_all(exp.Select), None)
         projected_columns: set[tuple[str | None, str]] = set()
+        projected_aliases: set[str] = set()
         if root_select is not None:
             for projection in root_select.expressions:
+                if projection.alias_or_name:
+                    projected_aliases.add(projection.alias_or_name)
                 for column_expr in projection.find_all(exp.Column):
                     qualifier = column_expr.table or None
                     projected_columns.add((alias_map.get(qualifier, qualifier), column_expr.name))
@@ -118,17 +126,20 @@ def make_static_validation_node(deps):
                 continue
             qualified = (output.table, output.column) in projected_columns
             unqualified = (None, output.column) in projected_columns
+            aliased = bool(output.alias and output.alias in projected_aliases)
             owners = [
                 table for table in ref_tables
                 if output.column in table_cols.get(table, set())
             ]
-            if not qualified and not (unqualified and owners == [output.table]):
+            if not aliased and not qualified and not (unqualified and owners == [output.table]):
                 errors.append(
                     f"SQL SELECT 遗漏计划返回字段 {output.table}.{output.column}"
                 )
 
         for tbl, col in sqlsvc.extract_columns(expr):
             if tbl is not None:
+                if tbl in derived_aliases:
+                    continue
                 real = alias_map.get(tbl, tbl)
                 if real not in table_cols or col not in table_cols[real]:
                     errors.append(f"表 {real} 不存在字段 {col}")

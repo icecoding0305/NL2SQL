@@ -25,7 +25,6 @@ from nl2sql_agent.services.schema_ingest.mysql_fetcher import TableMeta
 from nl2sql_agent.services.schema_ingest.mschema import (
     build_mschema,
     hydrate_enrichment,
-    write_schema_catalog_projection,
     write_mschema_artifacts,
 )
 from nl2sql_agent.services.schema_ingest.profiler import classify_column, enrich_table
@@ -164,10 +163,8 @@ def sync(
 ) -> SyncReport:
     """全量/增量同步。datasource 用于元数据分片;schema_name 是 MySQL 库名。
 
-    catalog_dir:写入 schema_catalog.yaml 的目录(测试可传临时目录,默认 config/)。
+    catalog_dir:测试时用于隔离 M-Schema 产物目录；生产默认写入 data/schema。
     """
-    from nl2sql_agent.services.deps import CONFIG_DIR
-
     executor = deps.executor
     patterns = tuple(config.get("sensitive_patterns", []))
     tables = fetch_schema(
@@ -285,12 +282,6 @@ def sync(
         effective_mschema,
         artifact_root=artifact_root,
         prompt_version=str(config.get("prompt_version", "enterprise-xiyan-v1")),
-    )
-    write_schema_catalog_projection(
-        effective_mschema,
-        manifest,
-        catalog_dir=catalog_dir or CONFIG_DIR,
-        m_schema_path=latest_mschema_path,
     )
     # 向量文档只允许从已落盘的 effective M-Schema 构建。写入成功后才推进
     # 表结构快照，确保向量后端失败时下次增量同步能够自动重试。

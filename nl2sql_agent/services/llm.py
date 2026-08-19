@@ -24,11 +24,41 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel
 
-from nl2sql_agent.services.llm_telemetry import annotate_last_call, record_call, usage_value
+from nl2sql_agent.services.llm_telemetry import (
+    annotate_last_call,
+    current_node,
+    record_call,
+    usage_value,
+)
 
 
 class EnvConfigError(RuntimeError):
     pass
+
+
+class LLMResponseError(RuntimeError):
+    """A remote request completed but did not contain a usable final answer."""
+
+
+class LLMOutputTruncatedError(LLMResponseError):
+    """The model exhausted its output budget before emitting final content."""
+
+
+def classify_llm_error(exc: BaseException) -> str:
+    """Return a stable failure kind for retry and user-facing status decisions."""
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, LLMOutputTruncatedError):
+            return "output_truncated"
+        if isinstance(current, LLMResponseError):
+            return "empty_response"
+        status_code = getattr(current, "status_code", None)
+        if status_code in {400, 401, 402, 403, 404, 422}:
+            return "provider_non_retryable"
+        current = current.__cause__ or current.__context__
+    return "generation_error"
 
 
 @dataclass
@@ -127,10 +157,13 @@ class BaseLLMClient(ABC):
                     raise ValueError(f"输出缺少目标字段 {keys}(疑似回显 schema 定义)")
                 annotate_last_call(status="json_valid")
                 return data
+            except LLMResponseError as e:
+                annotate_last_call(status="response_invalid", error=e)
+                raise
             except Exception as e:  # noqa: BLE001
                 annotate_last_call(status="json_invalid", error=e)
                 last_err = e
-        raise ValueError(f"LLM 结构化输出多次解析失败: {last_err}")
+        raise ValueError(f"LLM 结构化输出多次解析失败: {last_err}") from last_err
 
     def complete_structured(self, prompt: str, model: type[BaseModel], retries: int = 2) -> BaseModel:
         """返回符合 Pydantic schema 的实例，并让嵌套校验错误参与模型重试。
@@ -149,6 +182,9 @@ class BaseLLMClient(ABC):
                 result = model.model_validate(previous_data)
                 annotate_last_call(status="pydantic_valid")
                 return result
+            except LLMResponseError as e:
+                annotate_last_call(status="response_invalid", error=e)
+                raise
             except Exception as e:  # noqa: BLE001
                 annotate_last_call(status="pydantic_invalid", error=e)
                 last_err = e
@@ -164,7 +200,7 @@ class BaseLLMClient(ABC):
                     + "必须严格符合以下 JSON Schema:\n"
                     + json.dumps(schema, ensure_ascii=False, default=str)
                 )
-        raise ValueError(f"LLM 结构化输出多次解析失败: {last_err}")
+        raise ValueError(f"LLM 结构化输出多次解析失败: {last_err}") from last_err
 
     def complete_sql(self, prompt: str, retries: int = 2) -> SQLResult:
         """要求模型同时返回 SQL 与用到的表清单(供模块 8 交叉比对)。"""
@@ -269,9 +305,16 @@ class DeepSeekLLMClient(BaseLLMClient):
     默认 base_url=https://api.deepseek.com,可用 DEEPSEEK_BASE_URL 覆盖。
     """
 
-    def __init__(self, client, model: str):
+    def __init__(self, client, model: str, *, request_config: dict | None = None):
         self.client = client
         self.model = model
+        self.request_config = request_config or {}
+
+    def _request_settings(self, max_tokens: int) -> tuple[int, dict]:
+        node_cfg = (self.request_config.get("nodes") or {}).get(current_node() or "", {})
+        effective_max = int(node_cfg.get("max_tokens", max_tokens))
+        extra_body = dict(node_cfg.get("extra_body") or {})
+        return effective_max, extra_body
 
     @classmethod
     def from_env(cls) -> "DeepSeekLLMClient":
@@ -290,21 +333,54 @@ class DeepSeekLLMClient(BaseLLMClient):
 
     def complete(self, prompt: str, max_tokens: int = 2000) -> str:
         started_at = time.perf_counter()
+        effective_max_tokens, extra_body = self._request_settings(max_tokens)
         try:
+            request_kwargs = {
+                "model": self.model,
+                "max_tokens": effective_max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if extra_body:
+                request_kwargs["extra_body"] = extra_body
             resp = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
+                **request_kwargs,
             )
-            content = resp.choices[0].message.content or ""
+            choice = resp.choices[0]
+            message = choice.message
+            content = message.content or ""
             usage = getattr(resp, "usage", None)
+            finish_reason = getattr(choice, "finish_reason", None)
+            if finish_reason == "length" or not content.strip():
+                reasoning_chars = len(getattr(message, "reasoning_content", None) or "")
+                error_cls = LLMOutputTruncatedError if finish_reason == "length" else LLMResponseError
+                error = error_cls(
+                    ("模型输出在完成前被截断" if finish_reason == "length" else "模型未返回最终正文")
+                    + f"(finish_reason={finish_reason or 'unknown'}, "
+                    f"reasoning_chars={reasoning_chars}, content_chars={len(content)}, "
+                    f"max_tokens={effective_max_tokens})"
+                )
+                record_call(
+                    provider="openai_compatible",
+                    model=self.model,
+                    operation="complete",
+                    started_at=started_at,
+                    prompt_chars=len(prompt),
+                    max_tokens=effective_max_tokens,
+                    output_chars=len(content),
+                    prompt_tokens=usage_value(usage, "prompt_tokens", "input_tokens"),
+                    completion_tokens=usage_value(usage, "completion_tokens", "output_tokens"),
+                    total_tokens=usage_value(usage, "total_tokens"),
+                    request_id=getattr(resp, "id", None) or getattr(resp, "_request_id", None),
+                    error=error,
+                )
+                raise error
             record_call(
                 provider="openai_compatible",
                 model=self.model,
                 operation="complete",
                 started_at=started_at,
                 prompt_chars=len(prompt),
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 output_chars=len(content),
                 prompt_tokens=usage_value(usage, "prompt_tokens", "input_tokens"),
                 completion_tokens=usage_value(usage, "completion_tokens", "output_tokens"),
@@ -313,13 +389,15 @@ class DeepSeekLLMClient(BaseLLMClient):
             )
             return content
         except Exception as exc:
+            if isinstance(exc, LLMResponseError):
+                raise
             record_call(
                 provider="openai_compatible",
                 model=self.model,
                 operation="complete",
                 started_at=started_at,
                 prompt_chars=len(prompt),
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 error=exc,
             )
             raise
@@ -333,8 +411,15 @@ class DeepSeekLLMClient(BaseLLMClient):
 class OpenAICompatibleLLMClient(DeepSeekLLMClient):
     """Generic OpenAI-compatible client configured entirely from YAML."""
 
-    def __init__(self, client, model: str, *, supports_tool_calling: bool = True):
-        super().__init__(client, model)
+    def __init__(
+        self,
+        client,
+        model: str,
+        *,
+        supports_tool_calling: bool = True,
+        request_config: dict | None = None,
+    ):
+        super().__init__(client, model, request_config=request_config)
         self.supports_tool_calling = supports_tool_calling
 
     def _complete_tool(self, prompt: str, name: str, description: str, schema: dict) -> dict | None:
@@ -421,11 +506,14 @@ def build_llm_from_config(config: dict) -> BaseLLMClient:
             raise EnvConfigError("OpenAI 兼容模型必须在 model_config.yaml 配置 base_url")
         client = openai.OpenAI(api_key=api_key, base_url=base_url)
         if provider == "deepseek":
-            return DeepSeekLLMClient(client, model=model)
+            return DeepSeekLLMClient(
+                client, model=model, request_config=config.get("request")
+            )
         return OpenAICompatibleLLMClient(
             client,
             model=model,
             supports_tool_calling=bool(config.get("supports_tool_calling", True)),
+            request_config=config.get("request"),
         )
     raise EnvConfigError(f"不支持的模型 provider: {provider}")
 

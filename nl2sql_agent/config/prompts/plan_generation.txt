@@ -44,6 +44,10 @@ PLATFORM_CODE、business_line 等过滤条件；行级权限由后续确定性�
 - covered_output_ids 必须与 output_fields 实际填写的 source_output_ids 完全一致，并覆盖全部 required output id
 - 必须显式填写 output_fields 和 output_grain。output_fields 只描述最终返回列；output_grain 描述每一行代表实体、明细记录、分组聚合还是全局聚合
 - output_grain.level=entity/record 时必须给出可用的 keys；level=aggregate 时 keys 必须与 group_by 完全一致；level=global 时 keys 必须为空
+- semantic_graph 中的 group_by、order_by、limit 是用户查询契约，必须分别原样落实到 QueryPlan.group_by、order_by、limit，不得遗漏
+- output_bindings 中的 aggregation 是已经确认的计算方式；同一个物理字段可以分别生成 SUM、AVG 等多个独立 output_fields，不得合并
+- 普通行级条件写入 filters；累计、合计、平均、最大、最小等聚合结果条件必须写入 having，并声明 aggregation，禁止写入 WHERE
+- filters.scope 必须区分 row/cohort/measure；多事实查询中 cohort 条件用于限制最终实体集合，measure 条件只影响所属指标子计划
 - SCHEMA_DATA.query_mschema 是唯一可用 Schema，必须只以它规划字段与关系；不得请求完整 Schema 或从数据库常识猜测额外字段
 - status、exists、not_exists 条件必须落实为可执行过滤/连接语义；无法实现时降低置信度并让校验失败，禁止静默删除
 - 正向 exists 应把父 atom_id 标注到实现该存在关系的 join/filter；服务端会在所有子条件已完整实现时做确定性补全。not_exists 不会自动补全，必须明确规划反连接语义
@@ -56,6 +60,6 @@ PLATFORM_CODE、business_line 等过滤条件；行级权限由后续确定性�
 - confidence 是对当前计划事实完备性的评估；缺少口径或 JOIN 事实时必须降低
 - metric_logic 只能为 null，或严格使用 {{"metric_name":"...","definition":"...","columns":["table.column"],"expression":null,"source_atom_ids":["atom_id"]}}；禁止使用 name、field 等未定义键
 - 只输出符合以下 QueryPlan 结构的实际数据，不输出解释文字：
-  {{"target_tables":["table"],"join_logic":[{{"left_table":"table","right_table":"table","left_column":"column","right_column":"column","join_type":"inner","source_atom_ids":[]}}],"filters":[{{"column":"column","operator":">","value":10000,"table":"table","source_atom_ids":["atom_1"]}}],"metric_logic":null,"group_by":[],"output_fields":[{{"concept":"客户姓名","table":"table","column":"customer_name","expression":null,"alias":null,"aggregation":null,"source_output_ids":["output_1"]}}],"output_grain":{{"level":"entity","entity":"客户","keys":["table.customer_id"],"description":"每行一位客户"}},"covered_atom_ids":["atom_1"],"covered_output_ids":["output_1"],"confidence":0.9}}
+  {{"target_tables":["table"],"join_logic":[{{"left_table":"table","right_table":"table","left_column":"column","right_column":"column","join_type":"inner","source_atom_ids":[]}}],"filters":[{{"column":"column","operator":">","value":10000,"table":"table","source_atom_ids":["atom_1"],"scope":"row","aggregation":null}}],"having":[],"metric_logic":null,"group_by":[],"order_by":[],"limit":null,"output_fields":[{{"concept":"客户姓名","table":"table","column":"customer_name","expression":null,"alias":null,"aggregation":null,"source_output_ids":["output_1"]}}],"output_grain":{{"level":"entity","entity":"客户","keys":["table.customer_id"],"description":"每行一位客户"}},"covered_atom_ids":["atom_1"],"covered_output_ids":["output_1"],"confidence":0.9}}
 
-输出字段：target_tables、join_logic[]、filters[]、metric_logic、group_by[]、output_fields[]、output_grain、covered_atom_ids[]、covered_output_ids[]、confidence。
+输出字段：target_tables、join_logic[]、filters[]、having[]、metric_logic、group_by[]、order_by[]、limit、output_fields[]、output_grain、covered_atom_ids[]、covered_output_ids[]、confidence。

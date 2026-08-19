@@ -1,0 +1,29 @@
+你负责把用户模糊的返回要求具体化为本次查询实际需要的业务字段。
+
+用户问题：{user_query}
+目标实体：{target_entity}
+模糊返回要求：{projection_request}
+
+以下仅是 Schema 检索后得到的投影候选字段，不是完整数据库 Schema：
+<CANDIDATE_FIELDS format="json">
+{candidate_fields}
+</CANDIDATE_FIELDS>
+
+要求：
+- 只能从 CANDIDATE_FIELDS 选择 table_name 和 column_name，不得创造字段
+- 根据用户问题、目标实体、字段业务名称和语义角色，选择 3 至 8 个最能满足要求的字段
+- 对“逾期情况、贷款情况、代偿情况、风险表现”等主题，只选择与主题直接相关的候选字段；用户动作是统计/汇总/计算时必须为数值字段声明 aggregation（金额/余额通常 sum，比率通常 avg，天数通常 max），不要返回无聚合的明细字段
+- “基本信息”优先选择业务人员能直接阅读的身份、联系和地址类信息，不能只返回主键或技术编码
+- “联系方式”只选择电话、邮箱、通讯地址等联系信息
+- “详细信息”选择覆盖面更完整但仍与目标实体直接相关的字段
+- 同一主体存在多个有意义的地址或联系方式字段时可以同时选择
+- 证件号码、银行卡、账号、密码等直接标识不得因为模糊要求自动加入，除非用户明确提出
+- sensitive=true 只是风险提示，不代表字段一定不能选择；仍需结合字段含义判断
+- reason 只写简短、可向用户展示的选择依据，不输出内部思维过程
+- excluded_fields 记录看似相关但因敏感或主体不一致而未自动选择的业务字段
+- missing_concepts 记录用户需要但候选字段中不存在的业务概念
+- understood_description 用一句面向用户的中文描述本次具体化结果
+- 只输出 ProjectionDecision 对应的 JSON，不输出解释或 Markdown
+
+输出结构：
+{{"request":"基本信息","target_entity":"客户","understood_description":"返回客户姓名、联系电话和地址","selected_fields":[{{"table_name":"候选表","column_name":"候选字段","business_label":"业务名称","reason":"简短选择依据","aggregation":null,"distinct_grain":null}}],"excluded_fields":[{{"business_label":"证件号码","reason":"用户未明确要求直接身份标识"}}],"missing_concepts":[],"confidence":0.9}}

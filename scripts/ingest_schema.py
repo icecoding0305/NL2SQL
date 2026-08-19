@@ -9,7 +9,7 @@
 - 注释缺失/覆盖率不足的表 → LLM 生成候选注释草稿(样例脱敏)→ 进审核队列,不入向量库
 - 增量模式:structure_hash 变化或有覆盖层的表才处理;被删的表从向量库清理
 - 先生成扩展版 M-Schema:raw/effective 快照 + data/schema/{datasource}/m-schema.json
-- 再由 effective M-Schema 自动投影 schema_catalog.yaml(供模块 3/8 使用)
+- 运行时直接读取 effective M-Schema，不再生成或依赖 schema_catalog.yaml
 
 增量模式建议配合定时任务按天跑一次。
 """

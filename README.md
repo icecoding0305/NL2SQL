@@ -55,7 +55,7 @@ nl2sql_agent/
     m10_sandbox_execution.py / m11_result_interpretation.py / human_review.py
   config/
     term_mapping/_global.yaml   # 全局术语映射
-    schema_catalog.yaml         # 各系统(risk_mart/dw/core)表/字段(含敏感标记)
+    settings.yaml               # 运行时参数与 M-Schema 自动定位配置
     clarification_rules.yaml    # 澄清/置信度/补充关联表阈值
     business_predicates.yaml / sensitive_rules.yaml / settings.yaml / few_shot.yaml
     schema_ingest.yaml          # 表结构入库质量规则
@@ -179,19 +179,18 @@ uv run python scripts/ingest_schema.py --mode incremental --datasource risk_mart
   `raw-m-schema.json` / `effective-m-schema.json` / `manifest.json` 内容寻址快照。
 - **多层索引**:由审核生效的 M-Schema 派生表级、按语义类别分组的字段级、外键关系级向量文档。
 
-M-Schema 是完整事实源，`schema_catalog.yaml` 是运行时精简视图，向量库是派生检索视图：
+M-Schema 是唯一运行时 Schema 事实源，向量库是它的派生检索视图：
 
 ```text
 数据库 → raw M-Schema → 画像/分类/描述 → 审核 Override → effective M-Schema
-                                                    ├→ schema_catalog.yaml
                                                     └→ 表/字段/关系向量索引
 ```
 
-运行 `scripts/ingest_schema.py` 时会先落盘 effective M-Schema，再自动生成
-`schema_catalog.yaml`；YAML 顶层 `_meta.semantic_hash` 与同次 M-Schema 的
-`manifest.json` 一致。表级、字段级和关系级向量文档也只从 effective M-Schema
-生成，并携带 `snapshot_id`、`semantic_hash` 和表级语义哈希。因此 catalog 和
-向量索引都不需要、也不应手工维护。
+运行 `scripts/ingest_schema.py` 时会落盘 effective M-Schema。运行时根据
+`DATABASE_URL` 的数据库名自动定位 `data/schema/<database>/m-schema.json`，并直接
+构建内存 SchemaCatalog；不再生成或依赖 `schema_catalog.yaml`。表级、字段级和
+关系级向量文档同样只从 effective M-Schema 生成，并携带 `snapshot_id`、
+`semantic_hash` 和表级语义哈希。
 
 模块 3 对复合指标保留术语精确映射；普通问题使用字段级证据构建 `QueryIntent` 和
 `SchemaPlan`。SchemaPlan 明确 `primary_fact/secondary_fact/entity/dimension/bridge`

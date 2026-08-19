@@ -12,6 +12,10 @@ _trace_id: ContextVar[str | None] = ContextVar("llm_trace_id", default=None)
 _calls: ContextVar[list[dict[str, Any]] | None] = ContextVar("llm_trace_calls", default=None)
 
 
+def current_node() -> str | None:
+    return _node.get()
+
+
 def begin_capture(node: str, trace_id: str) -> tuple[Token, Token, Token]:
     return (_node.set(node), _trace_id.set(trace_id), _calls.set([]))
 
