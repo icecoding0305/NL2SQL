@@ -1,4 +1,4 @@
-# https://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanhttps://bailian.console.aliyun.com/xiyanNL2SQL 智能体(LangGraph)
+# NL2SQL 智能体(LangGraph)
 
 面向企业内部数据分析场景(多系统、字段量大、对生成准确性和权限安全要求较高)的
 自然语言 → SQL 智能体。使用类型化语义图、Schema Grounding 与统一计划链路执行;
