@@ -26,6 +26,7 @@ from nl2sql_agent.api import get_deps, router as api_router
 from nl2sql_agent.graph import build_graph
 from nl2sql_agent.services.checkpoint import create_sqlite_checkpointer
 from nl2sql_agent.services.deps import load_env
+from nl2sql_agent.services.query_terminal import finalize_query_state
 from nl2sql_agent.security import platform_access_required, verify_platform_token
 
 load_env()  # 加载项目根目录 .env(ANTHROPIC_API_KEY / ANTHROPIC_MODEL / NL2SQL_DEMO 等)
@@ -154,8 +155,7 @@ def query(req: QueryRequest):
             ),
         }
     # invoke 结果可能不含从未被写入的默认字段,统一用 get_state 的完整快照
-    vals = snap.values
-    status = "blocked" if vals.get("blocked_reason") else "done"
+    vals, status = finalize_query_state(dict(snap.values))
     return {
         "thread_id": thread_id,
         "status": status,
@@ -186,9 +186,9 @@ def approve(req: ApproveRequest):
     snap = graph.get_state(config)
     if snap.next:
         return {"status": "still_pending", "next": snap.next}
-    vals = snap.values
+    vals, status = finalize_query_state(dict(snap.values))
     return {
-        "status": "done",
+        "status": status,
         "final_answer": vals.get("final_answer"),
         "result_summary": (
             vals["result_summary"].model_dump() if vals.get("result_summary") else None

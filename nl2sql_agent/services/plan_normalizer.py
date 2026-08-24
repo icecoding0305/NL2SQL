@@ -168,6 +168,22 @@ def normalize_structural_coverage(
     # different expressions (for example SUM(LOAN_AMT) and AVG(LOAN_AMT)).
     required_outputs = [output for output in semantic_graph.outputs if output.required]
     if required_outputs and all(output.id in output_bindings for output in required_outputs):
+        # Keep structural identifiers that make each result row intelligible.
+        # The semantic output contract controls business projections, but must
+        # not erase record/entity keys declared by the plan.
+        structural_refs = set(normalized.output_grain.keys) | set(normalized.group_by)
+        for join in normalized.join_logic:
+            structural_refs.add(f"{join.left_table}.{join.left_column}")
+            structural_refs.add(f"{join.right_table}.{join.right_column}")
+        structural_fields = [
+            field.model_copy(deep=True)
+            for field in normalized.output_fields
+            if field.table and field.column and not field.aggregation
+            and (
+                f"{field.table}.{field.column}" in structural_refs
+                or field.column in structural_refs
+            )
+        ]
         contract_fields: list[OutputFieldSpec] = []
         for output in required_outputs:
             binding = output_bindings[output.id]
@@ -186,6 +202,14 @@ def normalize_structural_coverage(
                     aggregation=output.aggregation or binding.get("aggregation"),
                     source_output_ids=[output.id],
                 ))
+        existing_refs = {
+            (field.table, field.column, field.aggregation)
+            for field in contract_fields
+        }
+        contract_fields.extend(
+            field for field in structural_fields
+            if (field.table, field.column, field.aggregation) not in existing_refs
+        )
         if [item.model_dump() for item in normalized.output_fields] != [
             item.model_dump() for item in contract_fields
         ]:
@@ -217,18 +241,25 @@ def normalize_structural_coverage(
         for order in semantic_graph.order_by:
             output = next((
                 item for item in required_outputs
-                if normalized_concept(item.concept) == normalized_concept(order.concept)
-                or normalized_concept(item.grounding_concept) == normalized_concept(order.grounding_concept)
+                if {
+                    normalized_concept(item.concept),
+                    normalized_concept(item.grounding_concept),
+                } - {""}
+                & ({
+                    normalized_concept(order.concept),
+                    normalized_concept(order.grounding_concept),
+                } - {""})
             ), None)
             if output is None:
                 continue
             expected = output_binding_fields(output_bindings[output.id])[0]
             order_specs.append(OrderSpec(
-                concept=order.concept,
+                concept=output.concept,
                 table=expected.get("table_name"),
                 column=expected.get("column_name"),
                 direction=order.direction,
                 source_output_id=output.id,
+                aggregation=output.aggregation,
             ))
         normalized.order_by = order_specs
         normalized.limit = semantic_graph.limit

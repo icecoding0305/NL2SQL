@@ -112,6 +112,11 @@ def validate_plan(
     atom_map = semantic_atom_map(semantic_graph)
     semantic_bindings = semantic_bindings or {}
     for filter_spec in [*plan.filters, *plan.having]:
+        if semantic_graph is not None and not filter_spec.source_atom_ids:
+            errors.append(
+                f"过滤条件 {filter_spec.table or '?'}.{filter_spec.column} "
+                "没有用户语义或可信规则来源，禁止静默增加条件"
+            )
         for atom_id in filter_spec.source_atom_ids:
             atom = atom_map.get(atom_id)
             binding = semantic_bindings.get(atom_id)
@@ -253,6 +258,49 @@ def validate_plan(
             if plan.output_grain.level != "aggregate" or not plan.group_by:
                 errors.append("用户要求按维度统计，但 QueryPlan 缺少分组聚合")
 
+    aggregate_outputs = [field for field in plan.output_fields if field.aggregation]
+    detail_outputs = [
+        field for field in plan.output_fields
+        if not field.aggregation and field.table and field.column
+    ]
+    group_refs = set(plan.group_by)
+    if aggregate_outputs and detail_outputs:
+        missing_group_fields = {
+            f"{field.table}.{field.column}" for field in detail_outputs
+            if f"{field.table}.{field.column}" not in group_refs
+            and field.column not in group_refs
+        }
+        if missing_group_fields:
+            errors.append(
+                "聚合输出与非聚合输出混用时，非聚合字段必须进入 GROUP BY: "
+                f"{sorted(missing_group_fields)}"
+            )
+
+    grain_keys = set(plan.output_grain.keys)
+    if plan.output_grain.level in {"entity", "record", "aggregate"} and grain_keys:
+        returned_refs = {
+            f"{field.table}.{field.column}" for field in detail_outputs
+        } | {field.column for field in detail_outputs if field.column}
+        missing_returned_keys = {
+            key for key in grain_keys
+            if key not in returned_refs and key.rsplit(".", 1)[-1] not in returned_refs
+        }
+        if missing_returned_keys:
+            errors.append(
+                "结果粒度必须返回用于区分每行数据的键字段: "
+                f"{sorted(missing_returned_keys)}"
+            )
+        if plan.output_grain.level in {"entity", "aggregate"} and aggregate_outputs:
+            missing_group_keys = {
+                key for key in grain_keys
+                if key not in group_refs and key.rsplit(".", 1)[-1] not in group_refs
+            }
+            if missing_group_keys:
+                errors.append(
+                    "实体/聚合粒度必须按粒度键 GROUP BY: "
+                    f"{sorted(missing_group_keys)}"
+                )
+
     # Aggregating measures from multiple fact/detail tables after a flat JOIN can
     # multiply amounts.  Only the deterministic pre-aggregation compiler may
     # handle these plans, and it currently requires one shared grain with no
@@ -382,6 +430,14 @@ def make_plan_validation_node(deps):
         out: dict[str, Any] = {
             "plan_validation_errors": errors,
             "plan_retry_count": new_count,
+            "query_candidates": [
+                candidate.model_copy(update={
+                    "status": "rejected" if errors else "validated",
+                    "validation_errors": list(errors),
+                })
+                if candidate.stage == "plan" and candidate.selected else candidate
+                for candidate in state.query_candidates
+            ],
         }
         if errors and new_count >= state.max_plan_retries:
             out["terminal_status"] = "error"

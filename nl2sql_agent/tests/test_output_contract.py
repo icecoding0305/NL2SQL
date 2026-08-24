@@ -6,13 +6,17 @@ from nl2sql_agent.services.schema_catalog import TableDef
 from nl2sql_agent.services.schema_planner import (
     build_schema_plan,
     ground_output_bindings,
+    resolve_anchor_table_ambiguities,
     rank_field_candidates,
 )
 from nl2sql_agent.services.semantic_parser import (
     build_semantic_graph,
     semantic_graph_to_query_intent,
 )
-from nl2sql_agent.state import FieldCandidate, NL2SQLState, QueryPlan, SchemaHit, SemanticGraph, SemanticOutput
+from nl2sql_agent.state import (
+    FieldCandidate, NL2SQLState, PlannedTable, QueryPlan, SchemaHit,
+    SchemaPlan, SemanticGraph, SemanticOrder, SemanticOutput,
+)
 
 
 QUERY = "计算代偿金额超过1000的客户的姓名和地址"
@@ -125,6 +129,115 @@ def test_grouping_entity_prefers_non_null_primary_identifier():
     assert binding["column_name"] == "CUST_ID"
 
 
+def test_product_grouping_prefers_semantic_key_on_metric_fact_table():
+    graph = SemanticGraph(
+        outputs=[
+            SemanticOutput(
+                id="product_output", subject_id="product", concept="产品",
+                grounding_concept="产品", source_text="每个产品",
+            ),
+            SemanticOutput(
+                id="amount_output", subject_id="product", concept="贷款总金额",
+                grounding_concept="贷款金额", source_text="贷款总金额",
+                aggregation="sum",
+            ),
+        ],
+        group_by=["产品"],
+    )
+    candidates = [
+        FieldCandidate(
+            table_name="loan", column_name="PRD_CODE", column_comment="产品编码",
+            query_slot="产品", final_score=0.83, phrase_coverage=1.0,
+        ),
+        FieldCandidate(
+            table_name="repay", column_name="PRD_CODE", column_comment="产品编号",
+            query_slot="产品", final_score=0.82, phrase_coverage=1.0,
+        ),
+        FieldCandidate(
+            table_name="repay", column_name="LOAN_NO", column_comment="借据编号",
+            query_slot="产品", final_score=0.45, phrase_coverage=0.3,
+        ),
+        FieldCandidate(
+            table_name="loan", column_name="LOAN_AMT", column_comment="贷款金额",
+            query_slot="贷款金额", final_score=0.84, phrase_coverage=1.0,
+        ),
+    ]
+    tables = [
+        TableDef("loan", "贷款表", "risk", [
+            {"name": "PRD_CODE", "comment": "产品编码", "nullable": True},
+            {"name": "LOAN_AMT", "comment": "贷款金额", "type": "decimal"},
+        ]),
+        TableDef("repay", "还款表", "risk", [
+            {"name": "PRD_CODE", "comment": "产品编号", "nullable": True},
+            {
+                "name": "LOAN_NO", "comment": "借据编号", "primary_key": True,
+                "unique": True, "nullable": False,
+            },
+        ]),
+    ]
+
+    bindings = ground_output_bindings(graph, candidates, tables=tables)
+
+    assert bindings["product_output"]["table_name"] == "loan"
+    assert bindings["product_output"]["column_name"] == "PRD_CODE"
+
+
+def test_cross_table_code_ambiguity_is_resolved_by_strong_primary_fact():
+    loan_code = FieldCandidate(
+        table_name="loan", column_name="PRD_CODE", column_comment="产品编码",
+        query_slot="产品编码", final_score=0.88, phrase_coverage=1.0,
+    )
+    ambiguities = {
+        "产品编码": [
+            loan_code,
+            FieldCandidate(
+                table_name="application", column_name="PRD_CODE", column_comment="产品编码",
+                query_slot="产品编码", final_score=0.84, phrase_coverage=1.0,
+            ),
+        ],
+    }
+    plan = SchemaPlan(anchor_tables=[PlannedTable(
+        table_name="loan", role="primary_fact", selected_columns=["LOAN_AMT", "PRD_CODE"],
+    )])
+
+    assert resolve_anchor_table_ambiguities(ambiguities, plan) == {}
+
+
+def test_schema_plan_keeps_group_key_on_single_fact_table():
+    graph = build_semantic_graph(
+        "统计每个产品的贷款总金额，按贷款总金额从高到低返回前3个产品"
+    )
+    intent = semantic_graph_to_query_intent(graph, graph.outputs[0].source_text)
+    tables = [
+        TableDef("loan", "贷款", "risk", [
+            {"name": "LOAN_AMT", "comment": "贷款金额", "type": "decimal"},
+            {"name": "PRD_CODE", "comment": "产品编码", "type": "varchar"},
+        ]),
+        TableDef("repay", "还款计划", "risk", [
+            {"name": "PRD_CODE", "comment": "产品编号", "type": "varchar"},
+        ]),
+    ]
+    candidates = [
+        FieldCandidate(
+            table_name="loan", column_name="LOAN_AMT", column_comment="贷款金额",
+            query_slot="贷款金额", final_score=0.82, phrase_coverage=1.0,
+        ),
+        FieldCandidate(
+            table_name="repay", column_name="PRD_CODE", column_comment="产品编号",
+            query_slot="产品", final_score=0.83, phrase_coverage=1.0,
+        ),
+        FieldCandidate(
+            table_name="loan", column_name="PRD_CODE", column_comment="产品编码",
+            query_slot="产品", final_score=0.82, phrase_coverage=1.0,
+        ),
+    ]
+
+    plan = build_schema_plan(intent, tables, candidates, [])
+
+    assert [item.table_name for item in plan.anchor_tables] == ["loan"]
+    assert plan.dimension_tables == []
+
+
 def test_plan_cannot_pass_when_explicit_outputs_are_missing(deps):
     graph, _ = _graph_and_intent()
     schema = [
@@ -194,6 +307,67 @@ def test_output_trace_ids_are_normalized_only_for_matching_bindings():
     assert normalized.output_fields[1].source_output_ids == ["output_2"]
     assert len(changes) == 3
     assert changes[-1] == "按用户语义输出契约重建返回字段"
+
+
+def test_order_binding_matches_output_grounding_concept_crosswise():
+    graph = SemanticGraph(
+        outputs=[SemanticOutput(
+            id="output_1", subject_id="subject_1", concept="贷款总金额",
+            grounding_concept="贷款金额", source_text="贷款总金额",
+            required=True, confidence=1.0, aggregation="sum",
+        )],
+        order_by=[SemanticOrder(concept="贷款金额", direction="desc")],
+        limit=3,
+    )
+    raw = QueryPlan(
+        target_tables=["loan"],
+        output_fields=[{
+            "concept": "贷款总金额", "table": "loan", "column": "loan_amt",
+            "alias": "贷款总金额", "aggregation": "sum",
+            "source_output_ids": ["output_1"],
+        }],
+    )
+
+    normalized, _ = normalize_structural_coverage(raw, graph, {
+        "output_1": {"table_name": "loan", "column_name": "loan_amt"},
+    })
+
+    assert normalized.order_by[0].concept == "贷款总金额"
+    assert normalized.order_by[0].source_output_id == "output_1"
+    assert normalized.order_by[0].aggregation == "sum"
+    assert normalized.order_by[0].direction == "desc"
+    assert normalized.limit == 3
+
+
+def test_output_contract_preserves_declared_record_key():
+    graph = SemanticGraph(outputs=[SemanticOutput(
+        id="output_1", subject_id="subject_1", concept="逾期本金余额",
+        grounding_concept="逾期本金余额", source_text="逾期情况", required=True,
+        confidence=0.9,
+    )])
+    raw = QueryPlan(
+        target_tables=["customer", "loan"],
+        join_logic=[{
+            "left_table": "customer", "left_column": "CUST_ID",
+            "right_table": "loan", "right_column": "CUST_ID",
+        }],
+        output_fields=[
+            {"concept": "客户编号", "table": "customer", "column": "CUST_ID"},
+            {"concept": "借据编号", "table": "loan", "column": "LOAN_NO"},
+            {"concept": "逾期本金余额", "table": "loan", "column": "OVD_BAL"},
+        ],
+        output_grain={"level": "record", "keys": ["loan.LOAN_NO"]},
+    )
+
+    normalized, _ = normalize_structural_coverage(raw, graph, {
+        "output_1": {"table_name": "loan", "column_name": "OVD_BAL"},
+    })
+
+    assert [(item.table, item.column) for item in normalized.output_fields] == [
+        ("loan", "OVD_BAL"),
+        ("customer", "CUST_ID"),
+        ("loan", "LOAN_NO"),
+    ]
 
 
 def test_sql_validation_rejects_missing_planned_projection(deps):

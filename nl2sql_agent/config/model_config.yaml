@@ -10,22 +10,34 @@ runtime:
   # DeepSeek 当前走纯 JSON 文本解析；切换支持 function calling 的 OpenAI 兼容模型时可设 true。
   supports_tool_calling: false
   request:
+    # OpenAI 兼容 SDK 不做隐式重试；各节点在业务层显式降级或重试。
+    timeout_seconds: 30
+    sdk_max_retries: 0
     nodes:
       query_resolution:
-        max_tokens: 2500
+        max_tokens: 1800
+        timeout_seconds: 8
         # 结构化解析需要短而完整的 JSON，不让默认思考过程占满输出预算。
         extra_body:
           thinking:
             type: disabled
       plan_generation:
         # 计划由语义图和最小 Schema 约束，非思考模式更快且能稳定输出完整 JSON。
-        max_tokens: 4096
+        max_tokens: 3000
+        timeout_seconds: 20
         extra_body:
           thinking:
             type: disabled
       schema_retrieval:
         # 仅在模糊投影具体化时调用，要求快速返回短结构化字段选择。
-        max_tokens: 1800
+        max_tokens: 1200
+        timeout_seconds: 8
+        extra_body:
+          thinking:
+            type: disabled
+      result_interpretation:
+        max_tokens: 800
+        timeout_seconds: 6
         extra_body:
           thinking:
             type: disabled

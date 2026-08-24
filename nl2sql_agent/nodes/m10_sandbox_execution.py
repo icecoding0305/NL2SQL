@@ -17,11 +17,21 @@ from typing import Any
 from nl2sql_agent.state import NL2SQLState
 
 
+def _mark_candidate(state: NL2SQLState, status: str, error: str | None = None) -> list:
+    return [
+        candidate.model_copy(update={"status": status, "execution_error": error})
+        if candidate.stage == "sql" and candidate.selected else candidate
+        for candidate in state.query_candidates
+    ]
+
+
 def _exec_fail(state: NL2SQLState, msg: str) -> dict[str, Any]:
     new_count = state.retry_count + 1
     out: dict[str, Any] = {
         "execution_error": msg,
         "retry_count": new_count,
+        **({"query_candidates": _mark_candidate(state, "execution_error", msg)}
+           if state.query_candidates else {}),
     }
     if new_count >= state.max_retries:
         out["final_answer"] = f"执行多次失败({msg}),请人工介入"
@@ -59,6 +69,11 @@ def make_sandbox_execution_node(deps):
         except Exception as e:  # noqa: BLE001
             return _exec_fail(state, f"执行报错: {e}")
 
-        return {"execution_result": rows, "execution_error": None}
+        return {
+            "execution_result": rows,
+            "execution_error": None,
+            **({"query_candidates": _mark_candidate(state, "executed")}
+               if state.query_candidates else {}),
+        }
 
     return sandbox_execution_node

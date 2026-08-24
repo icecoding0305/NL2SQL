@@ -19,8 +19,18 @@ export const statusColor = (status: string): string => {
   }
 };
 
+const statusLabel: Record<string, string> = {
+  running: "执行中",
+  done: "已完成",
+  pending_review: "待审批",
+  error: "执行失败",
+  rejected: "已驳回",
+  blocked: "已阻断",
+  cancelled: "已取消",
+};
+
 export const StatusTag = ({ status }: { status: string }) => (
-  <Tag color={statusColor(status)}>{status}</Tag>
+  <Tag color={statusColor(status)}>{statusLabel[status] || status}</Tag>
 );
 
 /**
@@ -41,7 +51,7 @@ export function buildBaseColumns({
     },
     { title: "用户", dataIndex: "user_id", width: 90 },
     {
-      title: "系统",
+      title: "业务范围",
       dataIndex: "data_scope",
       width: 110,
       render: (v: string[]) => (v || []).join(","),

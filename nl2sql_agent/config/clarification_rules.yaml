@@ -9,10 +9,20 @@ clarification_rules:
 
   # ---------- 模块 2:问题理解与改写 ----------
   query_resolution:
-    # 模型负责开放词汇语义解析；确定性解析仅作为失败兜底和完整性保护。
-    use_llm: always
+    # 高置信结构化问题直接采用确定性语义；复杂、低置信或多轮指代再调用模型。
+    use_llm: auto
     auto_min_confidence: 0.7
     llm_required_markers: [最新, 最早, 排名, 前, top, 同比, 环比, 占比, 增长率, 分别, 每个, 或者, 任一, 除外, 连续]
+
+  # ---------- 模块 5:高置信简单查询确定性计划 ----------
+deterministic_plan:
+  enabled: true
+  min_confidence: 0.78
+
+# 仅模型 SQL 路径首轮生成多个候选；简单确定性 SQL 不增加任何模型调用
+sql_candidate_refinement:
+  enabled: true
+  candidate_count: 2
 
   # ---------- 模块 2:缺时间范围 ----------
   time_range_missing:
@@ -35,6 +45,8 @@ clarification_rules:
   retrieval_confidence:
     # 检索置信度低于该值 → 低置信澄清(问用户是否继续)
     confidence_threshold: 0.7
+    # 第一次低置信时自动做业务语义改写并重新召回，不让用户选择物理表。
+    max_automatic_rewrites: 1
     # Top-2 候选置信度差小于该值 → 视为相近候选,触发候选澄清
     candidate_gap_threshold: 0.1
     # 候选判断优先使用相对差距，避免低分区间被绝对阈值放大

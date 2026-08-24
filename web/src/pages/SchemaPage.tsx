@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Alert,
   Button,
   Card,
   Collapse,
+  Empty,
   Input,
   Modal,
   Select,
@@ -14,15 +16,18 @@ import {
   message,
 } from "antd";
 import {
+  AuditOutlined,
   CheckOutlined,
   CloseOutlined,
+  DatabaseOutlined,
   EditOutlined,
   ReloadOutlined,
+  TableOutlined,
 } from "@ant-design/icons";
 import { apiGet, apiPost } from "../api";
 import type { DatabaseConfig } from "../types";
 
-const { Text } = Typography;
+const { Text, Title } = Typography;
 
 interface ColumnInfo {
   name: string;
@@ -62,21 +67,26 @@ function SchemaBrowse({ databaseId }: { databaseId?: string }) {
     current: string;
   } | null>(null);
   const [editText, setEditText] = useState("");
+  const requestId = useRef(0);
 
   const load = useCallback(async () => {
+    const currentRequest = ++requestId.current;
     if (!databaseId) {
       setTables([]);
+      setLoading(false);
       return;
     }
     setLoading(true);
     try {
       const data = await apiGet<TableInfo[]>(`/api/schema?database_id=${encodeURIComponent(databaseId)}`);
+      if (currentRequest !== requestId.current) return;
       setTables(data);
     } catch (error) {
+      if (currentRequest !== requestId.current) return;
       setTables([]);
       message.error(error instanceof Error ? error.message : "表结构加载失败");
     } finally {
-      setLoading(false);
+      if (currentRequest === requestId.current) setLoading(false);
     }
   }, [databaseId]);
 
@@ -104,14 +114,18 @@ function SchemaBrowse({ databaseId }: { databaseId?: string }) {
   const tableItems = tables.map((t) => ({
     key: t.table_name,
     label: (
-      <Space>
-        <Text strong>{t.table_name}</Text>
-        <Tag>{t.columns.length}列</Tag>
-      </Space>
+      <div className="schema-table-heading">
+        <Space size={10} wrap>
+          <span className="schema-table-icon"><TableOutlined /></span>
+          <Text strong className="schema-table-name">{t.table_name}</Text>
+          <Tag>{t.columns.length} 列</Tag>
+        </Space>
+        <Text type="secondary" ellipsis>{t.comment || "暂无表注释"}</Text>
+      </div>
     ),
     children: (
-      <div>
-        <Space style={{ marginBottom: 8 }}>
+      <div className="schema-table-panel">
+        <Space className="schema-table-comment" wrap>
           <Text type="secondary">表注释:</Text>
           <Text>{t.comment || "(空)"}</Text>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(t.table_name, null, t.comment)}>
@@ -152,18 +166,30 @@ function SchemaBrowse({ databaseId }: { databaseId?: string }) {
           ]}
           dataSource={t.columns}
           pagination={false}
+          scroll={{ x: 760 }}
         />
       </div>
     ),
   }));
 
   return (
-    <div>
-      <Space style={{ marginBottom: 8 }}>
-        <Text type="secondary">共 {tables.length} 张表。点击"补充/修改"为字段写注释,保存即写入系统覆盖层。</Text>
-      </Space>
-      {tables.length === 0 && !loading && <Text type="secondary">该数据库暂无已同步的表，请返回数据库连接页面同步 Schema。</Text>}
-      <Collapse items={tableItems} ghost={tables.length === 0} />
+    <div className="schema-browser">
+      <div className="schema-section-toolbar">
+        <div>
+          <Text strong>数据库结构</Text>
+          <Text type="secondary">共 {tables.length} 张表，展开表卡片可查看字段并维护注释。</Text>
+        </div>
+        <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>
+          刷新表结构
+        </Button>
+      </div>
+      {tables.length === 0 && !loading ? (
+        <div className="schema-empty-state">
+          <Empty description="该数据库暂无已同步的表，请先在数据库连接页面同步 Schema" />
+        </div>
+      ) : (
+        <Collapse className="schema-table-collapse" items={tableItems} bordered={false} />
+      )}
 
       <Modal
         title={editTarget ? `补充注释: ${editTarget.column || editTarget.table}` : ""}
@@ -251,26 +277,29 @@ function ReviewQueue({ databaseId }: { databaseId?: string }) {
   };
 
   return (
-    <div>
-      <Space style={{ marginBottom: 8 }}>
-        <Text type="secondary">待审核注释 {items.length} 条(LLM 生成的候选注释,人工确认后生效)。</Text>
+    <div className="schema-review-queue">
+      <div className="schema-section-toolbar">
+        <div>
+          <Text strong>候选注释审核</Text>
+          <Text type="secondary">待审核 {items.length} 条，人工确认后写入系统注释覆盖层。</Text>
+        </div>
         <Button
-          size="small"
           icon={<ReloadOutlined />}
           loading={refreshing}
           onClick={reingest}
         >
           重新入库(应用已确认注释)
         </Button>
-      </Space>
+      </div>
       {items.length === 0 ? (
-        <Text type="secondary">没有待审核的注释</Text>
+        <div className="schema-empty-state"><Empty description="没有待审核的注释" /></div>
       ) : (
         <Table
-          size="small"
+          className="schema-review-table"
           rowKey="id"
           dataSource={items}
-          pagination={false}
+          pagination={{ pageSize: 10, hideOnSinglePage: true }}
+          scroll={{ x: 900 }}
           columns={[
             { title: "ID", dataIndex: "id", width: 60 },
             { title: "表", dataIndex: "table_name", width: 220 },
@@ -359,17 +388,47 @@ export default function SchemaPage() {
       .catch((error) => message.error(error instanceof Error ? error.message : "数据库列表加载失败"));
   }, []);
 
+  const refreshDatabases = useCallback(async () => {
+    const items = await apiGet<DatabaseConfig[]>("/api/databases");
+    setDatabases(items);
+    const preferred = items.find((item) => item.is_default && item.schema_status === "ready")
+      || items.find((item) => item.schema_status === "ready");
+    setDatabaseId((current) => (
+      current && items.some((item) => item.id === current && item.schema_status === "ready")
+        ? current
+        : preferred?.id
+    ));
+  }, []);
+
+  useEffect(() => {
+    if (!databases.some((item) => item.schema_status === "syncing")) return;
+    const timer = window.setInterval(() => void refreshDatabases(), 2500);
+    return () => window.clearInterval(timer);
+  }, [databases, refreshDatabases]);
+
+  useEffect(() => {
+    const refreshOnFocus = () => void refreshDatabases();
+    window.addEventListener("focus", refreshOnFocus);
+    return () => window.removeEventListener("focus", refreshOnFocus);
+  }, [refreshDatabases]);
+
   return (
-    <Card
-      title="表结构与注释审核"
-      extra={
-        <Space>
-          <Text>数据库:</Text>
+    <div className="management-page schema-page">
+      <div className="management-page-header">
+        <div>
+          <Space size={10}>
+            <span className="page-icon"><TableOutlined /></span>
+            <Title level={3} style={{ margin: 0 }}>表与注释</Title>
+          </Space>
+          <Text type="secondary">浏览已同步的数据库结构，补充业务注释并审核自动生成的描述。</Text>
+        </div>
+        <Space wrap className="schema-database-picker">
+          <DatabaseOutlined />
           <Select
             value={databaseId}
             onChange={setDatabaseId}
             placeholder="选择已同步的数据库"
-            style={{ width: 240 }}
+            style={{ width: 260 }}
             options={databases.map((item) => ({
               value: item.id,
               label: `${item.name}${item.is_default ? "（默认）" : ""}`,
@@ -377,14 +436,32 @@ export default function SchemaPage() {
             }))}
           />
         </Space>
-      }
-    >
-      <Tabs
-        items={[
-          { key: "browse", label: "表结构 / 补充字段注释", children: <SchemaBrowse databaseId={databaseId} /> },
-          { key: "queue", label: "待审核注释", children: <ReviewQueue databaseId={databaseId} /> },
-        ]}
+      </div>
+
+      <Alert
+        className="management-alert"
+        type="info"
+        showIcon
+        message="注释修改只写入系统覆盖层，不会修改业务数据库 DDL"
+        description="建议先完善表和字段注释，再进行关系主动发现；检索与计划阶段会使用当前数据库对应的最新有效 M-Schema。"
       />
-    </Card>
+
+      <Card className="management-card schema-workspace-card">
+        <Tabs
+          items={[
+            {
+              key: "browse",
+              label: <Space size={7}><TableOutlined />表结构与注释</Space>,
+              children: <SchemaBrowse key={databaseId || "none"} databaseId={databaseId} />,
+            },
+            {
+              key: "queue",
+              label: <Space size={7}><AuditOutlined />待审核注释</Space>,
+              children: <ReviewQueue key={databaseId || "none"} databaseId={databaseId} />,
+            },
+          ]}
+        />
+      </Card>
+    </div>
   );
 }

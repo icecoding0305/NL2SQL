@@ -20,6 +20,7 @@ from nl2sql_agent.services.schema_ingest.comment_generator import (
     generate_database_context,
     generate_comment_draft,
     has_sufficient_comments,
+    profile_sample_values,
 )
 from nl2sql_agent.services.schema_ingest.mysql_fetcher import TableMeta
 from nl2sql_agent.services.schema_ingest.mschema import (
@@ -28,6 +29,7 @@ from nl2sql_agent.services.schema_ingest.mschema import (
     write_mschema_artifacts,
 )
 from nl2sql_agent.services.schema_ingest.profiler import classify_column, enrich_table
+from nl2sql_agent.services.schema_ingest.relation_discovery import discover_relation_candidates
 from nl2sql_agent.services.schema_ingest.schema_fetcher import fetch_schema
 from nl2sql_agent.services.schema_ingest.review_queue import ReviewStore
 from nl2sql_agent.services.schema_ingest.text_builder import (
@@ -45,6 +47,22 @@ class SyncReport:
     errors: list[str] = field(default_factory=list)
     mschema_path: str = ""
     snapshot_id: str = ""
+    profiled_tables: int = 0
+    profiled_columns: int = 0
+    profiled_rows: int = 0
+    profile_skipped_columns: int = 0
+    relation_candidates: int = 0
+
+
+def _profiling_policy_changed(mschema_path: Path, current_policy: dict) -> bool:
+    """Force one re-profile when the sampling policy changes between imports."""
+    if not mschema_path.exists():
+        return False
+    try:
+        previous = json.loads(mschema_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    return previous.get("profiling_policy", {}) != current_policy
 
 
 def compute_structure_hash(table: TableMeta) -> str:
@@ -104,12 +122,16 @@ def process_table(
 
     # 不达标:LLM 生成候选注释(样例脱敏)→ 进审核队列,人工 approve 后写入覆盖层
     try:
-        samples = fetch_masked_sample_values(
-            deps.executor,
-            table,
-            limit=int(config.get("sample_limit", 3)),
-            dialect=deps.config.dialect,
-        )
+        sample_limit = int(config.get("sample_limit", 3))
+        if config.get("comment_generation", {}).get("use_profile_samples", True):
+            samples = profile_sample_values(table, limit=sample_limit)
+        else:
+            samples = fetch_masked_sample_values(
+                deps.executor,
+                table,
+                limit=sample_limit,
+                dialect=deps.config.dialect,
+            )
         if llm is None:
             from nl2sql_agent.services.llm import get_model_for_node
 
@@ -187,6 +209,9 @@ def sync(
         configured_root = Path(config.get("artifact_dir", "data/schema"))
         artifact_root = configured_root if configured_root.is_absolute() else PROJECT_ROOT / configured_root
     latest_mschema_path = artifact_root / datasource / "m-schema.json"
+    profiling_policy_changed = _profiling_policy_changed(
+        latest_mschema_path, config.get("profiling", {})
+    )
     if mode == "incremental":
         hydrate_enrichment(tables, latest_mschema_path)
 
@@ -195,6 +220,7 @@ def sync(
         table.table_name
         for table in tables
         if mode == "full"
+        or profiling_policy_changed
         or snapshot.get(table.table_name) != hashes[table.table_name]
         or table.table_name in override_tables
     }
@@ -204,7 +230,16 @@ def sync(
     ready_for_vector: list[str] = []
     for table in tables:
         if table.table_name in changed_names:
-            enrich_table(executor, table, config, dialect=deps.config.dialect)
+            profile_summary = enrich_table(
+                executor, table, config, dialect=deps.config.dialect
+            )
+            if profile_summary.get("status") == "sampled":
+                report.profiled_tables += 1
+            report.profiled_columns += int(profile_summary.get("sampled_columns") or 0)
+            report.profiled_rows += int(profile_summary.get("sampled_rows") or 0)
+            report.profile_skipped_columns += int(
+                profile_summary.get("skipped_columns") or 0
+            )
         else:
             for column in table.columns:
                 classify_column(
@@ -264,6 +299,7 @@ def sync(
         schema_name=schema_name,
         namespace=business_line,
         database_context=database_context,
+        profiling_policy=config.get("profiling", {}),
     )
     effective_mschema = build_mschema(
         effective_tables,
@@ -272,7 +308,36 @@ def sync(
         schema_name=schema_name,
         namespace=business_line,
         database_context=database_context,
+        profiling_policy=config.get("profiling", {}),
     )
+    relation_discovery = config.get("relation_discovery", {})
+    if (
+        relation_discovery.get("enabled", True)
+        and relation_discovery.get("run_on_schema_sync", False)
+    ):
+        discovered_relations = discover_relation_candidates(
+            effective_tables,
+            effective_mschema.get("relations", []),
+            min_confidence=float(relation_discovery.get("min_confidence", 0.68)),
+            inferred_confidence=float(
+                relation_discovery.get("inferred_confidence", 0.84)
+            ),
+            max_candidates=int(relation_discovery.get("max_candidates", 200)),
+            allow_profile_inference=bool(
+                relation_discovery.get("allow_profile_inference", True)
+            ),
+            warehouse_anchor_threshold=float(
+                relation_discovery.get("warehouse_anchor_threshold", 0.62)
+            ),
+            max_edges_per_identifier=int(
+                relation_discovery.get("max_edges_per_identifier", 25)
+            ),
+        )
+    else:
+        discovered_relations = []
+    effective_mschema["relation_candidates"] = discovered_relations
+    raw_mschema["relation_candidates"] = discovered_relations
+    report.relation_candidates = len(discovered_relations)
     for table in effective_tables:
         effective_mschema["tables"][table.table_name]["retrieval_eligible"] = (
             has_sufficient_comments(table, config)

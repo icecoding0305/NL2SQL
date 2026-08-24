@@ -212,7 +212,7 @@ def _should_use_llm_resolution(state: NL2SQLState, resolved: ResolvedQuery, conf
 def make_query_resolution_node(deps):
     def query_resolution_node(state: NL2SQLState) -> NL2SQLState | dict:
         query = state.user_query.strip()
-        predicate_config = deps.loader.load("business_predicates.yaml")
+        predicate_config = deps.config.business_predicates
         resolved = _fallback_resolution(query, predicate_config)
         fallback_resolved = resolved
         resolution_config = deps.config.clarification_rules.get("query_resolution", {})

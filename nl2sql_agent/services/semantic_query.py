@@ -16,8 +16,39 @@ _OUTPUT_MARKER_RE = re.compile(r"(?:返回|展示|列出|输出|显示)(.+?)(?:[
 _SPLIT_RE = re.compile(r"、|，|,|以及|及|和")
 _GROUP_RE = re.compile(r"(?:统计|查询|计算)?每个([\u4e00-\u9fffA-Za-z_]{1,12}?)(?:的|累计|贷款|代偿|还款)")
 _GROUP_BY_RE = re.compile(r"按([\u4e00-\u9fffA-Za-z_]{1,12}?)(?:维度)?(?:统计|汇总|分组|计算)")
-_LIMIT_RE = re.compile(r"(?:前|top\s*)(\d+)", re.IGNORECASE)
+_LIMIT_RE = re.compile(
+    r"(?:前|top\s*)(?P<prefix_limit>\d+)"
+    r"|(?:限制)?(?:返回|取|保留)\s*(?P<return_limit>\d+)\s*(?:条|个|行|笔|名)?",
+    re.IGNORECASE,
+)
 _ORDER_RE = re.compile(r"([\u4e00-\u9fffA-Za-z_]{2,18}?)(最高|最大|最多|最低|最小|最少)")
+_DIRECTIONAL_ORDER_RES = (
+    re.compile(
+        r"(?:按|依据|根据)([\u4e00-\u9fffA-Za-z_]{1,20}?)(?:从)?"
+        r"(高到低|低到高|降序|升序)(?:排列|排序)?"
+    ),
+    re.compile(
+        r"([\u4e00-\u9fffA-Za-z_]{2,20}?)(降序|升序)(?:排列|排序)?"
+    ),
+)
+_TOP_N_OUTPUT_RE = re.compile(
+    r"^(?:(?:前|top)\d+(?:个|条|名|笔)?"
+    r"(?:客户|产品|机构|借据|合同|申请|贷款|还款|代偿|记录|结果)?"
+    r"|(?:限制)?(?:返回)?\d+(?:条|个|名|笔)(?:记录|结果)?)$",
+    re.IGNORECASE,
+)
+
+
+def _is_query_control_output(value: str) -> bool:
+    text = _clean_phrase(value)
+    if _TOP_N_OUTPUT_RE.fullmatch(text):
+        return True
+    if any(pattern.fullmatch(text) for pattern in _DIRECTIONAL_ORDER_RES):
+        return True
+    return bool(
+        _LIMIT_RE.search(text)
+        and any(word in text for word in ("高到低", "低到高", "降序", "升序"))
+    )
 
 
 def _clean_phrase(value: str) -> str:
@@ -57,15 +88,36 @@ def metric_semantics(label: str, *, grouped: bool = False) -> tuple[str, str | N
 
 def _explicit_outputs(query: str) -> list[tuple[str, list[int]]]:
     match = _OUTPUT_MARKER_RE.search(query)
-    if not match:
-        return []
     result: list[tuple[str, list[int]]] = []
-    for raw in _SPLIT_RE.split(match.group(1)):
-        phrase = _clean_phrase(raw)
-        if not phrase or len(phrase) > 20:
+    if match:
+        for raw in _SPLIT_RE.split(match.group(1)):
+            phrase = _clean_phrase(raw)
+            if not phrase or len(phrase) > 20 or _is_query_control_output(phrase):
+                continue
+            start = query.find(phrase, match.start(1))
+            result.append((phrase, [start, start + len(phrase)] if start >= 0 else []))
+
+    # A grouped metric list is also an explicit result contract, even when the
+    # natural-language possessive is omitted: “每个客户累计A、累计B和累计C”.
+    # This is generic SQL grammar, not a dictionary of business metrics.
+    known = {item[0] for item in result}
+    for group in _group_concepts(query):
+        marker = f"每个{group}"
+        marker_start = query.find(marker)
+        if marker_start < 0:
             continue
-        start = query.find(phrase, match.start(1))
-        result.append((phrase, [start, start + len(phrase)] if start >= 0 else []))
+        tail_start = marker_start + len(marker)
+        tail = query[tail_start:].lstrip("的")
+        for raw in _SPLIT_RE.split(tail):
+            phrase = _clean_phrase(raw)
+            if not phrase or len(phrase) > 20 or _is_query_control_output(phrase):
+                continue
+            _, aggregation, _ = metric_semantics(phrase, grouped=True)
+            if not aggregation or phrase in known:
+                continue
+            start = query.find(phrase, tail_start)
+            result.append((phrase, [start, start + len(phrase)] if start >= 0 else []))
+            known.add(phrase)
     return result
 
 
@@ -93,7 +145,10 @@ def enrich_semantic_graph(query: str, graph: SemanticGraph) -> SemanticGraph:
             subjects.append(SemanticSubject(id=identifier, kind="entity", concept=concept))
         return subject_by_concept[concept]
 
-    outputs = list(graph.outputs)
+    outputs = [
+        item for item in graph.outputs
+        if not _is_query_control_output(item.source_text or item.concept)
+    ]
     known_sources = {_clean_phrase(item.source_text or item.concept) for item in outputs}
     for phrase, span in _explicit_outputs(query):
         if phrase in known_sources:
@@ -172,10 +227,34 @@ def enrich_semantic_graph(query: str, graph: SemanticGraph) -> SemanticGraph:
         existing.add(concept)
 
     limit_match = _LIMIT_RE.search(query)
-    limit = int(limit_match.group(1)) if limit_match else graph.limit
+    limit_value = (
+        limit_match.group("prefix_limit") or limit_match.group("return_limit")
+        if limit_match else None
+    )
+    limit = int(limit_value) if limit_value else graph.limit
     orders = list(graph.order_by)
     if not orders:
-        order_match = _ORDER_RE.search(query)
+        order_match = next(
+            (match for pattern in _DIRECTIONAL_ORDER_RES if (match := pattern.search(query))),
+            None,
+        )
+        if order_match:
+            raw_concept = _clean_phrase(order_match.group(1))
+            candidates = [
+                item for item in enriched_outputs
+                if _clean_phrase(item.concept) in raw_concept
+                or raw_concept.endswith(_clean_phrase(item.concept))
+            ]
+            selected = max(candidates, key=lambda item: len(item.concept), default=None)
+            concept = selected.concept if selected else raw_concept
+            base = selected.grounding_concept if selected else metric_semantics(concept)[0]
+            orders.append(SemanticOrder(
+                concept=concept,
+                grounding_concept=base,
+                direction="desc" if order_match.group(2) in {"高到低", "降序"} else "asc",
+                source_text=order_match.group(0),
+            ))
+        order_match = None if orders else _ORDER_RE.search(query)
         if order_match:
             raw_concept = _clean_phrase(order_match.group(1))
             # Keep the closest requested output concept, not the leading verb.
@@ -193,6 +272,67 @@ def enrich_semantic_graph(query: str, graph: SemanticGraph) -> SemanticGraph:
                 source_text=order_match.group(0),
             ))
 
+    # Natural Top-N questions often omit “统计每个”, for example
+    # “按贷款总金额从高到低返回前3个产品”. If the model retains only the
+    # entity projection, preserve the explicitly named aggregate ordering
+    # measure as an output contract and infer the single entity as group grain.
+    # Restrict this repair to one non-aggregate output to avoid guessing the
+    # grain for requests containing multiple descriptive attributes.
+    effective_groups = groups or list(graph.group_by)
+    non_aggregate_outputs = [item for item in enriched_outputs if not item.aggregation]
+    entity_subjects = [item for item in subjects if item.kind == "entity"]
+    if limit and orders and not non_aggregate_outputs and len(entity_subjects) == 1:
+        entity = entity_subjects[0]
+        output_id = f"output_{len(enriched_outputs) + 1}"
+        while output_id in used_ids:
+            output_id = f"output_{int(output_id.split('_')[-1]) + 1}"
+        entity_output = SemanticOutput(
+            id=output_id,
+            subject_id=entity.id,
+            concept=entity.concept,
+            grounding_concept=entity.concept,
+            source_text=entity.concept,
+            required=True,
+            confidence=0.95,
+        )
+        enriched_outputs.append(entity_output)
+        used_ids.add(output_id)
+        non_aggregate_outputs = [entity_output]
+    if limit and orders and len(non_aggregate_outputs) == 1:
+        for order in orders:
+            order_keys = {
+                _clean_phrase(order.concept),
+                _clean_phrase(order.grounding_concept or ""),
+            } - {""}
+            already_bound = any(
+                order_keys & ({
+                    _clean_phrase(item.concept),
+                    _clean_phrase(item.grounding_concept or ""),
+                } - {""})
+                for item in enriched_outputs
+            )
+            base, aggregation, grain = metric_semantics(order.concept, grouped=True)
+            if already_bound or not aggregation:
+                continue
+            entity_output = non_aggregate_outputs[0]
+            output_id = f"output_{len(enriched_outputs) + 1}"
+            while output_id in used_ids:
+                output_id = f"output_{int(output_id.split('_')[-1]) + 1}"
+            enriched_outputs.append(SemanticOutput(
+                id=output_id,
+                subject_id=entity_output.subject_id,
+                concept=order.concept,
+                grounding_concept=base,
+                source_text=order.source_text or order.concept,
+                required=True,
+                confidence=0.95,
+                aggregation=aggregation,
+                distinct_grain=grain,
+            ))
+            used_ids.add(output_id)
+            if not effective_groups:
+                effective_groups = [entity_output.grounding_concept or entity_output.concept]
+
     capabilities = list(graph.capabilities)
     if any(item.aggregation for item in enriched_outputs) and "aggregation" not in capabilities:
         capabilities.append("aggregation")
@@ -203,7 +343,7 @@ def enrich_semantic_graph(query: str, graph: SemanticGraph) -> SemanticGraph:
     return graph.model_copy(update={
         "subjects": subjects,
         "outputs": enriched_outputs,
-        "group_by": groups or graph.group_by,
+        "group_by": effective_groups,
         "order_by": orders,
         "limit": limit,
         "capabilities": capabilities,

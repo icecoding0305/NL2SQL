@@ -1,31 +1,130 @@
-# 少样本示例库(模块 7 简单路径使用),基于真实借据表 dwd_ar_loan_info
-# 注意:
-# - 行级权限过滤(WHERE PLATFORM_CODE IN (...))由模块 8 代码自动注入,示例里不写,
-#   但 SQL 只应引用 schema 内真实表/字段
-# - 语法为 MySQL(与 dialect 一致)
-# - 反馈闭环:人工确认通过的案例可回流到此处(暂未接入图内,预留 add_example 接口)
-examples:
-  - user_query: "查询新信贷的借据笔数"
+# Few-shot v2：计划模式与 SQL 降级示例分离。
+# plan_patterns 不允许出现物理表名、字段名或业务枚举值，可跨数据库复用。
+# sql_fallback_examples 仅在方言一致、verified=true 且 used_tables 全部属于本次
+# Query M-Schema 时使用，避免切换数据库后复制失效的物理标识符。
+version: 2
+
+plan_patterns:
+  - id: single_table_detail_filter
+    question_pattern: "查询满足某个条件的记录明细"
+    question_skeleton: {action: detail, filters: [comparison]}
+    plan_structure: {operators: [scan, filter, project], output_grain: record}
+    tags: [detail, filter, single_table]
+
+  - id: single_table_multi_filter
+    question_pattern: "查询同时满足多个条件的记录信息"
+    question_skeleton: {action: detail, filters: [comparison, equality]}
+    plan_structure: {operators: [scan, filter, project], predicate_mode: and, output_grain: record}
+    tags: [detail, multi_filter, single_table]
+
+  - id: grouped_count_sum
+    question_pattern: "统计每个类别的记录数量和指标总额"
+    question_skeleton: {action: aggregate, aggregations: [count, sum], group_by: true}
+    plan_structure: {operators: [scan, aggregate, project], output_grain: aggregate}
+    tags: [aggregate, group_by, count, sum]
+
+  - id: grouped_multi_metric
+    question_pattern: "统计每个主体的数量、总额和平均值"
+    question_skeleton: {action: aggregate, aggregations: [count, sum, avg], group_by: true}
+    plan_structure: {operators: [scan, aggregate, project], output_grain: aggregate}
+    tags: [aggregate, group_by, multi_metric]
+
+  - id: grouped_having
+    question_pattern: "统计每个主体累计总额，并筛选累计总额超过阈值的主体"
+    question_skeleton: {action: aggregate, aggregations: [sum], group_by: true, filters: [aggregate_comparison]}
+    plan_structure: {operators: [scan, aggregate, having, project], output_grain: aggregate}
+    tags: [aggregate, group_by, having]
+
+  - id: top_n_ranking
+    question_pattern: "查询指标最高的前若干个主体并按指标降序排列"
+    question_skeleton: {action: rank, aggregations: [sum], group_by: true, order_by: true, limit: true}
+    plan_structure: {operators: [scan, aggregate, project, sort, limit], output_grain: aggregate}
+    tags: [rank, top_n, order_by, limit]
+
+  - id: two_table_detail_join
+    question_pattern: "关联实体和业务记录，返回双方的明细信息"
+    question_skeleton: {action: detail, multi_table: true}
+    plan_structure: {operators: [scan, scan, join, project], output_grain: record}
+    tags: [join, two_table, detail]
+
+  - id: entity_fact_aggregate
+    question_pattern: "关联实体和业务记录，统计每个实体的数量与总额"
+    question_skeleton: {action: aggregate, aggregations: [count, sum], group_by: true, multi_table: true}
+    plan_structure: {operators: [scan, scan, join, aggregate, project], output_grain: aggregate}
+    tags: [join, entity, aggregate]
+
+  - id: exists_semijoin
+    question_pattern: "查询存在相关业务记录的实体信息"
+    question_skeleton: {action: detail, filters: [exists], multi_table: true}
+    plan_structure: {operators: [scan, scan, semi_join, project], output_grain: entity}
+    tags: [exists, semi_join, entity]
+
+  - id: not_exists_antijoin
+    question_pattern: "查询不存在相关业务记录的实体信息"
+    question_skeleton: {action: detail, filters: [not_exists], multi_table: true}
+    plan_structure: {operators: [scan, scan, anti_join, project], output_grain: entity}
+    tags: [not_exists, anti_join, entity]
+
+  - id: three_table_relation_path
+    question_pattern: "通过中间业务记录关联实体与另一类业务明细"
+    question_skeleton: {action: detail, multi_table: true}
+    plan_structure: {operators: [scan, scan, scan, join, join, project], output_grain: record}
+    tags: [join, three_table, relation_path]
+
+  - id: multi_fact_preaggregate
+    question_pattern: "分别统计两类业务事实的累计指标，再按同一实体关联"
+    question_skeleton: {action: aggregate, aggregations: [sum], group_by: true, multi_table: true}
+    plan_structure:
+      operators: [scan, aggregate, scan, aggregate, join, project]
+      strategy: preaggregate_each_fact_before_join
+      output_grain: aggregate
+    tags: [multi_fact, preaggregate, anti_duplication]
+
+  - id: time_bucket_aggregate
+    question_pattern: "按时间周期统计数量、客户数和指标总额"
+    question_skeleton: {action: aggregate, aggregations: [count, count_distinct, sum], group_by: true, filters: [time_range]}
+    plan_structure: {operators: [scan, filter, aggregate, project], output_grain: aggregate}
+    tags: [time, group_by, count_distinct]
+
+  - id: conditional_aggregate
+    question_pattern: "按类别统计总记录数以及满足某状态的记录数和金额"
+    question_skeleton: {action: aggregate, aggregations: [count, sum], group_by: true, filters: [equality]}
+    plan_structure:
+      operators: [scan, aggregate, project]
+      strategy: conditional_aggregation
+      output_grain: aggregate
+    tags: [conditional_aggregate, group_by]
+
+  - id: composite_detail_comparison
+    question_pattern: "关联计划记录和实际记录，对比每个明细周期的多个指标及差额"
+    question_skeleton: {action: detail, multi_table: true}
+    plan_structure:
+      operators: [scan, scan, join, project]
+      strategy: join_on_composite_key_and_derive_difference
+      output_grain: record
+    tags: [composite_key, derived_expression, detail]
+
+sql_fallback_examples:
+  - id: mysql_simple_count
+    dialect: mysql
+    user_query: "查询借据笔数"
     sql: "SELECT COUNT(*) AS cnt FROM dwd_ar_loan_info"
     used_tables: [dwd_ar_loan_info]
-    tags: [count, simple]
+    tags: [aggregate, count, single_table]
+    verified: true
 
-  - user_query: "查询新信贷的逾期本金"
-    sql: "SELECT SUM(OVD_BAL) AS total_ovd FROM dwd_ar_loan_info"
+  - id: mysql_simple_sum
+    dialect: mysql
+    user_query: "查询贷款总金额"
+    sql: "SELECT SUM(LOAN_AMT) AS total_loan_amount FROM dwd_ar_loan_info"
     used_tables: [dwd_ar_loan_info]
-    tags: [sum, amount]
+    tags: [aggregate, sum, single_table]
+    verified: true
 
-  - user_query: "查询新信贷的贷款余额"
-    sql: "SELECT SUM(PRIN_BAL) AS total_balance FROM dwd_ar_loan_info"
-    used_tables: [dwd_ar_loan_info]
-    tags: [sum, amount]
-
-  - user_query: "查询新信贷的贷款金额"
-    sql: "SELECT SUM(LOAN_AMT) AS total FROM dwd_ar_loan_info"
-    used_tables: [dwd_ar_loan_info]
-    tags: [sum, amount]
-
-  - user_query: "查询新信贷的逾期借据清单"
+  - id: mysql_detail_filter
+    dialect: mysql
+    user_query: "查询逾期本金余额大于零的借据明细"
     sql: "SELECT LOAN_NO, LOAN_STATUS, OVD_BAL FROM dwd_ar_loan_info WHERE OVD_BAL > 0"
     used_tables: [dwd_ar_loan_info]
-    tags: [where, overdue]
+    tags: [detail, filter, single_table]
+    verified: true

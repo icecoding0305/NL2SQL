@@ -171,10 +171,16 @@ def _should_use_llm_summary(state: NL2SQLState, deps) -> bool:
         return False
     plan = state.query_plan
     if plan is None:
-        return True
-    # Detail/entity result sets are already displayed as a table. An extra remote
-    # model call adds latency without adding factual information.
-    return bool(plan and (plan.metric_logic or plan.group_by))
+        return False
+    # In auto mode only a single global aggregate receives synchronous LLM
+    # enrichment. Detail/entity and grouped result sets are already displayed as
+    # data; waiting for a remote narrative adds latency without changing facts.
+    rows = state.execution_result or []
+    return bool(
+        len(rows) == 1
+        and plan.output_grain.level == "global"
+        and any(field.aggregation for field in plan.output_fields)
+    )
 
 
 def make_result_interpretation_node(deps):
@@ -219,7 +225,7 @@ def make_result_interpretation_node(deps):
                 rows_truncated=str(len(rows) > len(safe_rows)).lower(),
                 rows=prompt_json(safe_rows),
             )
-            generated = deps.llm.complete_structured(prompt, ResultSummary, retries=1)
+            generated = deps.llm.complete_structured(prompt, ResultSummary, retries=0)
             summary = generated.model_copy(update={
                 "status": fallback.status,
                 "row_count": len(rows),

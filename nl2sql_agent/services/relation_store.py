@@ -38,6 +38,11 @@ class DatabaseRelationStore:
                     preferred_join_type TEXT NOT NULL DEFAULT 'inner',
                     description TEXT,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'verified',
+                    source TEXT NOT NULL DEFAULT 'user_configured',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    evidence TEXT NOT NULL DEFAULT '[]',
+                    validation_summary TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -47,6 +52,21 @@ class DatabaseRelationStore:
                 "CREATE INDEX IF NOT EXISTS idx_database_relations_database "
                 "ON database_relations(database_id)"
             )
+            existing_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(database_relations)").fetchall()
+            }
+            migrations = {
+                "status": "TEXT NOT NULL DEFAULT 'verified'",
+                "source": "TEXT NOT NULL DEFAULT 'user_configured'",
+                "confidence": "REAL NOT NULL DEFAULT 1.0",
+                "evidence": "TEXT NOT NULL DEFAULT '[]'",
+                "validation_summary": "TEXT NOT NULL DEFAULT '{}'",
+            }
+            for column, definition in migrations.items():
+                if column not in existing_columns:
+                    conn.execute(
+                        f"ALTER TABLE database_relations ADD COLUMN {column} {definition}"
+                    )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_database_relation_edge "
                 "ON database_relations(database_id, source_table, source_columns, "
@@ -63,6 +83,8 @@ class DatabaseRelationStore:
         item = dict(row)
         item["source_columns"] = json.loads(item.get("source_columns") or "[]")
         item["target_columns"] = json.loads(item.get("target_columns") or "[]")
+        item["evidence"] = json.loads(item.get("evidence") or "[]")
+        item["validation_summary"] = json.loads(item.get("validation_summary") or "{}")
         item["enabled"] = bool(item.get("enabled"))
         return item
 
@@ -96,13 +118,22 @@ class DatabaseRelationStore:
             "preferred_join_type": str(values.get("preferred_join_type") or "inner"),
             "description": str(values.get("description") or "").strip(),
             "enabled": int(bool(values.get("enabled", True))),
+            "status": str(values.get("status") or "verified"),
+            "source": str(values.get("source") or "user_configured"),
+            "confidence": float(values.get("confidence", 1.0)),
+            "evidence": json.dumps(values.get("evidence") or [], ensure_ascii=False),
+            "validation_summary": json.dumps(
+                values.get("validation_summary") or {}, ensure_ascii=False
+            ),
             "created_at": now,
             "updated_at": now,
         }
         with self._lock, self._connect() as conn:
+            columns = list(item)
             conn.execute(
-                "INSERT INTO database_relations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                tuple(item.values()),
+                f"INSERT INTO database_relations ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                tuple(item[column] for column in columns),
             )
         return self.get(item["id"]) or {}
 
@@ -112,9 +143,13 @@ class DatabaseRelationStore:
         allowed = {
             "source_table", "source_columns", "target_table", "target_columns",
             "cardinality", "preferred_join_type", "description", "enabled",
+            "status", "source", "confidence", "evidence", "validation_summary",
         }
         updates = {key: values[key] for key in allowed if key in values and values[key] is not None}
         for key in ("source_columns", "target_columns"):
+            if key in updates:
+                updates[key] = json.dumps(updates[key], ensure_ascii=False)
+        for key in ("evidence", "validation_summary"):
             if key in updates:
                 updates[key] = json.dumps(updates[key], ensure_ascii=False)
         if "enabled" in updates:
@@ -128,6 +163,30 @@ class DatabaseRelationStore:
                 (*updates.values(), relation_id),
             )
         return self.get(relation_id)
+
+    def decide_many(
+        self, database_id: str, relation_ids: list[str], status: str
+    ) -> list[str]:
+        """Confirm or reject pending candidates in one transaction."""
+        unique_ids = list(dict.fromkeys(str(item) for item in relation_ids if item))
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT id FROM database_relations WHERE database_id=? "
+                f"AND status IN ('candidate','inferred') AND id IN ({placeholders})",
+                (database_id, *unique_ids),
+            ).fetchall()
+            matched = [str(row["id"]) for row in rows]
+            if matched:
+                matched_placeholders = ",".join("?" for _ in matched)
+                conn.execute(
+                    f"UPDATE database_relations SET status=?,enabled=?,updated_at=? "
+                    f"WHERE database_id=? AND id IN ({matched_placeholders})",
+                    (status, int(status == "verified"), _now(), database_id, *matched),
+                )
+        return matched
 
     def delete(self, relation_id: str) -> bool:
         with self._lock, self._connect() as conn:
@@ -155,8 +214,57 @@ class DatabaseRelationStore:
                 "description": item["description"],
                 "constraint_name": f"user_relation_{item['id']}",
                 "relation_type": "user_defined",
-                "status": "verified",
-                "source": "user_configured",
+                "status": item.get("status") or "verified",
+                "source": item.get("source") or "user_configured",
+                "confidence": float(item.get("confidence") or 0.0),
+                "evidence": item.get("evidence") or [],
             }
             for item in self.list(database_id, enabled_only=True)
+            if item.get("status") in {"verified", "confirmed"}
         ]
+
+    def replace_discovered(self, database_id: str, candidates: list[dict]) -> int:
+        """Upsert the latest discovery snapshot without touching verified rows."""
+        active_ids: set[str] = set()
+        for candidate in candidates:
+            source_columns = json.dumps(candidate.get("source_columns") or [], ensure_ascii=False)
+            target_columns = json.dumps(candidate.get("target_columns") or [], ensure_ascii=False)
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT id,status,source FROM database_relations WHERE database_id=? "
+                    "AND source_table=? AND source_columns=? AND target_table=? AND target_columns=?",
+                    (
+                        database_id, candidate.get("source_table"), source_columns,
+                        candidate.get("target_table"), target_columns,
+                    ),
+                ).fetchone()
+            if row:
+                active_ids.add(str(row["id"]))
+                if row["status"] not in {"verified", "confirmed", "rejected"}:
+                    self.update(str(row["id"]), {
+                        **candidate,
+                        "enabled": False,
+                        "source": "schema_relation_discovery",
+                    })
+                continue
+            created = self.create(database_id, {
+                **candidate,
+                "enabled": False,
+                "source": "schema_relation_discovery",
+                "description": "系统根据字段、键和安全样本自动发现的候选关系",
+            })
+            if created.get("id"):
+                active_ids.add(str(created["id"]))
+
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM database_relations WHERE database_id=? "
+                "AND source='schema_relation_discovery' AND status IN ('candidate','inferred')",
+                (database_id,),
+            ).fetchall()
+            stale = [str(row["id"]) for row in rows if str(row["id"]) not in active_ids]
+            if stale:
+                conn.executemany(
+                    "DELETE FROM database_relations WHERE id=?", [(item,) for item in stale]
+                )
+        return len(active_ids)

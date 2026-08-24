@@ -63,6 +63,7 @@ def build_mschema(
     namespace: str,
     raw_tables: list[TableMeta] | None = None,
     database_context: str = "",
+    profiling_policy: dict | None = None,
 ) -> dict:
     raw_by_name = {table.table_name: table for table in (raw_tables or tables)}
     table_map: dict[str, dict] = {}
@@ -93,6 +94,11 @@ def build_mschema(
                 "time_granularity": column.time_granularity,
                 "examples": profile.get("examples", []),
                 "profile": profile,
+                "profile_status": (
+                    "sampled" if profile
+                    else "skipped_sensitive" if column.sensitive
+                    else "not_sampled"
+                ),
             }
         table_source = _comment_source(raw_table.table_comment, table.table_comment)
         table_map[table.table_name] = {
@@ -134,6 +140,7 @@ def build_mschema(
         "schema": schema_name,
         "namespace": namespace,
         "db_info": database_context,
+        "profiling_policy": dict(profiling_policy or {}),
         "tables": table_map,
         "foreign_keys": foreign_keys,
         "relations": relations,

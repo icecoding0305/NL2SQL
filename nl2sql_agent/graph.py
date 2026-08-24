@@ -207,8 +207,8 @@ def build_graph(deps: Deps, checkpointer=None, event_sink=None, cancellation_che
     g.add_node("entry", t("entry", m1_entry.make_entry_node(deps)))
     g.add_node("query_resolution", t("query_resolution", m2_query_resolution.make_query_resolution_node(deps)))
     g.add_node("schema_retrieval", t("schema_retrieval", m3_schema_retrieval.make_schema_retrieval_node(deps)))
+    g.add_node("rewrite_retrieval", t("rewrite_retrieval", m3_5_retrieval_confidence_router.make_rewrite_retrieval_node(deps)))
     g.add_node("clarify_business", t("clarify_business", m3_5_retrieval_confidence_router.make_clarify_business_node(deps)))
-    g.add_node("clarify_low_confidence", t("clarify_low_confidence", m3_5_retrieval_confidence_router.make_clarify_low_confidence_node(deps)))
     g.add_node("plan_generation", t("plan_generation", m5b_plan_generation.make_plan_generation_node(deps)))
     g.add_node("plan_validation", t("plan_validation", m6_plan_validation.make_plan_validation_node(deps)))
     g.add_node("sql_generation", t("sql_generation", m7_sql_generation.make_sql_generation_node(deps)))
@@ -236,18 +236,13 @@ def build_graph(deps: Deps, checkpointer=None, event_sink=None, cancellation_che
         {
             "unsupported_output": END,
             "clarify_business": "clarify_business",
-            "clarify_low_confidence": "clarify_low_confidence",
+            "rewrite_retrieval": "rewrite_retrieval",
             "plan_generation": "plan_generation",
         },
     )
+    g.add_edge("rewrite_retrieval", "schema_retrieval")
     # 只澄清业务口径；用户不会接触物理表/字段绑定。
     g.add_edge("clarify_business", "schema_retrieval")
-    # 低置信澄清:继续 → 统一计划路径(带 low_confidence_flag);不继续 → 结束
-    g.add_conditional_edges(
-        "clarify_low_confidence",
-        m3_5_retrieval_confidence_router.route_after_low_confidence,
-        {"need_info": END, "proceed": "plan_generation"},
-    )
 
     # 所有查询统一经过模块5b/6，不再用脆弱的复杂度分类绕过计划。
     g.add_edge("plan_generation", "plan_validation")
@@ -312,9 +307,5 @@ def build_graph(deps: Deps, checkpointer=None, event_sink=None, cancellation_che
         # 复用 checkpoint 序列化器(注册全部 state 模型,避免 msgpack 反序列化告警)
         checkpointer=checkpointer
         or InMemorySaver(serde=checkpoint_serializer()),
-        interrupt_before=(
-            ["human_review", "clarify_low_confidence"]
-            if deps.config.approval_enabled
-            else ["clarify_low_confidence"]
-        ),
+        interrupt_before=(["human_review"] if deps.config.approval_enabled else []),
     )

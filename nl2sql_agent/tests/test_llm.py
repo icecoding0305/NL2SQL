@@ -20,19 +20,26 @@ def test_build_openai_compatible_llm_entirely_from_config(monkeypatch):
     import openai
 
     fake_client = object()
+    captured = {}
     monkeypatch.setenv("TEST_MODEL_KEY", "secret")
-    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: fake_client)
+    def fake_openai(**kwargs):
+        captured.update(kwargs)
+        return fake_client
+    monkeypatch.setattr(openai, "OpenAI", fake_openai)
     client = build_llm_from_config({
         "provider": "openai_compatible",
         "model": "config-model",
         "base_url": "https://model.example/v1",
         "api_key_env": "TEST_MODEL_KEY",
         "supports_tool_calling": False,
+        "request": {"timeout_seconds": 12, "sdk_max_retries": 0},
     })
     assert isinstance(client, OpenAICompatibleLLMClient)
     assert client.client is fake_client
     assert client.model == "config-model"
     assert client.supports_tool_calling is False
+    assert captured["timeout"] == 12
+    assert captured["max_retries"] == 0
 
 
 def test_config_model_rejects_inline_or_missing_secret(monkeypatch):
@@ -100,10 +107,12 @@ class _FakeCompletions:
     def __init__(self, contents: list[str], tool_support: bool = True):
         self._contents = list(contents)
         self.calls = 0
+        self.last_kwargs = {}
         self.tool_support = tool_support
 
     def create(self, **kwargs):
         self.calls += 1
+        self.last_kwargs = kwargs
         raw = self._contents.pop(0)
         msg = _FakeMessage(content=raw)
         if kwargs.get("tools") and self.tool_support:
@@ -148,6 +157,42 @@ def test_deepseek_complete_and_json():
     assert data2 == {"answer": 7}
 
     assert client.client.chat.completions.calls == 3
+
+
+def test_deepseek_applies_node_request_timeout_and_budget():
+    from nl2sql_agent.services.llm_telemetry import begin_capture, end_capture
+
+    client = DeepSeekLLMClient(
+        _FakeClient(['{"answer": 1}']),
+        model="deepseek-chat",
+        request_config={
+            "timeout_seconds": 30,
+            "nodes": {"query_resolution": {"timeout_seconds": 7, "max_tokens": 123}},
+        },
+    )
+
+    tokens = begin_capture("query_resolution", "trace-timeout")
+    try:
+        client.complete("test")
+    finally:
+        end_capture(tokens)
+
+    kwargs = client.client.chat.completions.last_kwargs
+    assert kwargs["timeout"] == 7
+    assert kwargs["max_tokens"] == 123
+
+
+def test_query_assumption_accepts_common_model_aliases():
+    from nl2sql_agent.state import QueryAssumption
+
+    from_string = QueryAssumption.model_validate("未指定时间范围")
+    from_alias = QueryAssumption.model_validate({
+        "assumption": "按全量数据处理", "source": "inferred",
+    })
+
+    assert from_string.content == "未指定时间范围"
+    assert from_alias.content == "按全量数据处理"
+    assert from_alias.source == "system_inference"
 
 
 def test_complete_json_rejects_schema_echo():

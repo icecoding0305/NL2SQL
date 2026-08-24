@@ -1,9 +1,10 @@
-"""模块 3.5:检索后置信度路由(插在模块 3 与模块 4 之间)。
+"""模块 3.5:检索后置信度与自动改写路由。
 
 把"是否需要澄清"的判断依据从"术语库有没有收录"改为"Schema 检索完成后的置信度分布":
 - 多个物理表候选由系统按角色、粒度和关系自动规划，不要求业务用户选表
 - 同一业务槽位存在不同字段口径 → 只展示业务语言选项
-- 检索置信度低于阈值 → 低置信澄清(clarify_low_confidence),问用户是否继续
+- 检索置信度低于阈值 → 自动业务语义改写并重新召回一次
+- 第二次仍低置信 → 带风险标记进入严格计划校验，不询问物理表
 - 高置信单一候选 → 直接放行到模块 4
 
 阈值从 config/clarification_rules.yaml 的 retrieval_confidence 读取,不硬编码。
@@ -34,10 +35,61 @@ def make_route_after_retrieval(deps):
             return "clarify_business"
         confidence_threshold, _ = _thresholds(deps)
         if state.retrieval_confidence < confidence_threshold:
-            return "clarify_low_confidence"
+            max_rewrites = int(
+                deps.config.clarification_rules.get("retrieval_confidence", {})
+                .get("max_automatic_rewrites", 1)
+            )
+            if state.retrieval_rewrite_count < max_rewrites:
+                return "rewrite_retrieval"
+            return "plan_generation"
         return "plan_generation"
 
     return route_after_retrieval
+
+
+def _semantic_rewrite(state: NL2SQLState) -> str:
+    """Build a business-language retrieval query without exposing Schema names."""
+    graph = state.semantic_graph
+    parts = [
+        state.resolved_query.rewritten_query
+        if state.resolved_query is not None else state.user_query
+    ]
+    if graph is not None:
+        for output in graph.outputs:
+            parts.extend([output.concept, output.grounding_concept or ""])
+        parts.extend(graph.group_by)
+        for order in graph.order_by:
+            parts.extend([order.concept, order.grounding_concept or ""])
+        if graph.group_by:
+            parts.append("按维度分组统计")
+        if graph.order_by:
+            parts.append("排序指标")
+        if graph.limit:
+            parts.append(f"前{graph.limit}条")
+    cleaned = [str(part).strip() for part in parts if str(part or "").strip()]
+    return " ".join(dict.fromkeys(cleaned))
+
+
+def make_rewrite_retrieval_node(deps):  # noqa: ARG001
+    """Automatically rewrite a low-confidence query and run Schema retrieval again."""
+
+    def rewrite_retrieval_node(state: NL2SQLState) -> dict:
+        rewritten = _semantic_rewrite(state)
+        return {
+            "clarified_query": rewritten,
+            "retrieval_rewrite_count": state.retrieval_rewrite_count + 1,
+            "retrieval_rewrites": [*state.retrieval_rewrites, rewritten],
+            "retrieval_resolved": False,
+            "retrieved_schema": [],
+            "retrieval_candidates": [],
+            "field_candidates": [],
+            "field_ambiguities": {},
+            "schema_plan": None,
+            "low_confidence_flag": True,
+            "clarification_reason": None,
+        }
+
+    return rewrite_retrieval_node
 
 
 def make_clarify_business_node(deps):  # noqa: ARG001 - 保持节点工厂签名一致
@@ -83,36 +135,3 @@ def make_clarify_business_node(deps):  # noqa: ARG001 - 保持节点工厂签名
         }
 
     return clarify_business_node
-
-
-def make_clarify_low_confidence_node(deps):
-    """低置信澄清:提示指标不在已知范围,问用户是否继续。"""
-
-    def clarify_low_confidence_node(state: NL2SQLState) -> NL2SQLState | dict:
-        unresolved = state.schema_plan.unresolved_slots if state.schema_plan else []
-        detail = f" 未确定内容：{'、'.join(unresolved)}。" if unresolved else ""
-        payload = {
-            "type": "clarify_low_confidence",
-            "question": f"Schema 规划证据不足。{detail}是否继续尝试?",
-            "query": state.user_query,
-        }
-        decision = interrupt(payload)
-        if isinstance(decision, dict):
-            cont = bool(decision.get("continue", decision.get("approved", False)))
-        else:
-            cont = bool(decision)
-        if cont:
-            return {"low_confidence_flag": True, "clarification_reason": None}
-        return {
-            "need_clarification": True,
-            "clarification_questions": ["Schema 规划证据不足，请换一种问法或补充字段口径"],
-            "clarification_reason": "low_confidence",
-            "final_answer": "Schema 规划证据不足，请换一种问法或补充字段口径。",
-        }
-
-    return clarify_low_confidence_node
-
-
-def route_after_low_confidence(state: NL2SQLState) -> str:
-    """用户选择不继续 → 结束;继续 → 带着 low_confidence_flag 进模块 4。"""
-    return "need_info" if state.need_clarification else "proceed"

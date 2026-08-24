@@ -27,7 +27,7 @@ def run_case(deps, case: dict) -> tuple[bool, str]:
         cfg,
     )
 
-    # 自动处理候选澄清 / 低置信澄清(选第一个候选 / 继续),保证用例能往下走
+    # 自动处理旧候选澄清；低置信 Schema 已由图内自动改写，无需人工继续。
     for _ in range(3):
         snap = graph.get_state(cfg)
         if not snap.next:
@@ -40,8 +40,6 @@ def run_case(deps, case: dict) -> tuple[bool, str]:
             first = cands[0]
             name = first.table_name if hasattr(first, "table_name") else first.get("table_name")
             result = graph.invoke(Command(resume={"table": name}), cfg)
-        elif nxt == "clarify_low_confidence":
-            result = graph.invoke(Command(resume={"continue": True}), cfg)
         else:
             break
 

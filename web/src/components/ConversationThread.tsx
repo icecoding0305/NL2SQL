@@ -3,9 +3,11 @@ import {
   CodeOutlined,
   ExclamationCircleOutlined,
   RobotOutlined,
+  BulbOutlined,
+  DatabaseOutlined,
   StopOutlined,
 } from "@ant-design/icons";
-import { Card, Collapse, Space, Spin, Tag, Typography } from "antd";
+import { Button, Card, Collapse, Space, Spin, Tag, Typography } from "antd";
 import { PIPELINE_NODES } from "../types";
 
 const { Text, Title } = Typography;
@@ -26,6 +28,8 @@ interface ThreadSession {
 interface Props {
   sessions: ThreadSession[];
   renderStep: (session: ThreadSession, node: string, title: string) => React.ReactNode;
+  databaseName?: string;
+  onSuggestion?: (question: string) => void;
 }
 
 const statusLabel: Record<string, string> = {
@@ -82,6 +86,14 @@ function ConversationTurn({
   const runningNode = PIPELINE_NODES.find(({ node }) => session.steps[node]?.status === "running");
   const lastNode = session.trace_steps?.[session.trace_steps.length - 1];
   const runningLabel = stageByNode[runningNode?.node || lastNode || "entry"] || "正在准备查询";
+  const mainNodeOrder: Record<string, number> = {
+    query_resolution: 0,
+    clarify_business: 1,
+    clarify_low_confidence: 1,
+    human_review: 1,
+    result_interpretation: 2,
+    sandbox_execution: 3,
+  };
   const mainNodes = PIPELINE_NODES.filter(({ node }) => {
     const step = session.steps[node];
     if (!step || !(node in mainNodeTitles)) return false;
@@ -89,7 +101,7 @@ function ConversationTurn({
       return step.status === "interrupt";
     }
     return true;
-  });
+  }).sort((left, right) => (mainNodeOrder[left.node] ?? 10) - (mainNodeOrder[right.node] ?? 10));
   const detailNodes = PIPELINE_NODES.filter(
     ({ node }) => technicalNodes.has(node) && Boolean(session.steps[node]),
   );
@@ -183,14 +195,32 @@ function ConversationTurn({
   );
 }
 
-export default function ConversationThread({ sessions, renderStep }: Props) {
+const starterQuestions = [
+  "查询有逾期客户的基本信息",
+  "统计每个产品的贷款总金额和平均贷款金额",
+  "按累计贷款金额从高到低返回前 10 个客户",
+];
+
+export default function ConversationThread({ sessions, renderStep, databaseName, onSuggestion }: Props) {
   if (sessions.length === 0) {
     return (
       <div className="conversation-empty">
-        <div>
+        <div className="conversation-empty-content">
           <div className="empty-orb"><RobotOutlined /></div>
-          <Title level={3} style={{ marginBottom: 8 }}>今天想了解哪些数据？</Title>
-          <Text type="secondary">用自然语言提问，我会先说明理解，再返回结果。</Text>
+          <Title level={2} className="conversation-empty-title">向企业数据提问</Title>
+          <Text type="secondary" className="conversation-empty-description">描述你想了解的业务问题，我会理解需求、生成查询并总结结果。</Text>
+          <div className="conversation-scope-hint">
+            <DatabaseOutlined />
+            <span>当前数据源：{databaseName || "请选择可查询数据库"}</span>
+          </div>
+          <div className="starter-question-list">
+            {starterQuestions.map((question) => (
+              <Button key={question} className="starter-question" onClick={() => onSuggestion?.(question)}>
+                <BulbOutlined />
+                <span>{question}</span>
+              </Button>
+            ))}
+          </div>
         </div>
       </div>
     );

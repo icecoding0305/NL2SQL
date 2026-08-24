@@ -63,6 +63,51 @@ def test_fact_filter_plan_prompt_forbids_invented_metric(deps):
     assert "禁止使用 name" in prompt
 
 
+def test_order_spec_accepts_known_semantic_hints_but_rejects_unknown_shape(deps):
+    plan = QueryPlan(
+        target_tables=["loan"],
+        order_by=[{
+            "concept": "贷款总金额",
+            "table": "loan",
+            "column": "loan_amt",
+            "direction": "desc",
+            "source_output_id": "output_2",
+            "grounding_concept": "贷款金额",
+            "source_text": "贷款总金额",
+        }],
+    )
+    assert plan.order_by[0].concept == "贷款总金额"
+    assert plan.order_by[0].direction == "desc"
+
+    with pytest.raises(ValidationError):
+        QueryPlan(
+            target_tables=["loan"],
+            order_by=[{"concept": "贷款金额", "unexpected_filter": {"operator": ">"}}],
+        )
+
+
+def test_plan_prompt_documents_physical_order_by_shape(deps):
+    state = NL2SQLState(
+        **make_input("按贷款总金额从高到低返回前3个产品"),
+        retrieved_schema=[_schema(columns=("prd_code", "loan_amt"))],
+    )
+    prompt = build_plan_prompt(state, deps)
+    assert '"source_output_id":"output_2"' in prompt
+    assert "禁止复制 semantic_graph.order_by" in prompt
+
+
+def test_plan_prompt_contains_only_structural_few_shot(deps):
+    state = NL2SQLState(
+        **make_input("统计每个客户的贷款总额"),
+        retrieved_schema=[_schema(columns=("CUST_ID", "LOAN_AMT"))],
+    )
+    prompt = build_plan_prompt(state, deps)
+    assert "<FEW_SHOT_DATA" in prompt
+    assert "question_skeleton" in prompt
+    assert "sql_structure" in prompt
+    assert "SELECT SUM(LOAN_AMT)" not in prompt
+
+
 def test_prompts_do_not_expose_data_scope_as_row_filter(deps):
     state = NL2SQLState(
         **make_input("查询借据", data_scope=["risk_mart"]),

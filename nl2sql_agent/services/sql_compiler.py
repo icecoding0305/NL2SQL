@@ -6,6 +6,7 @@ import sqlglot
 from sqlglot import exp
 
 from nl2sql_agent.state import FilterSpec, JoinSpec, OutputFieldSpec, QueryPlan
+from nl2sql_agent.services.field_labels import safe_sql_alias
 
 
 class UnsupportedPlanError(ValueError):
@@ -44,7 +45,10 @@ def _projection(field: OutputFieldSpec, dialect: str) -> exp.Expression:
                 expression = aggregates[field.aggregation](this=expression)
     else:
         raise UnsupportedPlanError(f"输出字段 {field.concept!r} 缺少 column/expression")
-    return exp.alias_(expression, field.alias, quoted=False) if field.alias else expression
+    if not field.alias:
+        return expression
+    alias = safe_sql_alias(field.alias, fallback=field.concept or field.column or "字段")
+    return exp.alias_(expression, alias, quoted=True)
 
 
 def _literal(value):

@@ -2,14 +2,17 @@ from nl2sql_agent.services.projection_resolver import (
     _candidate_fields,
     _validated_decision,
     materialize_projection_decision,
+    resolve_vague_projection,
     vague_projection_request,
 )
 from nl2sql_agent.services.schema_catalog import TableDef
 from nl2sql_agent.services.schema_planner import build_schema_plan, rank_field_candidates
 from nl2sql_agent.state import (
     IntentSlot,
+    NL2SQLState,
     PlannedTable,
     ProjectionDecision,
+    ProjectionFieldExclusion,
     ProjectionFieldSelection,
     QueryIntent,
     SchemaPlan,
@@ -73,6 +76,65 @@ def test_primary_key_alone_cannot_satisfy_basic_information():
 
     assert decision.selected_fields == []
     assert "仅返回实体主键" in decision.excluded_fields[0].reason
+
+
+def test_projection_exclusion_reason_is_optional_display_metadata():
+    exclusion = ProjectionFieldExclusion.model_validate({
+        "business_label": "手机号码",
+    })
+
+    assert exclusion.reason == ""
+
+
+def test_basic_information_uses_schema_fallback_when_projection_model_fails(deps):
+    class BrokenStructuredModel:
+        def complete_structured(self, *args, **kwargs):
+            raise ValueError("invalid excluded_fields payload")
+
+    deps.node_llms["projection_resolution"] = BrokenStructuredModel()
+    state = NL2SQLState(
+        user_query="查询有逾期客户的基本信息",
+        user_id="test-user",
+        data_scope=["risk_mart"],
+    )
+    intent = QueryIntent(
+        query_type="fact_filter",
+        entities=[IntentSlot(text="客户", role="entity")],
+        attributes=[IntentSlot(text="基本信息", role="attribute")],
+    )
+    plan = SchemaPlan(
+        anchor_tables=[PlannedTable(
+            table_name="loan", role="entity", selected_columns=["OVD_BAL", "CUST_ID"],
+            reason="逾期条件", score=0.9,
+        )],
+        dimension_tables=[PlannedTable(
+            table_name="customer", role="entity", selected_columns=["CUST_ID"],
+            reason="客户实体", score=0.9,
+        )],
+    )
+    tables = [
+        TableDef("loan", "贷款信息", "risk_mart", [
+            {"name": "OVD_BAL", "type": "decimal", "comment": "逾期本金余额"},
+            {"name": "CUST_ID", "type": "varchar", "comment": "客户编号"},
+        ]),
+        TableDef("customer", "客户信息", "risk_mart", [
+            {"name": "CUST_ID", "type": "varchar", "comment": "客户编号", "primary_key": True},
+            {"name": "NAME", "type": "varchar", "comment": "姓名"},
+            {"name": "PHONE", "type": "varchar", "comment": "联系电话"},
+            {"name": "ADDRESS", "type": "varchar", "comment": "居住地址"},
+            {"name": "IDNUM", "type": "varchar", "comment": "证件号码", "sensitive": True},
+        ]),
+    ]
+
+    decision = resolve_vague_projection(state, deps, intent, plan, tables, [])
+
+    assert decision is not None
+    assert decision.missing_concepts == []
+    assert decision.confidence == 0.72
+    assert [item.column_name for item in decision.selected_fields] == [
+        "CUST_ID", "NAME", "PHONE", "ADDRESS",
+    ]
+    assert "IDNUM" not in {item.column_name for item in decision.selected_fields}
 
 
 def test_projection_decision_becomes_required_outputs_and_schema_columns():
@@ -180,3 +242,45 @@ def test_broad_semantic_output_keeps_original_topic_for_schema_resolution():
     )
 
     assert vague_projection_request(intent, graph) == "逾期情况"
+
+
+def test_single_direct_topic_field_skips_projection_llm(deps):
+    class MustNotCall:
+        def complete_structured(self, *args, **kwargs):
+            raise AssertionError("single direct topic field must not call the model")
+
+    deps.node_llms["projection_resolution"] = MustNotCall()
+    graph = SemanticGraph(
+        subjects=[SemanticSubject(id="customer", kind="entity", concept="客户")],
+        outputs=[SemanticOutput(
+            id="overdue", subject_id="customer", concept="逾期情况",
+            grounding_concept="逾期情况", source_text="逾期情况", broad=True,
+        )],
+        group_by=["客户"],
+        query_action="aggregate",
+    )
+    state = NL2SQLState(
+        user_query="统计每个客户的逾期情况",
+        user_id="test-user",
+        data_scope=["risk_mart"],
+        semantic_graph=graph,
+    )
+    intent = QueryIntent(
+        query_type="aggregation",
+        entities=[IntentSlot(text="客户", role="entity")],
+        attributes=[IntentSlot(text="逾期情况", role="attribute")],
+        dimensions=[IntentSlot(text="客户", role="dimension")],
+    )
+    plan = SchemaPlan(anchor_tables=[PlannedTable(
+        table_name="loan", role="primary_fact", selected_columns=["OVD_BAL"],
+        reason="逾期指标来源", score=0.9,
+    )])
+    tables = [TableDef("loan", "贷款表", "risk_mart", [
+        {"name": "OVD_BAL", "type": "decimal", "comment": "逾期本金余额"},
+        {"name": "LOAN_AMT", "type": "decimal", "comment": "贷款金额"},
+    ])]
+
+    decision = resolve_vague_projection(state, deps, intent, plan, tables, [])
+
+    assert [item.column_name for item in decision.selected_fields] == ["OVD_BAL"]
+    assert decision.selected_fields[0].aggregation == "sum"

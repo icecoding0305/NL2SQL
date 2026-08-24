@@ -12,10 +12,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from nl2sql_agent.state import NL2SQLState
+from nl2sql_agent.state import NL2SQLState, QueryCandidate
 from nl2sql_agent.services.prompt_context import compact_schema_facts, conversation_facts, effective_query, prompt_json, term_facts
 from nl2sql_agent.services.sql_dialect import dialect_tips
 from nl2sql_agent.services.sql_compiler import UnsupportedPlanError, compile_query_plan
+from nl2sql_agent.services.sql_candidate_selector import rank_sql_candidates
 
 
 def _retry_feedback(state: NL2SQLState, deps) -> str:
@@ -56,7 +57,11 @@ def build_prompt_from_plan(state: NL2SQLState, deps) -> str:
 
 
 def build_prompt_from_query(state: NL2SQLState, deps) -> str:
-    few_shots = deps.few_shot.retrieve(state.user_query)
+    few_shots = deps.few_shot.retrieve(
+        state.user_query,
+        dialect=deps.config.dialect,
+        available_tables={hit.table_name for hit in state.retrieved_schema},
+    )
     terms_label, terms = _term_view(state, deps)
     few_shot_block = prompt_json([
         {"user_query": ex.get("user_query"), "sql": ex.get("sql")}
@@ -77,14 +82,55 @@ def build_prompt_from_query(state: NL2SQLState, deps) -> str:
 
 def make_sql_generation_node(deps):
     def sql_generation_node(state: NL2SQLState) -> NL2SQLState | dict:
+        alternatives = sorted(
+            (
+                item for item in state.query_candidates
+                if item.stage == "sql"
+                and item.source == "model_sql_candidate"
+                and item.status == "generated"
+                and not item.selected
+                and item.sql
+            ),
+            key=lambda item: -(item.score or 0.0),
+        )
+        if state.retry_count > 0 and alternatives:
+            selected_id = alternatives[0].candidate_id
+            candidates = [
+                item.model_copy(update={"selected": item.candidate_id == selected_id})
+                for item in state.query_candidates
+            ]
+            selected = alternatives[0]
+            return {
+                "generated_sql": selected.sql,
+                "used_tables": list(selected.metadata.get("used_tables") or []),
+                "validation_errors": [],
+                "execution_error": None,
+                "sql_generation_source": "model",
+                "query_candidates": candidates,
+            }
         if state.query_plan is not None:
             try:
                 sql, used_tables = compile_query_plan(state.query_plan, deps.config.dialect)
+                candidates = [item.model_copy(update={"selected": False}) for item in state.query_candidates]
+                candidates.append(QueryCandidate(
+                    candidate_id=f"sql_{state.retry_count + 1}",
+                    stage="sql",
+                    source="deterministic_compiler",
+                    schema_profile=(state.query_mschema.profile if state.query_mschema else "precision"),
+                    status="compiled",
+                    query_plan=state.query_plan,
+                    logical_plan=state.logical_plan,
+                    sql=sql,
+                    score=state.query_plan.confidence,
+                    selected=True,
+                ))
                 return {
                     "generated_sql": sql,
                     "used_tables": used_tables,
                     "validation_errors": [],
                     "execution_error": None,
+                    "sql_generation_source": "deterministic",
+                    "query_candidates": candidates,
                 }
             except (UnsupportedPlanError, ValueError):
                 # Compatibility path for old/incomplete plans. It remains validated
@@ -96,13 +142,68 @@ def make_sql_generation_node(deps):
             prompt = build_prompt_from_query(state, deps)
         # SQL 专用模型(如有配置),否则回退主模型
         llm = deps.sql_llm or deps.llm
-        result = llm.complete_sql(prompt)  # 同时返回 sql 与 used_tables
+        candidate_policy = deps.config.clarification_rules.get(
+            "sql_candidate_refinement", {}
+        )
+        multi_candidate = bool(candidate_policy.get("enabled", True)) and state.retry_count == 0
+        candidate_count = (
+            max(1, min(3, int(candidate_policy.get("candidate_count", 2))))
+            if multi_candidate else 1
+        )
+        results = []
+        for index in range(candidate_count):
+            strategy = (
+                "\n\n候选策略：采用最保守、最直接且与 QueryPlan 一致的 SQL 结构。"
+                if index == 0 else
+                "\n\n候选策略：独立重新推导等价 SQL，重点检查 JOIN、聚合粒度和过滤条件，"
+                "不得改变 QueryPlan 业务语义。"
+            )
+            try:
+                results.append(llm.complete_sql(prompt + strategy))
+            except Exception:  # noqa: BLE001 - one failed candidate must not discard others
+                if not results and index == candidate_count - 1:
+                    raise
+        ranked = rank_sql_candidates(results, state, deps.config.dialect)
+        if not ranked:
+            raise ValueError("SQL 候选生成未返回可解析结果")
+        result = ranked[0][0]
+        candidates = [item.model_copy(update={"selected": False}) for item in state.query_candidates]
+        source = (
+            "model_sql_refiner" if state.retry_count > 0
+            else "model_sql_candidate" if len(ranked) > 1
+            else "model_sql_fallback"
+        )
+        base_index = sum(1 for item in candidates if item.stage == "sql") + 1
+        for index, (candidate_result, candidate_score, preliminary_errors) in enumerate(ranked):
+            candidates.append(QueryCandidate(
+                candidate_id=f"sql_{base_index + index}",
+                stage="sql",
+                source=source,
+                schema_profile=(
+                    state.query_mschema.profile if state.query_mschema else "precision"
+                ),
+                status="generated",
+                query_plan=state.query_plan,
+                logical_plan=state.logical_plan,
+                sql=candidate_result.sql,
+                validation_errors=preliminary_errors,
+                score=candidate_score,
+                selected=index == 0,
+                metadata={
+                    "selection_method": "deterministic_ast_score",
+                    "candidate_rank": index + 1,
+                    "refinement_round": state.retry_count,
+                    "used_tables": list(candidate_result.used_tables),
+                },
+            ))
         out: dict[str, Any] = {
             "generated_sql": result.sql,
             "used_tables": list(result.used_tables),
             # 重新生成后清空上一轮的校验错误
             "validation_errors": [],
             "execution_error": None,
+            "sql_generation_source": "model",
+            "query_candidates": candidates,
         }
         return out
 

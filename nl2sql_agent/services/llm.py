@@ -310,11 +310,15 @@ class DeepSeekLLMClient(BaseLLMClient):
         self.model = model
         self.request_config = request_config or {}
 
-    def _request_settings(self, max_tokens: int) -> tuple[int, dict]:
+    def _request_settings(self, max_tokens: int) -> tuple[int, dict, float | None]:
         node_cfg = (self.request_config.get("nodes") or {}).get(current_node() or "", {})
         effective_max = int(node_cfg.get("max_tokens", max_tokens))
         extra_body = dict(node_cfg.get("extra_body") or {})
-        return effective_max, extra_body
+        timeout_value = node_cfg.get(
+            "timeout_seconds", self.request_config.get("timeout_seconds")
+        )
+        timeout_seconds = float(timeout_value) if timeout_value is not None else None
+        return effective_max, extra_body, timeout_seconds
 
     @classmethod
     def from_env(cls) -> "DeepSeekLLMClient":
@@ -333,7 +337,7 @@ class DeepSeekLLMClient(BaseLLMClient):
 
     def complete(self, prompt: str, max_tokens: int = 2000) -> str:
         started_at = time.perf_counter()
-        effective_max_tokens, extra_body = self._request_settings(max_tokens)
+        effective_max_tokens, extra_body, timeout_seconds = self._request_settings(max_tokens)
         try:
             request_kwargs = {
                 "model": self.model,
@@ -342,6 +346,8 @@ class DeepSeekLLMClient(BaseLLMClient):
             }
             if extra_body:
                 request_kwargs["extra_body"] = extra_body
+            if timeout_seconds is not None:
+                request_kwargs["timeout"] = timeout_seconds
             resp = self.client.chat.completions.create(
                 **request_kwargs,
             )
@@ -426,12 +432,14 @@ class OpenAICompatibleLLMClient(DeepSeekLLMClient):
         if not self.supports_tool_calling:
             return None
         started_at = time.perf_counter()
+        effective_max_tokens = 2000
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=2000,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[{
+            effective_max_tokens, extra_body, timeout_seconds = self._request_settings(2000)
+            request_kwargs = {
+                "model": self.model,
+                "max_tokens": effective_max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": [{
                     "type": "function",
                     "function": {
                         "name": name,
@@ -439,7 +447,14 @@ class OpenAICompatibleLLMClient(DeepSeekLLMClient):
                         "parameters": schema,
                     },
                 }],
-                tool_choice={"type": "function", "function": {"name": name}},
+                "tool_choice": {"type": "function", "function": {"name": name}},
+            }
+            if extra_body:
+                request_kwargs["extra_body"] = extra_body
+            if timeout_seconds is not None:
+                request_kwargs["timeout"] = timeout_seconds
+            resp = self.client.chat.completions.create(
+                **request_kwargs,
             )
             message = resp.choices[0].message
             tool_calls = getattr(message, "tool_calls", None) or []
@@ -454,7 +469,7 @@ class OpenAICompatibleLLMClient(DeepSeekLLMClient):
                 operation="tool_call",
                 started_at=started_at,
                 prompt_chars=len(prompt),
-                max_tokens=2000,
+                max_tokens=effective_max_tokens,
                 output_chars=len(arguments) if isinstance(arguments, str) else 0,
                 prompt_tokens=usage_value(usage, "prompt_tokens", "input_tokens"),
                 completion_tokens=usage_value(usage, "completion_tokens", "output_tokens"),
@@ -469,7 +484,7 @@ class OpenAICompatibleLLMClient(DeepSeekLLMClient):
                 operation="tool_call",
                 started_at=started_at,
                 prompt_chars=len(prompt),
-                max_tokens=2000,
+                max_tokens=effective_max_tokens,
                 error=exc,
             )
             raise
@@ -504,7 +519,15 @@ def build_llm_from_config(config: dict) -> BaseLLMClient:
             base_url = "https://api.deepseek.com"
         if not base_url:
             raise EnvConfigError("OpenAI 兼容模型必须在 model_config.yaml 配置 base_url")
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        request_config = dict(config.get("request") or {})
+        client_kwargs = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "max_retries": int(request_config.get("sdk_max_retries", 0)),
+        }
+        if request_config.get("timeout_seconds") is not None:
+            client_kwargs["timeout"] = float(request_config["timeout_seconds"])
+        client = openai.OpenAI(**client_kwargs)
         if provider == "deepseek":
             return DeepSeekLLMClient(
                 client, model=model, request_config=config.get("request")

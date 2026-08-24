@@ -51,6 +51,7 @@ class AppConfig:
     sensitive_rules: dict = field(default_factory=dict)
     performance: dict = field(default_factory=dict)
     approval_enabled: bool = True
+    business_predicates: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -217,6 +218,7 @@ def build_deps(
     sql_llm: BaseLLMClient | None = None,
     executor: SQLExecutor | None = None,
     vector_store: VectorStoreAdapter | None = None,
+    knowledge_bundle: dict | None = None,
 ) -> Deps:
     load_env()  # 先加载 .env,再读取环境变量
     base_dir = base_dir or CONFIG_DIR
@@ -237,6 +239,11 @@ def build_deps(
         elif scheme.startswith("postgres"):
             configured_dialect = "postgres"
 
+    knowledge_bundle = knowledge_bundle or {}
+    predicate_config = loader.load("business_predicates.yaml") or {}
+    predicate_config.setdefault("business_predicates", {}).update(
+        knowledge_bundle.get("business_predicates") or {}
+    )
     config = AppConfig(
         dialect=configured_dialect,
         schema_search_top_k=int(settings.get("schema_search_top_k", 5)),
@@ -249,9 +256,10 @@ def build_deps(
         sensitive_rules=loader.load("sensitive_rules.yaml").get("sensitive_rules", {}),
         performance=settings.get("performance", {}),
         approval_enabled=bool(settings.get("approval", {}).get("enabled", True)),
+        business_predicates=predicate_config,
     )
 
-    term_mapping = TermMappingService(loader)
+    term_mapping = TermMappingService(loader, knowledge_bundle.get("terms"))
     catalog = SchemaCatalog(
         loader,
         m_schema_path=m_schema_path,
@@ -290,7 +298,7 @@ def build_deps(
         catalog=catalog,
         vector_store=vector_store,
         executor=executor,
-        few_shot=FewShotStore(loader),
+        few_shot=FewShotStore(loader, knowledge_bundle),
         sql=sql,
         prompts=PromptLoader(CONFIG_DIR / "prompts"),
     )

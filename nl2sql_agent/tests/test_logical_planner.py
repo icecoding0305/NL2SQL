@@ -1,11 +1,13 @@
 from nl2sql_agent.services.logical_planner import (
     build_logical_plan,
     build_query_mschema,
+    build_query_mschema_bundle,
     validate_logical_plan,
 )
 from nl2sql_agent.services.query_store import QueryStore
 from nl2sql_agent.state import (
     NL2SQLState,
+    FieldCandidate,
     QueryMSchema,
     QueryPlan,
     QuerySchemaRelation,
@@ -52,6 +54,43 @@ def test_query_mschema_keeps_only_planned_columns_and_relation_keys():
         "customer": {"CUST_ID", "NAME"},
         "loan": {"CUST_ID", "LOAN_AMT"},
     }
+
+
+def test_query_mschema_recall_adds_strong_field_alternative_without_adding_table():
+    state = _state(
+        retrieved_schema=[
+            SchemaHit(table_name="customer", columns=[
+                {"name": "CUST_ID", "type": "varchar", "primary_key": True},
+                {"name": "REG_ADDR", "type": "varchar", "comment": "户籍地址"},
+                {"name": "LIVE_ADDR", "type": "varchar", "comment": "居住地址"},
+            ]),
+            SchemaHit(table_name="unplanned", columns=[
+                {"name": "ADDR", "type": "varchar", "comment": "地址"},
+            ]),
+        ],
+        schema_plan=SchemaPlan(anchor_tables=[{
+            "table_name": "customer", "role": "entity", "selected_columns": ["REG_ADDR"],
+        }]),
+        field_candidates=[
+            FieldCandidate(
+                table_name="customer", column_name="LIVE_ADDR", query_slot="地址",
+                final_score=0.82,
+            ),
+            FieldCandidate(
+                table_name="unplanned", column_name="ADDR", query_slot="地址",
+                final_score=0.95,
+            ),
+        ],
+    )
+
+    precision, recall = build_query_mschema_bundle(state)
+    precision_columns = {column.name for column in precision.tables[0].columns}
+    recall_columns = {column.name for column in recall.tables[0].columns}
+    assert precision.profile == "precision"
+    assert recall.profile == "recall"
+    assert "LIVE_ADDR" not in precision_columns
+    assert "LIVE_ADDR" in recall_columns
+    assert {table.name for table in recall.tables} == {"customer"}
 
 
 def test_logical_plan_has_explicit_relational_pipeline_and_grain():
@@ -103,8 +142,14 @@ def test_query_store_persists_logical_plan_and_query_mschema(tmp_path):
         "trace-1",
         logical_plan={"root_operation_id": "project_1"},
         query_mschema={"tables": [{"name": "customer"}]},
+        query_mschema_precision={"profile": "precision"},
+        query_mschema_recall={"profile": "recall"},
+        query_candidates=[{"candidate_id": "sql_1", "status": "validated"}],
     )
 
     saved = store.get_query("trace-1")
     assert saved["logical_plan"]["root_operation_id"] == "project_1"
     assert saved["query_mschema"]["tables"][0]["name"] == "customer"
+    assert saved["query_mschema_precision"]["profile"] == "precision"
+    assert saved["query_mschema_recall"]["profile"] == "recall"
+    assert saved["query_candidates"][0]["candidate_id"] == "sql_1"

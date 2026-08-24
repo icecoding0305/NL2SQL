@@ -10,15 +10,19 @@ from __future__ import annotations
 
 from typing import Any
 
+from nl2sql_agent.services.deterministic_planner import build_deterministic_query_plan
 from nl2sql_agent.services.prompt_context import compact_schema_facts, conversation_facts, effective_query, prompt_json, term_facts
-from nl2sql_agent.services.logical_planner import build_logical_plan, build_query_mschema
+from nl2sql_agent.services.logical_planner import (
+    build_logical_plan,
+    build_query_mschema_bundle,
+)
 from nl2sql_agent.services.llm import (
     LLMOutputTruncatedError,
     LLMResponseError,
     classify_llm_error,
 )
 from nl2sql_agent.services.plan_normalizer import normalize_structural_coverage
-from nl2sql_agent.state import NL2SQLState, QueryPlan
+from nl2sql_agent.state import NL2SQLState, QueryCandidate, QueryPlan
 
 
 def build_plan_prompt(state: NL2SQLState, deps) -> str:
@@ -39,14 +43,19 @@ def build_plan_prompt(state: NL2SQLState, deps) -> str:
             errors=prompt_json(state.plan_validation_errors[-5:]),
         )
 
-    query_mschema = build_query_mschema(state)
+    precision_schema, recall_schema = build_query_mschema_bundle(state)
+    # First attempt stays narrow. A validation retry gets bounded alternatives,
+    # but never a full database schema or a disconnected table.
+    query_mschema = recall_schema if state.plan_validation_errors else precision_schema
     schema_view = compact_schema_facts(state, query_mschema)
+    few_shot_block = prompt_json(deps.few_shot.retrieve_patterns(effective_query(state)))
     return deps.prompts.render("plan_generation",
         user_query=prompt_json(effective_query(state)),
         schema_view=prompt_json(schema_view),
         terms_label=terms_label,
         terms=terms_json,
         retry_feedback=retry_feedback,
+        few_shot_block=few_shot_block,
         conversation_block=prompt_json(conversation_facts(state)),
     )
 
@@ -55,6 +64,50 @@ def make_plan_generation_node(deps):
     def plan_generation_node(state: NL2SQLState) -> NL2SQLState | dict:
         prompt = build_plan_prompt(state, deps)
         try:
+            deterministic_cfg = deps.config.clarification_rules.get("deterministic_plan", {})
+            deterministic_plan = (
+                build_deterministic_query_plan(
+                    state,
+                    min_confidence=float(deterministic_cfg.get("min_confidence", 0.78)),
+                )
+                if deterministic_cfg.get("enabled", True)
+                else None
+            )
+            if deterministic_plan is not None:
+                plan, normalizations = normalize_structural_coverage(
+                    deterministic_plan,
+                    state.semantic_graph,
+                    state.output_bindings,
+                    state.semantic_bindings,
+                )
+                precision_schema, recall_schema = build_query_mschema_bundle(state)
+                logical_plan = build_logical_plan(plan, state)
+                candidate = QueryCandidate(
+                    candidate_id=f"plan_{state.plan_retry_count + 1}",
+                    stage="plan",
+                    source="deterministic_compiler",
+                    schema_profile=precision_schema.profile,
+                    status="normalized",
+                    query_plan=plan,
+                    logical_plan=logical_plan,
+                    score=plan.confidence,
+                    selected=True,
+                    metadata={
+                        "normalizations": normalizations,
+                        "generation_mode": "deterministic_simple",
+                    },
+                )
+                return {
+                    "query_plan": plan,
+                    "query_mschema": precision_schema,
+                    "query_mschema_precision": precision_schema,
+                    "query_mschema_recall": recall_schema,
+                    "logical_plan": logical_plan,
+                    "query_candidates": [*state.query_candidates, candidate],
+                    "plan_normalizations": normalizations,
+                    "plan_validation_errors": [],
+                    "plan_generation_error_kind": None,
+                }
             # plan_generation 走节点级模型(配置里保持 deepseek-v4-pro 保质量,flash
             # 对嵌套 QueryPlan JSON 不稳定);内部重试 2→1,校验失败由模块 6 图级兜底。
             raw_plan = deps.llm_for("plan_generation").complete_structured(prompt, QueryPlan, retries=0)
@@ -64,12 +117,28 @@ def make_plan_generation_node(deps):
                 state.output_bindings,
                 state.semantic_bindings,
             )
-            query_mschema = build_query_mschema(state)
+            precision_schema, recall_schema = build_query_mschema_bundle(state)
+            query_mschema = recall_schema if state.plan_validation_errors else precision_schema
             logical_plan = build_logical_plan(plan, state)
+            candidate = QueryCandidate(
+                candidate_id=f"plan_{state.plan_retry_count + 1}",
+                stage="plan",
+                source="plan_model",
+                schema_profile=query_mschema.profile,
+                status="normalized",
+                query_plan=plan,
+                logical_plan=logical_plan,
+                score=plan.confidence,
+                selected=True,
+                metadata={"normalizations": normalizations},
+            )
             out: dict[str, Any] = {
                 "query_plan": plan,
                 "query_mschema": query_mschema,
+                "query_mschema_precision": precision_schema,
+                "query_mschema_recall": recall_schema,
                 "logical_plan": logical_plan,
+                "query_candidates": [*state.query_candidates, candidate],
                 "plan_normalizations": normalizations,
                 # 成功生成即清空历史校验错误,避免把上一轮的失败带到下一轮
                 "plan_validation_errors": [],

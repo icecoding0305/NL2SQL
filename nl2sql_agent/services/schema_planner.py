@@ -33,7 +33,7 @@ _COMPARISON_RE = re.compile(
 )
 _TEXT_FILTER_RE = re.compile(
     r"(?P<field>[\u4e00-\u9fffA-Za-z_]{1,16}?)(?P<word>等于|为|是)"
-    r"(?P<value>[\u4e00-\u9fffA-Za-z_]{1,16}?)(?:的|并且|且|$)"
+    r"\s*(?P<value>[\u4e00-\u9fffA-Za-z0-9_.-]{1,32}?)(?:的|并且|且|$)"
 )
 _MEASURE_RE = re.compile(
     r"[\u4e00-\u9fffA-Za-z_]{1,18}?(?:金额|余额|总额|数量|笔数|比率|率)"
@@ -307,6 +307,7 @@ def find_field_ambiguities(
     by_slot: dict[str, list[FieldCandidate]] = {}
     for candidate in candidates:
         by_slot.setdefault(candidate.query_slot, []).append(candidate)
+
     ambiguities: dict[str, list[FieldCandidate]] = {}
     for slot, options in by_slot.items():
         if (
@@ -329,6 +330,129 @@ def find_field_ambiguities(
     return ambiguities
 
 
+def resolve_anchor_table_ambiguities(
+    ambiguities: dict[str, list[FieldCandidate]],
+    schema_plan: SchemaPlan,
+) -> dict[str, list[FieldCandidate]]:
+    """Remove cross-table ambiguity already resolved by a strong fact anchor.
+
+    Repeated codes such as PRD_CODE commonly occur in several event tables. If
+    the query's other measures establish one primary fact table and that table
+    has one strong exact candidate for the slot, asking the user to choose a
+    physical table adds no business information.
+    """
+    primary_facts = {
+        item.table_name for item in schema_plan.anchor_tables
+        if item.role == "primary_fact"
+    }
+    if len(primary_facts) != 1:
+        return ambiguities
+    primary_fact = next(iter(primary_facts))
+    unresolved: dict[str, list[FieldCandidate]] = {}
+    for slot, options in ambiguities.items():
+        top = options[0] if options else None
+        same_table = [item for item in options if item.table_name == primary_fact]
+        context_resolved = bool(
+            top
+            and top.table_name == primary_fact
+            and top.final_score >= 0.75
+            and top.phrase_coverage >= 0.9
+            and len({item.column_name for item in same_table}) == 1
+        )
+        if not context_resolved:
+            unresolved[slot] = options
+    return unresolved
+
+
+def prefer_primary_fact_fields(
+    candidates: list[FieldCandidate],
+    plan: SchemaPlan | None,
+    *,
+    bonus: float = 0.25,
+) -> list[FieldCandidate]:
+    """Rerank duplicate business fields toward the selected primary fact.
+
+    This resolves physical placement (for example several ``产品编码`` columns)
+    internally after the measure anchor is known; it does not decide between
+    genuinely different business definitions.
+    """
+    if plan is None:
+        return candidates
+    primary = next((
+        item.table_name for item in plan.anchor_tables if item.role == "primary_fact"
+    ), None)
+    if not primary:
+        return candidates
+    reranked = [
+        item.model_copy(update={
+            "final_score": min(1.0, item.final_score + bonus),
+            "evidence": list(dict.fromkeys([
+                *item.evidence, "字段位于已确定的主事实表",
+            ])),
+        }) if item.table_name == primary and item.phrase_coverage >= 0.75 and item.semantic_role in {
+            "attribute", "dimension", "entity",
+        } else item
+        for item in candidates
+    ]
+    return sorted(reranked, key=lambda item: -item.final_score)
+
+
+def prefer_minimal_table_cover(
+    candidates: list[FieldCandidate],
+    intent: QueryIntent,
+    *,
+    max_bonus: float = 0.18,
+) -> list[FieldCandidate]:
+    """Prefer a coherent table that covers more requested query slots.
+
+    Column-level relevance can otherwise select a different physical table for
+    every field even when one slightly lower-scoring detail table contains all
+    requested fields. This bounded set-cover tie-breaker changes only ordering;
+    it does not inflate semantic confidence or invent relations.
+    """
+    slots = list(dict.fromkeys(
+        item.text
+        for item in [*intent.measures, *intent.filters, *intent.attributes, *intent.dimensions]
+        if item.text and not is_generic_projection(item.text)
+    ))
+    if len(slots) < 2:
+        return candidates
+
+    requested = set(slots)
+    covered_by_table: dict[str, set[str]] = {}
+    for item in candidates:
+        if (
+            item.query_slot in requested
+            and item.final_score >= 0.65
+            and item.phrase_coverage >= 0.75
+        ):
+            covered_by_table.setdefault(item.table_name, set()).add(item.query_slot)
+
+    slot_count = len(requested)
+
+    def coherence_bonus(item: FieldCandidate) -> float:
+        coverage = len(covered_by_table.get(item.table_name, set())) / slot_count
+        return max_bonus * coverage * coverage
+
+    reranked = sorted(
+        candidates,
+        key=lambda item: (
+            -(item.final_score + coherence_bonus(item)),
+            item.table_name,
+            item.column_name,
+        ),
+    )
+    return [
+        item.model_copy(update={
+            "evidence": list(dict.fromkeys([
+                *item.evidence,
+                "字段所在表可同时覆盖更多查询要求",
+            ])),
+        }) if len(covered_by_table.get(item.table_name, set())) > 1 else item
+        for item in reranked
+    ]
+
+
 def ground_output_bindings(
     graph: SemanticGraph | None,
     candidates: list[FieldCandidate],
@@ -342,6 +466,27 @@ def ground_output_bindings(
     by_slot: dict[str, list[FieldCandidate]] = {}
     for candidate in candidates:
         by_slot.setdefault(candidate.query_slot, []).append(candidate)
+
+    # Grouping dimensions should normally live with the measures they group.
+    # Infer the dominant fact table from high-confidence aggregate outputs so
+    # duplicate dimension names in unrelated event tables do not win merely
+    # because another column happens to be a primary key.
+    fact_table_votes: dict[str, int] = {}
+    for output in graph.outputs:
+        if not output.required or not output.aggregation or output.aggregation == "count_distinct":
+            continue
+        concept = output.grounding_concept or output.concept
+        metric_options = by_slot.get(concept, [])
+        if not metric_options:
+            continue
+        selected_metric = max(metric_options, key=lambda item: item.final_score)
+        fact_table_votes[selected_metric.table_name] = (
+            fact_table_votes.get(selected_metric.table_name, 0) + 1
+        )
+    preferred_fact_tables = {
+        table for table, votes in fact_table_votes.items()
+        if votes == max(fact_table_votes.values(), default=0)
+    }
 
     bindings: dict[str, dict] = {}
     for output in graph.outputs:
@@ -415,9 +560,22 @@ def ground_output_bindings(
                 for table in tables
                 for column in table.columns
             }
+            # First remove weak semantic matches.  Only then may identifier
+            # quality break ties; otherwise an unrelated PK can displace a
+            # strong category key such as PRD_CODE for “每个产品”.
+            top_semantic_score = max((item.final_score for item in options), default=0.0)
+            semantic_floor = max(0.42, top_semantic_score * 0.85)
+            relevant_options = [
+                item for item in options
+                if item.final_score >= semantic_floor
+                and item.phrase_coverage >= 0.65
+            ]
+            if relevant_options:
+                options = relevant_options
             options = sorted(
                 options,
                 key=lambda item: (
+                    item.table_name in preferred_fact_tables,
                     bool(column_meta.get((item.table_name, item.column_name), {}).get("primary_key")),
                     bool(column_meta.get((item.table_name, item.column_name), {}).get("unique")),
                     not bool(column_meta.get((item.table_name, item.column_name), {}).get("nullable", True)),
@@ -550,6 +708,21 @@ def build_schema_plan(
     for candidate in candidates:
         by_slot.setdefault(candidate.query_slot, []).append(candidate)
 
+    dimension_slots = {item.text for item in intent.dimensions}
+    attribute_slots = {item.text for item in intent.attributes}
+    fact_slots = {item.text for item in [*intent.measures, *intent.filters]}
+    # If every factual measure/filter points to the same table, that table is
+    # the established row grain. Prefer an equally strong grouping/output key
+    # on it instead of adding a second event table solely for a duplicated code.
+    fact_context_tables = {
+        by_slot[slot][0].table_name
+        for slot in fact_slots
+        if by_slot.get(slot) and by_slot[slot][0].final_score >= 0.65
+    }
+    fact_context_table = (
+        next(iter(fact_context_tables)) if len(fact_context_tables) == 1 else None
+    )
+
     selected: list[FieldCandidate] = []
     unresolved: list[str] = []
     ordered_slots = list(dict.fromkeys(
@@ -562,6 +735,16 @@ def build_schema_plan(
         override = overrides.get(slot)
         if override:
             options = [item for item in options if f"{item.table_name}.{item.column_name}" == override]
+        elif fact_context_table and slot in dimension_slots | attribute_slots and options:
+            semantic_floor = max(0.65, options[0].final_score * 0.85)
+            contextual = [
+                item for item in options
+                if item.table_name == fact_context_table
+                and item.final_score >= semantic_floor
+                and item.phrase_coverage >= 0.65
+            ]
+            if contextual:
+                options = [max(contextual, key=lambda item: item.final_score)]
         if not options or options[0].final_score < 0.42:
             unresolved.append(slot)
             continue
@@ -572,9 +755,6 @@ def build_schema_plan(
     table_by_name = {table.name: table for table in tables}
     anchors: dict[str, PlannedTable] = {}
     dimensions: dict[str, PlannedTable] = {}
-    dimension_slots = {item.text for item in intent.dimensions}
-    attribute_slots = {item.text for item in intent.attributes}
-    fact_slots = {item.text for item in [*intent.measures, *intent.filters]}
     for candidate in selected:
         # 同一字段可同时出现在 WHERE 与 SELECT 中；筛选/度量的事实角色
         # 优先，不能因为它也是返回属性就把事实锚点降级为维表。

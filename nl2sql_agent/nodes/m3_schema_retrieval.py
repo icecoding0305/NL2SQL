@@ -26,7 +26,10 @@ from nl2sql_agent.services.schema_planner import (
     ground_output_bindings,
     parse_query_intent,
     plan_table_names,
+    prefer_minimal_table_cover,
+    prefer_primary_fact_fields,
     rank_field_candidates,
+    resolve_anchor_table_ambiguities,
 )
 from nl2sql_agent.services.projection_resolver import (
     materialize_projection_decision,
@@ -113,6 +116,32 @@ def _business_clarification(deps, scope, field_ambiguities):
         question=f"“{slot}”存在多种业务口径，请确认您需要哪一种",
         options=options,
     ), bindings
+
+
+def _retain_true_business_ambiguities(deps, scope, field_ambiguities):
+    """Drop choices whose public business labels are identical.
+
+    Identical labels represent physical placement ambiguity, which must be
+    resolved by anchor/relationship planning rather than delegated to users.
+    """
+    if not field_ambiguities:
+        return {}
+    table_map = {table.name: table for table in deps.catalog.tables_for_scope(scope)}
+    retained = {}
+    for slot, candidates in field_ambiguities.items():
+        labels: set[str] = set()
+        for candidate in candidates:
+            table = table_map.get(candidate.table_name)
+            column = next((
+                item for item in (table.columns if table is not None else [])
+                if item.get("name") == candidate.column_name
+            ), None)
+            label = re.sub(r"\s+", "", str((column or {}).get("comment") or ""))
+            if label:
+                labels.add(label)
+        if len(labels) > 1:
+            retained[slot] = candidates
+    return retained
 
 
 def _enrich_decision_summary(
@@ -207,7 +236,9 @@ def _runtime_value_lookup(deps):
     return lookup
 
 
-def _ground_semantic_atoms(state, candidates, tables, deps=None):
+def _ground_semantic_atoms(
+    state, candidates, tables, deps=None, allowed_tables: set[str] | None = None,
+):
     """将语义原子绑定到已评分物理字段，形成可确定性校验的 Grounding 证据。"""
     bindings: dict[str, dict] = {}
     if state.semantic_graph is None:
@@ -217,6 +248,8 @@ def _ground_semantic_atoms(state, candidates, tables, deps=None):
             continue
         slot = atom.grounding_concept or atom.concept
         options = [item for item in candidates if item.query_slot == slot]
+        if allowed_tables:
+            options = [item for item in options if item.table_name in allowed_tables]
         override = state.selected_field_overrides.get(slot)
         if override:
             options = [
@@ -567,6 +600,9 @@ def make_schema_retrieval_node(deps):
                 field_candidates = rank_field_candidates(
                     query_intent, visible_tables, score_by_table
                 )
+                field_candidates = prefer_minimal_table_cover(
+                    field_candidates, query_intent
+                )
                 field_ambiguities = find_field_ambiguities(
                     field_candidates, state.selected_field_overrides
                 )
@@ -613,6 +649,31 @@ def make_schema_retrieval_node(deps):
                     overrides=state.selected_field_overrides,
                     max_hops=max_hops,
                 )
+                reranked_candidates = prefer_primary_fact_fields(
+                    field_candidates, schema_plan
+                )
+                reranked_candidates = prefer_minimal_table_cover(
+                    reranked_candidates, query_intent
+                )
+                if reranked_candidates != field_candidates:
+                    field_candidates = reranked_candidates
+                    field_ambiguities = find_field_ambiguities(
+                        field_candidates, state.selected_field_overrides
+                    )
+                    schema_plan = build_schema_plan(
+                        query_intent,
+                        visible_tables,
+                        field_candidates,
+                        relations,
+                        overrides=state.selected_field_overrides,
+                        max_hops=max_hops,
+                    )
+                field_ambiguities = resolve_anchor_table_ambiguities(
+                    field_ambiguities, schema_plan
+                )
+                field_ambiguities = _retain_true_business_ambiguities(
+                    deps, scope, field_ambiguities
+                )
                 for ambiguous_slot in field_ambiguities:
                     marker = f"字段口径:{ambiguous_slot}"
                     if marker not in schema_plan.unresolved_slots:
@@ -658,7 +719,11 @@ def make_schema_retrieval_node(deps):
                         deps, scope, field_ambiguities
                     )
                     semantic_bindings = _ground_semantic_atoms(
-                        state, field_candidates, visible_tables, deps
+                        state,
+                        field_candidates,
+                        visible_tables,
+                        deps,
+                        allowed_tables=set(planned_names),
                     )
                     unsupported_outputs = [
                         *_unsupported_output_concepts(effective_graph, output_bindings),

@@ -3,12 +3,14 @@ import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Empty,
   Form,
   Input,
   Modal,
   Popconfirm,
   Select,
+  Segmented,
   Space,
   Switch,
   Tag,
@@ -22,6 +24,8 @@ import {
   PlusOutlined,
   ReloadOutlined,
   SwapRightOutlined,
+  CheckOutlined,
+  CloseOutlined,
 } from "@ant-design/icons";
 import { apiDelete, apiGet, apiPost, apiPut } from "../api";
 import type {
@@ -34,7 +38,8 @@ const { Text, Title } = Typography;
 
 type RelationForm = Omit<
   DatabaseRelation,
-  "id" | "database_id" | "created_at" | "updated_at"
+  "id" | "database_id" | "created_at" | "updated_at" | "status" | "source"
+  | "confidence" | "evidence" | "validation_summary"
 >;
 
 const cardinalityLabels: Record<DatabaseRelation["cardinality"], string> = {
@@ -45,6 +50,8 @@ const cardinalityLabels: Record<DatabaseRelation["cardinality"], string> = {
   unknown: "未知",
 };
 
+type RelationView = "configured" | "pending" | "rejected";
+
 export default function RelationsPage() {
   const [databases, setDatabases] = useState<DatabaseConfig[]>([]);
   const [databaseId, setDatabaseId] = useState<string>();
@@ -54,6 +61,11 @@ export default function RelationsPage() {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
+  const [batching, setBatching] = useState(false);
+  const [relationView, setRelationView] = useState<RelationView>("configured");
+  const [selectedCandidateIds, setSelectedCandidateIds] = useState<string[]>([]);
+  const [focusedRelationId, setFocusedRelationId] = useState<string>();
   const [form] = Form.useForm<RelationForm>();
   const sourceTable = Form.useWatch("source_table", form);
   const targetTable = Form.useWatch("target_table", form);
@@ -90,7 +102,34 @@ export default function RelationsPage() {
     }
   };
 
-  useEffect(() => { load(databaseId); }, [databaseId]);
+  useEffect(() => {
+    setRelationView("configured");
+    setSelectedCandidateIds([]);
+    load(databaseId);
+  }, [databaseId]);
+
+  const configuredRelations = useMemo(() => relations.filter(
+    (item) => item.status === "verified" || item.status === "confirmed",
+  ), [relations]);
+  const pendingRelations = useMemo(() => relations.filter(
+    (item) => item.status === "candidate" || item.status === "inferred",
+  ), [relations]);
+  const rejectedRelations = useMemo(() => relations.filter(
+    (item) => item.status === "rejected",
+  ), [relations]);
+  const visibleRelations = relationView === "configured"
+    ? configuredRelations
+    : relationView === "pending" ? pendingRelations : rejectedRelations;
+
+  useEffect(() => {
+    if (!visibleRelations.length) {
+      setFocusedRelationId(undefined);
+      return;
+    }
+    if (!visibleRelations.some((item) => item.id === focusedRelationId)) {
+      setFocusedRelationId(visibleRelations[0].id);
+    }
+  }, [focusedRelationId, visibleRelations]);
 
   const tableOptions = useMemo(() => tables.map((table) => ({
     value: table.table_name,
@@ -178,6 +217,67 @@ export default function RelationsPage() {
     }
   };
 
+  const decideCandidate = async (item: DatabaseRelation, status: "verified" | "rejected") => {
+    if (!databaseId) return;
+    try {
+      await apiPut(`/api/databases/${databaseId}/relations/${item.id}`, { status });
+      message.success(status === "verified" ? "候选关系已确认并生效" : "候选关系已拒绝");
+      setRelations((current) => current.map((relation) => relation.id === item.id
+        ? { ...relation, status, enabled: status === "verified" }
+        : relation));
+      setSelectedCandidateIds((current) => current.filter((id) => id !== item.id));
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "候选关系处理失败");
+    }
+  };
+
+  const decideSelectedCandidates = async (status: "verified" | "rejected") => {
+    if (!databaseId || selectedCandidateIds.length === 0) return;
+    setBatching(true);
+    try {
+      const result = await apiPost<{ updated_ids: string[]; updated: number }>(
+        `/api/databases/${databaseId}/relations/batch-decision`,
+        { relation_ids: selectedCandidateIds, status },
+      );
+      const updatedIds = new Set(result.updated_ids);
+      setRelations((current) => current.map((relation) => updatedIds.has(relation.id)
+        ? { ...relation, status, enabled: status === "verified" }
+        : relation));
+      setSelectedCandidateIds([]);
+      message.success(
+        status === "verified"
+          ? `已批量确认 ${result.updated} 条关系`
+          : `已批量拒绝 ${result.updated} 条关系`,
+      );
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "批量处理失败");
+    } finally {
+      setBatching(false);
+    }
+  };
+
+  const toggleCandidate = (id: string, checked: boolean) => {
+    setSelectedCandidateIds((current) => checked
+      ? Array.from(new Set([...current, id]))
+      : current.filter((item) => item !== id));
+  };
+
+  const discoverRelations = async () => {
+    if (!databaseId) return;
+    setDiscovering(true);
+    try {
+      const result = await apiPost<{ discovered: number; message: string }>(
+        `/api/databases/${databaseId}/relations/discover`,
+      );
+      message.success(result.message || `发现 ${result.discovered} 条待确认关系`);
+      await load(databaseId);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "关系发现失败");
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
   return (
     <div className="management-page relation-page">
       <div className="management-page-header">
@@ -189,6 +289,14 @@ export default function RelationsPage() {
           <Text type="secondary">维护数据库中未声明外键、但业务上可以确认的 JOIN 关系。</Text>
         </div>
         <Space wrap>
+          <Button
+            icon={<ApartmentOutlined />}
+            onClick={() => void discoverRelations()}
+            loading={discovering}
+            disabled={!databaseId}
+          >
+            主动发现关系
+          </Button>
           <Select
             value={databaseId}
             style={{ width: 260 }}
@@ -208,25 +316,122 @@ export default function RelationsPage() {
       <Alert
         showIcon
         type="info"
-        message="这里只配置已经确认的业务关系"
-        description="保存后，Schema 检索、最短关联路径、查询计划和 JOIN 校验会立即使用该关系。请不要仅因为字段同名就建立关系。"
+        message="请在修正表和字段注释后，主动发现候选关系"
+        description="Schema 同步不再自动推断关系。点击“主动发现关系”会使用当前 M-Schema、最新注释覆盖、键、索引和安全样本重新生成待确认候选；已确认和已拒绝的关系会保留。"
         className="management-alert"
       />
 
+      <Card className="relation-view-toolbar" size="small">
+        <div className="relation-view-toolbar-row">
+          <Segmented<RelationView>
+            value={relationView}
+            onChange={(value) => {
+              setRelationView(value);
+              setSelectedCandidateIds([]);
+            }}
+            options={[
+              { value: "configured", label: `已配置 ${configuredRelations.length}` },
+              { value: "pending", label: `待审批 ${pendingRelations.length}` },
+              { value: "rejected", label: `已拒绝 ${rejectedRelations.length}` },
+            ]}
+          />
+          {relationView === "pending" && pendingRelations.length > 0 && (
+            <Space wrap>
+              <Checkbox
+                checked={selectedCandidateIds.length === pendingRelations.length}
+                indeterminate={selectedCandidateIds.length > 0 && selectedCandidateIds.length < pendingRelations.length}
+                onChange={(event) => setSelectedCandidateIds(
+                  event.target.checked ? pendingRelations.map((item) => item.id) : [],
+                )}
+              >
+                全选
+              </Checkbox>
+              <Text type="secondary">已选择 {selectedCandidateIds.length} 条</Text>
+              <Button
+                type="primary"
+                icon={<CheckOutlined />}
+                loading={batching}
+                disabled={selectedCandidateIds.length === 0}
+                onClick={() => void decideSelectedCandidates("verified")}
+              >
+                批量确认
+              </Button>
+              <Popconfirm
+                title={`拒绝选中的 ${selectedCandidateIds.length} 条候选关系？`}
+                onConfirm={() => void decideSelectedCandidates("rejected")}
+                disabled={selectedCandidateIds.length === 0}
+              >
+                <Button
+                  icon={<CloseOutlined />}
+                  loading={batching}
+                  disabled={selectedCandidateIds.length === 0}
+                >
+                  批量拒绝
+                </Button>
+              </Popconfirm>
+            </Space>
+          )}
+        </div>
+      </Card>
+
       {loading ? (
         <Card className="management-card relation-loading"><Text type="secondary">正在加载表关系…</Text></Card>
-      ) : relations.length === 0 ? (
-        <Card className="management-card"><Empty description="还没有配置表关系" /></Card>
+      ) : visibleRelations.length === 0 ? (
+        <Card className="management-card"><Empty description={
+          relationView === "configured" ? "当前数据库还没有已配置关系"
+            : relationView === "pending" ? "没有待审批候选关系" : "没有已拒绝关系"
+        } /></Card>
       ) : (
-        <div className="relation-list">
-          {relations.map((item) => (
-            <Card className={`relation-card ${item.enabled ? "" : "disabled"}`} key={item.id}>
+        <div className="relation-workspace">
+          <aside className="relation-index" aria-label="关系列表">
+            <div className="relation-index-heading">
+              <Text strong>关系列表</Text>
+              <Text type="secondary">{visibleRelations.length} 条</Text>
+            </div>
+            <div className="relation-index-items">
+              {visibleRelations.map((item) => (
+                <button
+                  type="button"
+                  key={item.id}
+                  className={`relation-index-item ${item.id === focusedRelationId ? "active" : ""}`}
+                  onClick={() => setFocusedRelationId(item.id)}
+                >
+                  <span className="relation-index-tables">
+                    <strong>{item.source_table}</strong>
+                    <SwapRightOutlined />
+                    <strong>{item.target_table}</strong>
+                  </span>
+                  <span className="relation-index-meta">{cardinalityLabels[item.cardinality]} · {item.preferred_join_type.toUpperCase()} JOIN</span>
+                </button>
+              ))}
+            </div>
+          </aside>
+        <div className="relation-list relation-detail-list">
+          {visibleRelations.map((item) => (
+            <Card className={`relation-card ${item.id === focusedRelationId ? "selected" : ""} ${item.enabled ? "" : "disabled"} ${item.status === "candidate" || item.status === "inferred" ? "candidate" : ""}`} key={item.id}>
               <div className="relation-card-header">
                 <Space wrap>
-                  <Tag color={item.enabled ? "success" : "default"}>{item.enabled ? "已启用" : "已停用"}</Tag>
+                  {(item.status === "candidate" || item.status === "inferred") && (
+                    <Checkbox
+                      checked={selectedCandidateIds.includes(item.id)}
+                      onChange={(event) => toggleCandidate(item.id, event.target.checked)}
+                    />
+                  )}
+                  <Tag color={item.status === "verified" || item.status === "confirmed" ? "success" : item.status === "rejected" ? "default" : "gold"}>
+                    {item.status === "verified" || item.status === "confirmed" ? "已确认" : item.status === "rejected" ? "已拒绝" : "待确认候选"}
+                  </Tag>
+                  {(item.status === "candidate" || item.status === "inferred") && (
+                    <Tag color="blue">置信度 {Math.round((item.confidence || 0) * 100)}%</Tag>
+                  )}
                   <Text type="secondary">{item.description || "人工确认的业务关系"}</Text>
                 </Space>
                 <Space>
+                  {(item.status === "candidate" || item.status === "inferred") && (
+                    <>
+                      <Button type="primary" ghost icon={<CheckOutlined />} onClick={() => decideCandidate(item, "verified")}>确认使用</Button>
+                      <Button type="text" icon={<CloseOutlined />} onClick={() => decideCandidate(item, "rejected")}>拒绝</Button>
+                    </>
+                  )}
                   <Button type="text" icon={<EditOutlined />} onClick={() => showEdit(item)}>编辑</Button>
                   <Popconfirm title="删除这条表关系？" description="删除后，新的查询计划将不再使用该关系。" onConfirm={() => remove(item.id)}>
                     <Button type="text" danger icon={<DeleteOutlined />}>删除</Button>
@@ -260,8 +465,17 @@ export default function RelationsPage() {
                   ))}
                 </div>
               </div>
+              {item.evidence?.length > 0 && (
+                <div className="relation-evidence">
+                  <Text type="secondary">发现依据</Text>
+                  <Space size={[6, 6]} wrap>
+                    {item.evidence.map((evidence) => <Tag key={evidence}>{evidence}</Tag>)}
+                  </Space>
+                </div>
+              )}
             </Card>
           ))}
+        </div>
         </div>
       )}
 

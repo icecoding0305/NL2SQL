@@ -559,6 +559,27 @@ def test_query_resolution_does_not_let_empty_model_fields_erase_explicit_outputs
     assert [item.concept for item in out["semantic_graph"].outputs] == ["客户姓名", "地址"]
 
 
+def test_query_resolution_retries_invalid_structured_output_and_keeps_fallback_metrics(deps):
+    from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
+
+    query = "统计每个客户累计贷款金额、累计代偿本金和累计代偿总额"
+
+    class InvalidResolutionLLM:
+        def complete_structured(self, prompt, model, retries=0):
+            assert retries == 1
+            raise ValueError("rewritten_query must be a string")
+
+    deps.config.clarification_rules.setdefault("query_resolution", {})["use_llm"] = True
+    deps.node_llms["query_resolution"] = InvalidResolutionLLM()
+    out = make_query_resolution_node(deps)(NL2SQLState(**make_input(query)))
+
+    outputs = {item.concept: item for item in out["semantic_graph"].outputs}
+    assert outputs["累计贷款金额"].aggregation == "sum"
+    assert outputs["累计代偿本金"].aggregation == "sum"
+    assert outputs["累计代偿总额"].aggregation == "sum"
+    assert out["semantic_coverage"]["uncovered_mentions"] == []
+
+
 def test_broad_topic_defers_model_metric_scope_question_to_schema(deps):
     from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
     from nl2sql_agent.state import ResolvedQuery
@@ -584,6 +605,25 @@ def test_broad_topic_defers_model_metric_scope_question_to_schema(deps):
     assert out["need_clarification"] is False
     assert out["resolved_query"].unresolved_business_slots == []
     assert any(item.broad for item in out["semantic_graph"].outputs)
+
+
+def test_high_confidence_broad_topic_uses_schema_stage_without_resolution_llm(deps):
+    from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
+
+    class MustNotCall:
+        def complete_structured(self, *args, **kwargs):
+            raise AssertionError("high-confidence broad topic should skip resolution LLM")
+
+    deps.config.clarification_rules.setdefault("query_resolution", {})["use_llm"] = "auto"
+    deps.node_llms["query_resolution"] = MustNotCall()
+
+    out = make_query_resolution_node(deps)(NL2SQLState(**make_input(
+        "统计户籍地址为上海的客户的逾期情况"
+    )))
+
+    assert out["need_clarification"] is False
+    assert any(item.broad for item in out["semantic_graph"].outputs)
+    assert out["semantic_coverage"]["uncovered_mentions"] == []
 
 
 def test_semantic_graph_preserves_comparison_and_overdue_existence(deps):

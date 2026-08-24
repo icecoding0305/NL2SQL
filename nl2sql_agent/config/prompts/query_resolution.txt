@@ -12,7 +12,9 @@
 - 可以消除口语、省略和会话中的明确指代
 - 不得擅自补充指标口径、统计粒度或时间范围
 - 会改变结果且无法确定的信息写入 unresolved_business_slots
+- 物理字段选择、候选指标选择、表名和 JOIN 关系属于后续 Schema 阶段，不得写入 unresolved_business_slots
 - assumptions 只记录可审计假设，不输出内部推理过程
+- assumptions 的每一项必须是对象：{{"content":"假设内容","source":"user|conversation|configured_default|system_inference","materiality":"low|medium|high"}}，不得输出字符串，也不得使用 assumption、text 等其它键
 - semantic_graph 必须保存比较、状态、存在、否定和 AND/OR 结构；每个高影响条件必须有唯一 atom_id
 - 用户明确要求返回、展示、列出或查询的每个业务字段，都必须分别写入 semantic_graph.outputs，不能用“客户信息”等笼统概念替代用户明确列出的“姓名、地址”等字段
 - 每个 output 必须具有唯一 id、subject_id、concept、grounding_concept、source_text、source_span、required=true 和 confidence；不得把筛选字段误作返回字段
@@ -24,3 +26,6 @@
 - 同一个基础概念可以形成多个独立输出，例如贷款总金额和平均贷款金额都以“贷款金额”为 grounding_concept，但 aggregation 分别为 sum 和 avg
 - 本阶段禁止接收或请求任何数据库 Schema；只能根据用户问题和会话上文理解业务语义
 - 输出必须符合调用方给定的 JSON Schema
+
+关键嵌套结构示例（仅说明字段形状，不代表需要补充这些内容）：
+{{"filters":[{{"subject":"户籍地址","operator":"=","value":"上海"}}],"assumptions":[{{"content":"未指定时间范围，按全量数据处理","source":"system_inference","materiality":"low"}}],"unresolved_business_slots":[],"semantic_graph":{{"subjects":[{{"id":"subject_1","kind":"entity","concept":"客户"}}],"outputs":[{{"id":"output_1","subject_id":"subject_1","concept":"逾期情况","grounding_concept":"逾期情况","source_text":"逾期情况","source_span":[13,17],"required":true,"confidence":0.9,"aggregation":null,"distinct_grain":null,"broad":true}}],"group_by":["客户"],"order_by":[],"limit":null,"query_action":"aggregate","predicate":null,"capabilities":["aggregation"],"assumptions":[],"unresolved_slots":[],"confidence":0.9}}}}

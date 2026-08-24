@@ -61,3 +61,34 @@ def test_aggregate_falls_back_to_factual_structured_summary(deps):
     assert summary.status == "success"
     assert any("逾期客户数为 12" in item for item in summary.key_findings)
     assert summary.row_count == 1
+
+
+def test_grouped_multirow_result_does_not_wait_for_llm(deps):
+    class MustNotCall:
+        def complete_structured(self, *args, **kwargs):
+            raise AssertionError("grouped multi-row summary must be deterministic")
+
+    deps.llm = MustNotCall()
+    plan = QueryPlan(
+        target_tables=["loan"],
+        output_fields=[
+            {"concept": "客户", "table": "loan", "column": "CUST_ID"},
+            {
+                "concept": "逾期本金余额", "table": "loan", "column": "OVD_BAL",
+                "aggregation": "sum",
+            },
+        ],
+        group_by=["loan.CUST_ID"],
+        output_grain={
+            "level": "aggregate", "entity": "客户",
+            "keys": ["loan.CUST_ID"],
+        },
+    )
+
+    out = make_result_interpretation_node(deps)(_state([
+        {"客户": "C1", "逾期本金余额": 100},
+        {"客户": "C2", "逾期本金余额": 200},
+    ], plan))
+
+    assert out["result_summary"].row_count == 2
+    assert "2 行" in out["final_answer"]

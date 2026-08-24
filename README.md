@@ -1,229 +1,262 @@
-# NL2SQL 智能体(LangGraph)
+# NL2SQL 智能体
 
-面向企业内部数据分析场景(多系统、字段量大、对生成准确性和权限安全要求较高)的
-自然语言 → SQL 智能体。使用类型化语义图、Schema Grounding 与统一计划链路执行;
-检索后按置信度路由(模块 3.5)让"术语库之外的新指标"也能被处理。
+面向企业数据分析场景的自然语言转 SQL 系统。项目使用 LangGraph 编排查询流程，以
+M-Schema 作为数据库结构事实源，通过语义覆盖、Schema Grounding、统一 QueryPlan、
+确定性 SQL 编译和多层校验降低字段遗漏、错误关联、聚合粒度错误与 Schema 幻觉。
 
-## 架构总览
+系统支持 MySQL/PostgreSQL、多数据库切换、前端数据库连接管理、Schema 同步、关系配置、
+多轮对话、流式进度、查询取消、历史审计和结果总结。
 
-```
-模块1 用户提问(注入 user_id / data_scope)
-  → 模块2 问题理解与改写(SemanticGraph,比较/状态/存在/布尔结构)
-  → 模块3 Schema检索(复合术语 + 字段召回 + 锚点/实体/桥接规划)
-  → 模块3.5 检索置信度路由
-       ├─ 同一业务槽位多字段 → 口径澄清(interrupt,用户选业务字段)
-       ├─ 物理表近分 → 系统自动规划,不要求用户选表
-       ├─ 低置信 → 低置信提示(interrupt,是否继续)
-       └─ 高置信 → 放行
-  → 模块5b 所有查询生成计划 → 模块6 语义覆盖/字段/关系校验 ─(不过)→ 回 5b(上限 max_plan_retries=2)
-                                                          └─(通过)→ 模块7 SQL生成 → 模块8 静态校验
-  → 模块9 风险三态判定 → 模块10 沙箱执行 → 模块11 结果解释
-模块9:pass → 执行；approval_required → 人工确认；hard_block → 直接结束
-模块3.5 澄清 → 人工确认(interrupt_before) → 通过才继续
-```
+## 当前架构
 
-**两条重试回路的边界(硬约束):**
-- 计划校验失败(模块 6)只在模块 5b 内部打转,不退回模块 3(Schema 检索)
-- 执行报错(模块 10)只退回模块 7(SQL 生成),不退回模块 5b(计划)
-- 每种错误在离它最近的节点被消化,不允许一次报错把整条链路从头推倒
-
-## 技术栈
-
-- Python 3.11+ / LangGraph(状态图 + SQLite 持久化 checkpointer + interrupt 人工确认)
-- Pydantic v2(state 与结构化输出) / sqlglot(SQL 解析、AST 校验、多方言)
-- 真语义 embedding(sentence-transformers,本地模型)+ 可插拔向量后端(memory / pgvector)
-- LLM:Anthropic / DeepSeek(OpenAI 兼容)/ 任意 OpenAI 兼容端点,按节点可配不同模型
-- 数据库:MySQL / Postgres(按 `DATABASE_URL` 自动选择执行器)
-- 前端:React + TypeScript + antd,WebSocket 流式
-
-## 目录结构
-
-```
-nl2sql_agent/
-  state.py                 # NL2SQLState / SchemaHit / 强类型 QueryPlan(pydantic v2)
-  graph.py                 # StateGraph 编排 + interrupt_before
-  main.py                  # FastAPI 入口(WebSocket /ws/query + REST /api/*)
-  api.py                   # WebSocket 流式事件 + REST(查询/审批/恢复/历史/反馈/配置)
-  testing.py               # FakeLLM / InMemoryExecutor 等测试双打
-  nodes/
-    m1_entry.py            # 模块1 用户提问(注入身份与权限)
-    m2_query_resolution.py    # 模块2 问题理解、改写与 SemanticGraph
-    m3_schema_retrieval.py    # 模块3 Schema检索(术语 + 向量补充)
-    m3_5_retrieval_confidence_router.py  # 模块3.5 置信度路由(候选/低置信澄清)
-    m5b_plan_generation.py / m6_plan_validation.py  # 所有查询统一计划与语义覆盖校验
-    m7_sql_generation.py / m8_static_validation.py / m9_sensitive_check.py
-    m10_sandbox_execution.py / m11_result_interpretation.py / human_review.py
-  config/
-    term_mapping/_global.yaml   # 全局术语映射
-    settings.yaml               # 运行时参数与 M-Schema 自动定位配置
-    clarification_rules.yaml    # 澄清/置信度/补充关联表阈值
-    business_predicates.yaml / sensitive_rules.yaml / settings.yaml / few_shot.yaml
-    schema_ingest.yaml          # 表结构入库质量规则
-    model_config.yaml           # embedding + 各节点模型
-    vector_store.yaml           # 向量后端显式配置(memory/pgvector)
-  services/
-    embedding/router.py         # embedding 适配层(统一 embed 签名)
-    vector_store/               # base(适配器) / memory / pg
-    schema_ingest/              # MySQL/Postgres 提取器 / profiler / M-Schema /
-                                # 分阶段描述生成 / 审核 / 增量同步 / 多层向量文本
-    llm.py / semantic_parser.py / term_mapping.py / schema_catalog.py / schema_importer.py / checkpoint.py
-    sql_dialect.py / executor.py / few_shot_store.py / query_store.py
-    config_loader.py / deps.py
-  eval/                        # regression_set.yaml + run_eval.py + 检索/指标基准
-  tests/                       # pytest:节点级 + 端到端路由(87 用例)
-scripts/
-  ingest_schema.py             # 表结构入库(full/incremental)
-  review_schema_comments.py    # 注释人工审核 CLI
-  seed_data.py                 # 生成 ~1000 条真实感业务数据
-  dev.ps1                      # 一键启停后端+前端
-sql/                           # 真实 Hive 表定义 + mysql_*.sql 转换建表脚本
-web/                           # React + TS + antd 前端
-data/                          # 运行数据(SQLite 历史/审核/快照)
-.env                           # 本地配置(LLM key、DATABASE_URL、模型)
+```mermaid
+flowchart TD
+    U[用户提问并选择数据库] --> A[API 鉴权与查询持久化]
+    A --> B[问题理解与 SemanticGraph]
+    B --> C[原问题语义覆盖检查与保守修复]
+    C --> D{必须由用户补充信息?}
+    D -- 是 --> X[返回澄清说明]
+    D -- 否 --> E[术语/表/字段/关系多通道检索]
+    E --> F[字段排序与最小 SchemaPlan]
+    F --> G[宽泛主题 Schema 驱动具体化]
+    G --> H[条件绑定与输出字段绑定]
+    H --> I[补全最短关系路径]
+    I --> J[生成查询级 Query M-Schema]
+    J --> K{字段及关系证据充分?}
+    K -- 不支持的输出 --> Y[说明缺失字段,禁止虚构]
+    K -- 低置信 --> Z[低置信确认]
+    K -- 通过 --> L[生成强类型 QueryPlan]
+    Z -- 继续 --> L
+    L --> M[规范化 WHERE/HAVING/粒度/输出契约]
+    M --> N[生成 LogicalPlan]
+    N --> O{计划完整性校验}
+    O -- 可重试 --> L
+    O -- 通过 --> P[确定性 SQL 编译]
+    P --> Q{编译器是否支持}
+    Q -- 否 --> R[模型 SQL 兜底]
+    Q -- 是 --> S[SQL AST 静态校验]
+    R --> S
+    S -- 普通错误可重试 --> P
+    S -- 危险或重试耗尽 --> W[拦截/失败]
+    S -- 通过 --> T[敏感与安全检查]
+    T --> V[EXPLAIN + 只读沙箱执行]
+    V -- 执行错误可重试 --> P
+    V -- 成功或空结果 --> AA[确定性/模型结果总结]
 ```
 
-## 关键设计
+核心边界：
 
-- **QueryPlan 结构上不可表达非 SELECT 操作**:没有 `operation` 字段；连接、过滤和指标分别使用
-  `JoinSpec` / `FilterSpec` / `MetricSpec` 强类型，连接类型、过滤运算符和置信度都有类型约束。
-- **Query M-Schema + LogicalPlan**:检索结果会先投影为本次查询所需的最小 Schema（字段、关系、基数、
-  语义绑定），再把兼容层 QueryPlan 转换为 `Scan / Filter / Join / SemiJoin / AntiJoin /
-  Aggregate / Project / Sort / Limit` 关系算子 DAG。计划显式记录最终输出字段与每行结果粒度，
-  校验器会拦截聚合粒度不一致以及实体查询中的一对多普通 JOIN 放大风险。
-- **低延迟执行路径**:规划和 SQL 翻译只携带 Query M-Schema，不再重复发送完整宽表 Schema；
-  表/字段/关系检索复用同一查询向量，并在服务启动时预热本地 Embedding 和磁盘索引。
-  高置信通用问题使用确定性语义解析；包含显式输出字段的计划直接编译为 sqlglot AST，
-  仅在计划表达不完整时回退 SQL 模型。明细列表使用确定性摘要，避免无价值的结果润色调用。
-- **业务线按系统维度**:`data_scope` 是用户可访问的**系统命名空间**(如 `risk_mart` 风险数据集市 /
-  `dw` 数仓 / `core` 网贷核心),入口注入后下游只读。表按系统分组,**系统级隔离**,
-  `PLATFORM_CODE`(平台)是表内普通数据维度,绝不从 `data_scope` 推导。行级平台过滤默认关闭；
-  如需启用，由服务端鉴权层通过独立的 `row_level_filters` 注入真实平台编码。
-- **字段驱动 Schema 规划**:普通问题先抽取度量、过滤、实体、属性和分组槽位，再按字段短语、
-  向量、数据类型、语义角色和实体亲和度评分；随后确定核心事实表、实体/维度表，并从
-  M-Schema 关系图补充最短路径桥接表。复合术语继续使用审核口径，普通字段不要求逐项维护指标映射。
-- **角色化澄清(模块 3.5)**:事实表、实体表和桥接表是互补角色，不再作为多选一候选；只有
-  同一业务槽位存在多个高证据近分字段时才询问字段口径。低证据结果继续走低置信提示。
-- **字段幻觉拦截**:模块 8 用 sqlglot AST 交叉比对(不用正则),解析表别名与 SELECT 别名;
-  危险操作(非 SELECT)硬失败不重试;行级过滤注入按别名限定。
-- **复合口径分离**:模块 5b 生成结构化 QueryPlan(非自由文本),模块 6 与术语映射交叉校验口径。
-- **风险三态决策**:证件/姓名/金额聚合/低置信等可审批风险输出 `approval_required` 并暂停；
-  超扫描阈值等硬风险输出 `hard_block` 直接结束；其余输出 `pass`。
-  当前 `settings.yaml` 中 `approval.enabled: false`，软风险仅记录原因并直接执行，不进入人工审批；
-  `hard_block` 仍然生效。恢复审批时把该开关改为 `true` 即可。
-- **有反馈的局部重试**:计划或 SQL 重试时会带入上一轮产物和校验/执行错误，要求模型只修错、不改变原查询语义。
-- **结构语义确定性归并**:当正向 `exists` 的全部高影响子条件已经进入计划，且相应 Join 或同表记录过滤存在时，
-  服务端自动把父级存在原子绑定到物理操作并重算覆盖集合，避免仅因模型漏写父 atom_id 重试；`not_exists` 仍必须显式规划反连接。
-- **会话内多轮**:前端维护同一会话最近几轮已完成对话的 <问题,最终答案>，作为 `conversation_history`
-  传给后端；m5b/m7 的提示词注入 `<CONVERSATION_DATA>` 上文，使追问能理解"那""这个"等指代。
-- **空结果是合法结果**:数据库返回 0 行时直接进入结果解释，不通过重写 SQL 放宽条件。
-- **中断状态持久化**:生产入口使用 SQLite checkpointer，服务重启后仍可恢复待审批/待澄清流程。
-- **配置热更新**:所有规则经 `ConfigLoader` 按 mtime 缓存,改配置无需重启服务。
-- **LLM 可插拔、按节点**:`build_llm()`(主模型,计划/解释)、`build_sql_llm()`(SQL 专用,
-  可指向任意 OpenAI 兼容端点如千问)、`get_model_for_node()`(离线任务如注释生成)。
-  model 名一律从环境变量/配置读取,不硬编码。
-  模型统一由 `config/model_config.yaml` 的 `runtime` 配置。默认开启 `unified: true`，
-  问题理解、计划生成、结果解释、离线 Schema 描述以及 SQL 生成兜底均继承同一个模型。
-  切换模型只需修改 provider、model、base_url、api_key_env 和 supports_tool_calling；
-  API Key 本身仍保存在 `.env` 对应的环境变量中，不得写入 YAML 或代码。
-- **数据库可插拔**:按 `DATABASE_URL` scheme 选 MySQL / Postgres 执行器,方言随 sqlglot 切换。
+- 所有查询都生成 QueryPlan，不再通过 SQL 复杂度分类绕过计划。
+- 用户不选择物理表；事实表、实体表、维度表和桥接表由系统自动规划。
+- 只有真正的业务口径或证据不足可能触发澄清，宽泛字段要求优先交给 Schema 具体化。
+- 计划失败只回到计划生成；SQL 校验或执行失败只回到 SQL 生成，不重新执行整条链路。
+- SQL 正常由 QueryPlan 确定性编译，只有编译器暂不支持的计划才调用 SQL 模型兜底。
 
-## 快速开始(uv)
+## 查询执行流程
 
-```bash
-cd d:\code\NL2SQL
-uv sync --extra dev          # 安装依赖
-copy .env.example .env       # 配置 LLM key / DATABASE_URL(见 .env.example)
+### 1. 请求入口与会话
 
-# 测试与回归(无需 LLM/DB,测试双打)
-uv run pytest
-uv run python -m nl2sql_agent.eval.run_eval
+前端提交 `user_query`、`user_id`、`database_id`、`conversation_id` 和最近的
+`conversation_history`。后端校验平台访问凭证，创建 `trace_id`，保存查询记录并注册取消信号。
 
-# 生产模式(真实 LLM + 真实数据库)
-uv run uvicorn nl2sql_agent.main:app --port 8000
+同一会话中的追问继续复用原 `conversation_id`，历史问题不会因为点击或追加提问而重新排序。
 
-# 演示模式(无外部依赖,FakeLLM + InMemoryExecutor)
-# 在 .env 设 NL2SQL_DEMO=1 后同上启动
-```
+### 2. 问题理解与语义覆盖
 
-前后端一键启停:`powershell -File scripts/dev.ps1 start|stop|restart|status`
-(前端 http://localhost:5173,后端 API http://localhost:8000/docs)
+模块 2 同时使用确定性解析和可配置模型，生成 `ResolvedQuery` 与 `SemanticGraph`：
 
-## 数据接入
+- 实体、事件、指标、属性和维度；
+- 比较、状态、存在、否定存在及布尔组合条件；
+- 返回字段、聚合方式、分组、排序和数量限制；
+- 查询动作：明细、查询、统计或排名。
 
-### 1. 建表
-把业务表的 Hive/MySQL 定义建到库中(`sql/mysql_*.sql` 为转换后的建表脚本)。
+`semantic_coverage` 对照原始问题检查高影响内容是否被语义图覆盖。模型不能删除用户明确提出的
+筛选条件或返回要求。对于“基本信息”“贷款情况”“逾期情况”等宽泛主题，系统保留原始表达，
+不在理解阶段武断地收缩为某一个指标。
 
-### 2. 导入表结构 → 向量索引
+### 3. Schema 检索与规划
 
-```bash
-# 全量入库:注释齐全的表直接写入向量库;注释缺失的表进审核队列
-uv run python scripts/ingest_schema.py --mode full --datasource risk_mart --business-line risk_mart
+模块 3 只读取当前选择数据库的 effective M-Schema，并组合以下证据：
 
-# 每日增量(配合定时任务)
-uv run python scripts/ingest_schema.py --mode incremental --datasource risk_mart
-```
+1. 审核生效的复合术语精确映射；
+2. 表级向量检索；
+3. 字段级向量检索；
+4. 关系级检索与最短 Join 路径；
+5. 字段名称、注释、类型、角色、主外键和样例画像；
+6. 过滤值与枚举/样例值的匹配证据。
 
-- **扩展元数据**:按 MySQL/Postgres 方言提取 PK、FK、唯一键、索引、默认值、可空性和原始类型。
-- **轻量字段画像**:变化表每表只执行一次受限采样，生成空值率、近似基数、范围/长度和脱敏样例；
-  规则优先分类为 code/enum/datetime/text/numeric 与 dimension/measure。
-- **质量检查**:除表注释长度与覆盖率外，默认要求每个字段都有有效描述；“字段/数据/相关字段”等
-  泛化注释不能通过。未达标 → 不入库，进入审核队列。
-- **XiYan 式分阶段描述**:数据库理解 → 表初步理解 → 同类字段辨析 → 宽表分批生成字段描述
-  → 根据字段反向生成表描述；生成结果经过字段存在性、敏感泄漏、重复描述和长度校验。
-- **LLM 候选安全**:样例值先按敏感字段脱敏(身份证打码)，候选带证据、校验问题与置信度；
-  不经人工审核不会成为有效描述或进入向量库。
-- **人工审核**:`scripts/review_schema_comments.py list/show/approve/reject`
-  通过后写入系统覆盖层(schema_metadata_override),**不改数据库 DDL**;后续入库用覆盖注释
-- **增量同步**:按结构 hash 只处理变化的表;被删的表从向量库清理(无幽灵表)
-- **Enterprise M-Schema**:每次同步生成 `data/schema/{datasource}/m-schema.json`，并保存
-  `raw-m-schema.json` / `effective-m-schema.json` / `manifest.json` 内容寻址快照。
-- **多层索引**:由审核生效的 M-Schema 派生表级、按语义类别分组的字段级、外键关系级向量文档。
+系统生成最小 `SchemaPlan`，区分：
 
-M-Schema 是唯一运行时 Schema 事实源，向量库是它的派生检索视图：
+- `primary_fact`：主事实表；
+- `secondary_fact`：其他指标来源表；
+- `entity` / `dimension`：实体和维度表；
+- `bridge`：仅用于连通关系的桥接表。
+
+字段级命中可以独立产生表候选；关系图支持多跳路径。多个相近物理表不会展示给业务用户选择，
+系统会根据查询粒度、字段覆盖和关系连通性自动组合。
+
+### 4. 宽泛字段具体化
+
+如果用户要求“客户基本信息”或“客户的逾期情况”，系统在完成 Schema 检索后，从查询相关的
+有限字段集合中选择真实字段：
+
+- “基本信息”可以展开为姓名、地址、电话等当前 Schema 实际存在的字段；
+- “逾期情况”可以具体化为逾期本金余额等直接相关指标；
+- 聚合问题会同时确定 `SUM`、`AVG`、`MAX` 或 `COUNT DISTINCT` 等计算方式；
+- 敏感字段不会因为宽泛表达而被自动扩展，除非用户明确要求且安全策略允许；
+- 模型选择无效时使用规则式 Schema 兜底，不虚构字段。
+
+具体化结果写入 `ProjectionDecision`，随后物化为强制执行的 `SemanticOutput` 和
+`OutputBindings`。
+
+### 5. 查询级 M-Schema
+
+检索完成后同时生成两份有边界的 `QueryMSchema`：
+
+- `precision`：首次规划使用，只包含已确认的字段和关系；
+- `recall`：仅在计划校验失败重试时启用，加入当前计划表内的高分候选字段，上限为每表 24 列。
+
+两份视图都只包含本次问题需要的：
+
+- 目标表和必要桥接表；
+- 条件、输出、分组、排序和 Join 所需字段；
+- 已验证关系；
+- `SemanticBindings` 与 `OutputBindings`。
+
+完整数据库 Schema 不会进入计划或 SQL 提示词。输出字段绑定完成后，如果新增字段位于其他表，
+系统会再次扩展最小关系子图，避免“字段找到了但表没有加入计划”。
+
+计划生成前还会按查询结构骨架检索 Few-shot。匹配依据包括查询动作、聚合、分组、排序、过滤和
+Top-N 等结构特征；传给计划模型的只有 `question_skeleton` 与 `sql_structure`，不会传入示例 SQL、
+示例表名或字段名。
+
+### 6. QueryPlan 与 LogicalPlan
+
+所有查询统一生成强类型 `QueryPlan`。主要结构包括：
+
+- `target_tables`、`join_logic`；
+- `output_fields` 与 `output_grain`；
+- 行级 `filters`；
+- 聚合级 `having`；
+- `group_by`、`order_by`、`limit`；
+- 指标定义和语义原子覆盖信息。
+
+服务端规范化器以已确认的绑定事实为准修正模型计划：
+
+- 输出字段必须覆盖全部 required semantic outputs；
+- 行级条件进入 `WHERE`，聚合比较进入 `HAVING`；
+- 分组实体优先使用不可空主键或唯一键；
+- 多事实表指标先分别按统一粒度预聚合，再关联，避免明细 Join 导致金额重复放大；
+- 同一物理字段允许生成多个表达式，例如 `SUM(LOAN_AMT)` 和 `AVG(LOAN_AMT)`。
+
+随后生成由 `Scan / Filter / Join / SemiJoin / AntiJoin / Aggregate / Having /
+Project / Sort / Limit` 构成的 `LogicalPlan`。
+
+计划与 SQL 统一记录为 `QueryCandidate`，保存来源、使用的 Schema profile、校验状态、执行状态和
+失败原因。当前在线链路仍只执行一个主候选，这一结构为后续按失败或低置信度条件触发多候选生成与
+选择器预留稳定接口，不会在普通查询中额外调用模型。
+
+### 7. 三层完整性校验
+
+模块 6 在生成 SQL 前执行：
+
+1. 原始问题与 SemanticGraph 的覆盖检查；
+2. SemanticGraph 与 QueryPlan 的条件/输出原子覆盖检查；
+3. QueryPlan 与 Query M-Schema 的物理表、字段、关系和粒度检查。
+
+校验失败时只携带错误反馈重新生成 QueryPlan，达到 `max_plan_retries` 后终止，不会猜测字段继续执行。
+
+### 8. SQL 编译与静态校验
+
+模块 7 优先通过 `sql_compiler.py` 将 QueryPlan 确定性编译为 SQL。编译器支持普通查询、分组聚合、
+HAVING、多表 Join 和多事实预聚合。只有不受支持的计划结构才回退到统一配置的 SQL 模型。
+
+模块 8 使用 sqlglot AST 校验：
+
+- 只允许只读查询；
+- SQL 方言与语法合法；
+- 表和字段必须存在于检索结果及 Query M-Schema；
+- Join、别名和输出字段与计划一致；
+- 禁止把 `data_scope` 错写为 `PLATFORM_CODE` 等业务字段的筛选值；
+- 危险操作直接硬拦截，不进入重试。
+
+### 9. 安全执行与结果说明
+
+通过静态校验后，系统执行敏感规则检查。当前查询审批暂时关闭：
+
+- `approval_required` 仅记录风险原因并继续；
+- `hard_block` 始终有效；
+- 将 `settings.yaml` 中 `approval.enabled` 改为 `true`，并在前端构建环境设置
+  `VITE_APPROVAL_ENABLED=true`，可恢复查询人工审批和审批队列入口。
+
+执行节点先运行 `EXPLAIN`，超过扫描阈值则拒绝执行；随后在只读事务中运行 SQL，并设置查询超时。
+非聚合查询会强制添加结果行数上限。0 行是合法结果，不会自动放宽条件重写 SQL。
+
+结果总结采用 `performance.result_summary_mode` 控制：明细查询通常使用确定性说明，聚合结果可调用
+模型生成业务化总结。所有模型调用、耗时、Token、结构化校验和重试记录都会写入查询审计。
+
+## M-Schema 与向量索引
+
+M-Schema 是唯一运行时 Schema 事实源，向量存储是其派生检索视图：
 
 ```text
-数据库 → raw M-Schema → 画像/分类/描述 → 审核 Override → effective M-Schema
-                                                    └→ 表/字段/关系向量索引
+数据库
+  → raw M-Schema
+  → PK/FK/唯一键/索引/默认值/可空性提取
+  → 字段画像与规则分类
+  → 分阶段描述生成与质量校验
+  → 审核 Override
+  → effective M-Schema
+  ├→ SchemaCatalog
+  └→ 表级/字段级/关系级向量索引
 ```
 
-运行 `scripts/ingest_schema.py` 时会落盘 effective M-Schema。运行时根据
-`DATABASE_URL` 的数据库名自动定位 `data/schema/<database>/m-schema.json`，并直接
-构建内存 SchemaCatalog；不再生成或依赖 `schema_catalog.yaml`。表级、字段级和
-关系级向量文档同样只从 effective M-Schema 生成，并携带 `snapshot_id`、
-`semantic_hash` 和表级语义哈希。
+每个数据库的结构文件位于：
 
-模块 3 对复合指标保留术语精确映射；普通问题使用字段级证据构建 `QueryIntent` 和
-`SchemaPlan`。SchemaPlan 明确 `primary_fact/secondary_fact/entity/dimension/bridge`
-角色，并只采用审核生效关系构造最小连通子图。无法结构化的问题回退原表级/字段级
-向量链路，融合权重与阈值统一在 `clarification_rules.yaml` 配置。
-
-召回层还支持：领域短语查询扩展、跨表字段集合覆盖、按查询特征动态调整表/字段
-权重、相对候选差距，以及候选表之间最多 3 跳的最短 FK 路径补全。宽表的表级文本
-按 PK/FK/指标/时间字段选择核心字段，并额外保留全部字段名。内存后端会把向量缓存到
-M-Schema 同目录的 `vector-cache.json`；只有 M-Schema 语义哈希和 Embedding 配置签名
-都一致时才复用，否则自动重新生成。
-
-领域 Embedding 不直接凭经验替换，可运行
-`python -m nl2sql_agent.eval.run_schema_retrieval_benchmark` 测试默认模型，或用
-`--model-path <本地模型目录>` 对候选模型运行同一组金融 Schema Recall@K 用例。
-
-`nl2sql_agent.eval.schema_metrics.evaluate_schema_cases` 可用于对比 legacy/xiyan 快照，统一计算
-表 Recall@K、字段召回率、Join 路径正确率、SQL Execution Accuracy、澄清率、人工修改率及
-每表画像/LLM 成本。
-
-### 3. 生成演示数据(可选)
-
-```bash
-uv run python scripts/seed_data.py --count 1000   # 6 张表插入 ~1000 条真实感关联数据
+```text
+data/schema/<数据库或连接标识>/m-schema.json
 ```
 
-### 4. 新系统接入
-数仓/网贷核心等新系统:建表 → 导入(`--business-line dw` / `--business-line core`)。
-表自动归入对应系统命名空间,只有 `data_scope` 含该系统的用户能检索。
+系统不再生成或依赖 `schema_catalog.yaml`。Schema 同步时自动生成 M-Schema 和向量索引，用户不需要
+手工执行额外的“生成 M-Schema”步骤。内存向量后端使用同目录的 `vector-cache.json` 缓存向量；
+M-Schema 语义哈希或 Embedding 配置变化时自动重建。
 
-## LLM 统一模型配置
+## 企业知识管理
 
-模型路由只修改 `nl2sql_agent/config/model_config.yaml`：
+左侧“企业知识管理”统一维护业务名词、同义表达、业务规则和优化案例。知识记录保存在
+`data/nl2sql.db`，支持全局或数据库专属作用域、草稿/发布/停用状态、版本快照和优先级。
+
+- 业务名词通过数据库 Schema 选择器绑定真实 `table.column`，发布时校验字段存在性；
+- 同义表达区分等价、简称、上下位、相关和禁止替换，只有等价/简称进入自动改写；
+- 业务规则以结构化谓词或指标定义进入问题理解，不依赖纯自然语言描述；
+- 优化案例区分跨库计划骨架和数据库 SQL 降级案例，发布时校验 SQL 只读性及引用表；
+- 数据库专属知识优先于全局知识，知识变更后对应查询依赖缓存自动失效。
+
+首次访问知识管理接口时，系统会幂等迁移现有 `term_mapping/*.yaml`、
+`business_predicates.yaml` 和 `few_shot.yaml`。旧 YAML 暂时保留作为兼容与备份源。
+
+数据库没有物理外键时，可以在“表关系配置”页面补充经过人工确认的关系。运行时会将这些关系
+覆盖与 M-Schema 关系合并，用于 Join 路径规划，但不会修改业务数据库 DDL。
+
+## 多数据库管理
+
+前端“数据源管理”提供：
+
+- 新增和编辑 MySQL/PostgreSQL 连接；
+- 测试连接；
+- 设置默认数据库；
+- 全量或增量同步 Schema；
+- 查看表与字段注释；
+- 配置表关系、基数和建议 Join 类型；
+- 提问时选择目标数据库。
+
+连接配置保存在 `data/nl2sql.db`。密码不会通过查询接口返回。首次启动且数据库配置表为空时，
+系统可以从 `.env` 的 `DATABASE_URL` 初始化一条兼容连接；之后以数据库管理页面中的配置为准。
+
+## 模型配置
+
+在线查询模型统一由 [`nl2sql_agent/config/model_config.yaml`](nl2sql_agent/config/model_config.yaml)
+管理。切换模型不需要修改代码：
 
 ```yaml
 runtime:
@@ -235,83 +268,188 @@ runtime:
   supports_tool_calling: false
 ```
 
-`.env` 只保存密钥和数据库连接，不再保存模型名称或模型路由：
+密钥只保存在 `.env`：
 
 ```env
-DEEPSEEK_API_KEY=sk-xxx
-# 数据库(按 scheme 自动选执行器)
-DATABASE_URL=mysql://user:pass@host:port/db
+DEEPSEEK_API_KEY=your-key
+PLATFORM_ACCESS_TOKEN=your-platform-access-token
+ADMIN_TOKEN=your-admin-token
+
+# 可选：仅用于首次初始化默认数据库连接
+DATABASE_URL=mysql://user:password@host:3306/database
 ```
 
-离线任务模型(如注释生成)在 `config/model_config.yaml` 的 `nodes` 下配置。
+`runtime.unified: true` 时，主流程和 SQL 模型共享同一配置；`nodes` 可以覆盖单个节点的 Token 预算、
+思考模式或独立模型。模型请求和结构化输出失败会记录在 `llm_calls`，便于区分模型延迟与数据库延迟。
 
-## 语义检索与向量存储
+## 技术栈
 
-- **Embedding**:`config/model_config.yaml`。`provider: local` 用 sentence-transformers
-  (默认 `paraphrase-multilingual-MiniLM-L12-v2`);huggingface 不可达时从 ModelScope 下载后配 `model_path`。
-  `provider: fake` 仅测试。
-- **向量后端**:`config/vector_store.yaml` 显式 `backend: memory / pgvector`。
-  MySQL 环境用 `memory`(重启后需重新 ingest);切换 embedding 后必须全量重建索引,新旧向量不能混用。
-- **检索两层**:术语映射精确命中 → 向量语义兜底 + 补充关联表(阈值在 `clarification_rules.yaml`)。
+- Python 3.11+、FastAPI、LangGraph、SQLite Checkpointer；
+- Pydantic v2、sqlglot；
+- sentence-transformers、本地 Embedding；
+- memory / pgvector 向量后端；
+- MySQL / PostgreSQL 只读执行器；
+- DeepSeek、Anthropic 或任意 OpenAI 兼容模型；
+- React、TypeScript、Vite、Ant Design；
+- WebSocket 流式查询事件。
 
-## 前端(React + antd)
+## 目录结构
 
-```bash
-cd web && npm install && npm run dev   # http://localhost:5173
+```text
+nl2sql_agent/
+  graph.py                     LangGraph 编排与重试路由
+  state.py                     SemanticGraph、QueryPlan、LogicalPlan 等类型
+  api.py                       查询、数据库、关系、Schema、历史 API
+  nodes/
+    m1_entry.py
+    m2_query_resolution.py
+    m3_schema_retrieval.py
+    m3_5_retrieval_confidence_router.py
+    m5b_plan_generation.py
+    m6_plan_validation.py
+    m7_sql_generation.py
+    m8_static_validation.py
+    m9_sensitive_check.py
+    m10_sandbox_execution.py
+    m11_result_interpretation.py
+  services/
+    semantic_coverage.py       原问题语义覆盖契约
+    projection_resolver.py     宽泛返回字段具体化
+    schema_planner.py          字段排序、SchemaPlan、关系补全
+    logical_planner.py         QueryPlan → LogicalPlan
+    plan_normalizer.py         绑定事实与计划规范化
+    sql_compiler.py            确定性 SQL 编译和多事实预聚合
+    value_grounding.py         文本值与字段值画像绑定
+    schema_ingest/             Schema 提取、画像、描述、审核和增量同步
+    vector_store/              memory / pgvector 适配器
+  config/                      模型、规则、提示词和向量配置
+  tests/                       单元、节点、路由和回归测试
+web/                           React 前端
+scripts/                       启停、Schema 同步和维护脚本
+data/                          SQLite、M-Schema、向量缓存和快照
+docs/                          业务流程与架构文档
 ```
 
-页面:
-- **数据问答**:对话流 + 分阶段步骤卡片(检索/计划/SQL/审批/结果),WebSocket 流式推进,
-  运行中显示当前步骤加载指示;候选/低置信/字段口径澄清在页面内点选;断线重连与页面切换后
-  通过 localStorage 活动会话 + `GET /api/query/{trace_id}` 恢复进度;同一对话内连续追问支持多轮上下文。
-- **表与注释**:按系统浏览表结构,前端直接补充/修改表或字段注释(写入覆盖层,不改 DDL);
-  查看并处理 LLM 生成的待审核注释(通过/驳回/重新入库)。
-- **审批队列**:待审批敏感查询 + 完整 pipeline 详情,通过/驳回(驳回必须填原因,写入反馈闭环)
-- **历史与审计**:按用户/系统/时间筛选,完整 trace(各节点耗时、重试、审批人),CSV 导出
-- **配置管理**:术语映射可视化编辑(需 `ADMIN_TOKEN`,热更新)
+## 快速开始
 
-界面采用低饱和莫兰迪配色(米白底 + 紫灰主色),语义色(信息/成功/警告/错误)统一映射到主题色板。
+### 安装依赖
 
-## API 契约
+```powershell
+cd D:\code\NL2SQL
+uv sync --extra dev
 
-WebSocket `/api/ws/query`:连接后发送 `{"query","user_id","data_scope","trace_id?"}`,
-服务端按 `node_start / node_complete / retry / interrupt / final / error` 流式推送节点事件(节点名与后端一致)。
+cd web
+npm install
+```
+
+### 配置
+
+1. 在 `.env` 配置模型密钥和平台访问密码。
+2. 在 `nl2sql_agent/config/model_config.yaml` 配置模型。
+3. 启动系统后，在“数据库连接”页面新增连接、测试并同步 Schema。
+4. 如果数据库没有外键，在“表关系配置”页面补充关系。
+
+### 启动和停止
+
+```powershell
+powershell -File scripts/dev.ps1 start
+powershell -File scripts/dev.ps1 status
+powershell -File scripts/dev.ps1 restart
+powershell -File scripts/dev.ps1 stop
+```
+
+- 前端：<http://localhost:5173>
+- API 文档：<http://localhost:8000/docs>
+- 后端日志：`logs/backend.log`、`logs/backend.err.log`
+- 前端日志：`logs/frontend.log`、`logs/frontend.err.log`
+
+也可以单独启动：
+
+```powershell
+uv run uvicorn nl2sql_agent.main:app --port 8000
+
+cd web
+npm run dev
+```
+
+## 前端功能
+
+- **数据问答**：气泡式对话流、数据库选择、理解结果、计划、SQL、结果与停止查询；
+- **会话历史**：同一会话追加问题、新建、删除、恢复运行状态；
+- **数据库连接**：新增、编辑、删除、测试、设为默认和同步 Schema；
+- **表与注释**：浏览 M-Schema 表字段并维护覆盖注释；
+- **表关系配置**：维护无外键数据库的业务关系、基数和 Join 类型；
+- **历史与审计**：查看节点耗时、模型调用、重试、SQL、执行结果和错误；
+- **配置管理**：维护术语和查看规则配置；
+- **审批队列**：仅在查询审批功能开启时显示。
+
+前端只展示对用户有价值的合并阶段，不把每个内部节点都堆叠到对话中。后端仍保留完整 trace，
+便于诊断和审计。
+
+## 主要 API
+
+所有 `/api/*` 请求使用 `X-Platform-Token`；WebSocket 首帧使用 `platform_token`。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| POST | `/api/query` | 非流式提交查询,返回 trace_id + 结果/待审批状态 |
-| GET | `/api/query/{trace_id}` | 断线重连/刷新后恢复当前阶段 |
-| POST | `/api/query/{trace_id}/approve` | 审批 `{approved, reason, approver}` |
-| POST | `/api/query/{trace_id}/resume` | 澄清恢复 `{resume: {table} / {continue}}` |
-| GET | `/api/approvals` | 待审批队列 |
-| GET | `/api/history` | 历史查询(筛选 user_id / business_line / 日期) |
-| GET | `/api/audit/{trace_id}` | 完整 trace 详情(含反馈) |
-| POST | `/api/feedback` | 反馈闭环 `{trace_id, node, feedback_type, comment}` |
-| GET/PUT | `/api/config/term-mapping` | 术语映射读写(PUT 需 `X-Admin-Token`) |
-| GET | `/api/config/rules` | 规则配置查看 |
+| WebSocket | `/api/ws/query` | 提交查询并接收流式节点事件 |
+| POST | `/api/query` | 非流式提交查询 |
+| GET | `/api/query/{trace_id}` | 查询状态或断线恢复 |
+| POST | `/api/query/{trace_id}/cancel` | 停止正在执行的查询 |
+| DELETE | `/api/query/{trace_id}` | 删除查询记录 |
+| GET | `/api/conversations` | 会话列表 |
+| GET | `/api/conversation/{conversation_id}` | 会话详情 |
+| DELETE | `/api/conversation/{conversation_id}` | 删除会话及其查询 |
+| GET | `/api/history` | 查询历史 |
+| GET | `/api/audit/{trace_id}` | 完整审计记录 |
+| GET/POST | `/api/databases` | 数据库连接列表/新增 |
+| PUT/DELETE | `/api/databases/{id}` | 编辑/删除数据库连接 |
+| POST | `/api/databases/{id}/test` | 测试连接 |
+| POST | `/api/databases/{id}/default` | 设为默认数据库 |
+| POST | `/api/databases/{id}/sync-schema` | 同步 Schema 并构建索引 |
+| GET/POST | `/api/databases/{id}/relations` | 查询/新增关系配置 |
+| PUT/DELETE | `/api/databases/{id}/relations/{relation_id}` | 编辑/删除关系 |
+| GET | `/api/schema` | 浏览当前 Schema |
+| GET/PUT | `/api/config/term-mapping` | 读取/修改术语映射 |
 
-## 测试与验收
+WebSocket 事件包括 `trace`、`node_start`、`node_complete`、`retry`、`interrupt`、`restore`、
+`final`、`error` 和 `done`。
 
-87 个 pytest 用例覆盖:
+## 测试与评估
 
-| 验收项 | 测试 |
-| --- | --- |
-| 原单表简单查询也生成并校验 QueryPlan | `test_acceptance_1_simple_path_executes` |
-| 复合口径正确路由 5b,metric_logic 与术语定义一致并通过模块 6 | `test_acceptance_2_composite_metric_plan_path` |
-| 引用不存在字段被模块 8 拦截并退回模块 7 重试 | `test_acceptance_3_hallucinated_field_retries_sql` |
-| 系统隔离:仅可访问系统的表被检索 | `test_acceptance_4_system_isolation` |
-| 敏感查询在 human_review 暂停,不自动执行 | `test_acceptance_5_sensitive_pauses_for_human` |
-| 模块 10 执行报错退回模块 7 而非模块 5b | `test_acceptance_6_execution_error_retries_sql_generation` |
-| 计划失败只在计划路径内打转,不退回模块 3 | `test_plan_retry_loop_stays_inside_plan_path` |
-| 新指标不被模块 2 拒答,走到检索/3.5 判定 | `test_acceptance_1_new_metric_not_blocked_at_module2` |
-| 多相近候选 → 候选澄清,选定后不重复触发 | `test_acceptance_2/3_multi_candidate_*` |
-| 低置信 → 继续 → 强制计划路径 + 强制人工确认 | `test_acceptance_4_low_confidence_*` |
-| 表结构入库:质量门禁/审核/override 重入库/脱敏/增量/删表清理 | `tests/test_schema_ingest.py` |
-| 重试反馈/空结果/风险三态/强类型计划/重启恢复 | `tests/test_architecture_hardening.py` |
+当前测试集包含 170+ 个用例：
 
-## 预留扩展点(暂不实现,接口已留)
+```powershell
+uv run pytest
+uv run python -m nl2sql_agent.eval.run_eval
+uv run python -m nl2sql_agent.eval.run_schema_retrieval_benchmark
+```
 
-- **反馈闭环**:人工确认通过的案例回流 few-shot —— `FewShotStore.add_example` + `Deps.feedback_sink`
-- **语义缓存**:相同语义复用已校验 SQL —— `Deps.semantic_cache`
-- **结果多模态输出**:`execution_result` 保留原始数据,可扩展图表/导出
-- **跨会话用户偏好**:`conversation_history` / `user_id` 已在 state,可扩展持久化
+重点覆盖：
+
+- 原问题、SemanticGraph、QueryPlan 三层语义覆盖；
+- 显式返回字段与宽泛字段具体化；
+- 文本值归一化和字段绑定；
+- 主键粒度、WHERE/HAVING 作用域；
+- 多事实表预聚合；
+- Schema 最小关系子图；
+- 不存在字段和危险 SQL 拦截；
+- 计划、SQL、执行的局部重试边界；
+- 多数据库配置、关系配置和查询取消；
+- Schema 增量同步、审核、脱敏和向量缓存；
+- 节点耗时与 LLM 调用审计。
+
+评估工具可以计算表 Recall@K、字段召回率、Join 路径正确率、SQL Execution Accuracy、
+澄清触发率、人工修改率以及 Schema 画像和 LLM 成本。
+
+## 当前限制与后续方向
+
+- 复杂窗口函数、同比/环比和递归查询仍需要扩展强类型计划与确定性编译器；
+- 宽泛业务主题的字段选择依赖 Schema 注释质量和字段画像；
+- 无外键数据库必须维护可靠的关系事实，系统不会在缺少证据时猜测 Join；
+- 在线模型已配置节点级超时和确定性降级；后续可继续增加结果总结异步化和已验证计划缓存；
+- 语义缓存和已验证计划复用接口已经预留，尚未作为默认主链路启用。
+
+详细实施记录见 [`docs/响应时间与提示词优化计划.md`](docs/响应时间与提示词优化计划.md)。
+
+后续能力建设与实施顺序见 [`docs/后续优化路线图.md`](docs/后续优化路线图.md)。

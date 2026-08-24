@@ -14,10 +14,34 @@ profiling:
   enabled: true
   sample_size: 100
   example_limit: 3
+  # 宽表只选择最有业务价值的字段执行一次受限查询
+  max_columns_per_query: 20
+  # skip 表示敏感列不进入 SELECT，避免“查询后再脱敏”仍接触原始值
+  sensitive_mode: skip
+  exclude_types: [blob, tinyblob, mediumblob, longblob, binary, varbinary, longtext, mediumtext, json, geometry]
+  exclude_name_patterns: [password, passwd, pwd, secret, token, private_key, access_key]
+
+# 注释生成复用字段画像，不再为缺注释的表重复读取一遍数据
+comment_generation:
+  use_profile_samples: true
 
 # 规则优先分类，低基数维度识别为 enum；不对每一列单独调用 LLM
 classification:
   enum_max_distinct: 20
+
+# 无外键数据库的保守关系发现；结果只进入候选库，不会直接参与 SQL JOIN
+relation_discovery:
+  enabled: true
+  # 注释修正后由关系管理页面主动触发，避免 Schema 导入阶段过早产生候选。
+  run_on_schema_sync: false
+  min_confidence: 0.68
+  inferred_confidence: 0.84
+  max_candidates: 200
+  # 无 PK/UK 的数仓表允许使用字段画像推断中心实体；仍只生成待确认候选。
+  allow_profile_inference: true
+  warehouse_anchor_threshold: 0.62
+  # 同一业务标识只连接到一个中心锚点，限制星型边数量，禁止两两组合。
+  max_edges_per_identifier: 25
 
 # M-Schema 输出；相对路径从项目根目录解析
 artifact_dir: data/schema

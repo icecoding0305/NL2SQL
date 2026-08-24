@@ -3,7 +3,11 @@ from nl2sql_agent.services.projection_resolver import _fallback_topic_decision
 from nl2sql_agent.services.semantic_coverage import ensure_semantic_coverage
 from nl2sql_agent.services.schema_catalog import TableDef
 from nl2sql_agent.services.schema_planner import ground_output_bindings
-from nl2sql_agent.services.semantic_parser import build_semantic_graph, semantic_graph_to_query_intent
+from nl2sql_agent.services.semantic_parser import (
+    build_semantic_graph,
+    iter_semantic_atoms,
+    semantic_graph_to_query_intent,
+)
 from nl2sql_agent.services.semantic_query import enrich_semantic_graph
 from nl2sql_agent.services.sql_compiler import compile_query_plan
 from nl2sql_agent.state import (
@@ -38,6 +42,77 @@ def test_grouped_metrics_become_base_concepts_and_aggregations():
     assert outputs["剩余本金"].aggregation == "sum"
     assert [item.text for item in intent.dimensions] == ["产品"]
     assert "贷款笔数" not in [item.text for item in intent.attributes]
+
+
+def test_grouped_metrics_without_possessive_are_preserved_by_fallback():
+    query = "统计每个客户累计贷款金额、累计代偿本金和累计代偿总额"
+    graph = build_semantic_graph(query)
+
+    outputs = {item.concept: item for item in graph.outputs}
+    assert graph.group_by == ["客户"]
+    assert outputs["累计贷款金额"].aggregation == "sum"
+    assert outputs["累计代偿本金"].aggregation == "sum"
+    assert outputs["累计代偿总额"].aggregation == "sum"
+
+
+def test_alphanumeric_code_filter_is_a_required_semantic_atom():
+    query = "查询产品编码为P01且贷款金额超过100000元的借据编号"
+    graph = build_semantic_graph(query)
+    atoms = list(iter_semantic_atoms(graph.predicate))
+
+    code_atom = next(item for item in atoms if item.value == "P01")
+    assert code_atom.concept == "产品编码"
+    assert code_atom.operator == "="
+    assert code_atom.materiality == "high"
+
+
+def test_grouped_top_n_control_phrases_do_not_become_outputs():
+    query = "统计每个产品的贷款总金额，按贷款总金额从高到低返回前3个产品"
+    graph = build_semantic_graph(query)
+
+    assert graph.limit == 3
+    assert graph.order_by[0].concept == "贷款总金额"
+    assert graph.order_by[0].direction == "desc"
+    assert {item.concept for item in graph.outputs} == {"产品", "贷款总金额"}
+
+
+def test_implicit_grouped_top_n_restores_ranking_measure_and_grain():
+    query = "按贷款总金额从高到低返回前3个产品"
+    graph = build_semantic_graph(query)
+
+    assert graph.limit == 3
+    assert graph.group_by == ["产品"]
+    assert graph.order_by[0].concept == "贷款总金额"
+    outputs = {item.concept: item for item in graph.outputs}
+    assert set(outputs) == {"产品", "贷款总金额"}
+    assert outputs["贷款总金额"].grounding_concept == "贷款金额"
+    assert outputs["贷款总金额"].aggregation == "sum"
+
+
+def test_limit_return_wording_is_normalized_to_top_n():
+    query = "统计每个产品的贷款总金额，按贷款总金额降序排列，限制返回3条"
+    graph = build_semantic_graph(query)
+
+    assert graph.limit == 3
+    assert graph.order_by[0].concept == "贷款总金额"
+    assert graph.order_by[0].direction == "desc"
+    assert all(item.concept not in {"3条", "限制返回3条"} for item in graph.outputs)
+    assert {item.concept for item in graph.outputs} == {"产品", "贷款总金额"}
+
+
+def test_common_model_plan_order_and_group_shapes_are_normalized():
+    plan = QueryPlan.model_validate({
+        "target_tables": ["loan"],
+        "group_by": [{"table": "loan", "column": "PRD_CODE"}],
+        "order_by": [{
+            "table": "loan", "column": "LOAN_AMT", "operator": "desc",
+            "aggregation": "sum", "source_atom_ids": ["atom_output_2"],
+        }],
+    })
+
+    assert plan.group_by == ["loan.PRD_CODE"]
+    assert plan.order_by[0].direction == "desc"
+    assert plan.order_by[0].aggregation == "sum"
 
 
 def test_count_distinct_uses_entity_identifier_not_similar_attribute():

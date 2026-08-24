@@ -13,6 +13,13 @@ COLLECTION_COLUMN = "schema_column"
 COLLECTION_RELATION = "schema_relation"
 
 
+def _vector_examples(field: dict, limit: int = 5) -> list[str]:
+    """Only low-cardinality, non-sensitive enum values may enter embeddings."""
+    if field.get("sensitive") or field.get("category") != "enum":
+        return []
+    return [str(value)[:50] for value in (field.get("examples") or [])[:limit]]
+
+
 def load_mschema_vector_source(metadata: dict) -> tuple[dict, dict] | None:
     """根据 catalog 来源元数据加载 effective M-Schema 与同目录 manifest。"""
     source_path = metadata.get("m_schema_path")
@@ -94,7 +101,7 @@ def build_column_level_text(table_name: str, fields: list[tuple[str, dict]]) -> 
         f"类别:{field.get('category') or 'unknown'} "
         f"PK:{bool(field.get('primary_key'))} UNIQUE:{bool(field.get('unique'))} "
         f"NULLABLE:{bool(field.get('nullable', True))} "
-        f"说明:{field.get('comment') or ''} 样例:{field.get('examples') or []}"
+        f"说明:{field.get('comment') or ''} 样例:{_vector_examples(field)}"
         for name, field in fields
     ]
     return f"表:{table_name}\n" + "\n".join(lines)

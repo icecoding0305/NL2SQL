@@ -3,8 +3,7 @@ import { Button, Dropdown, Input, Modal, Tooltip, Typography, message } from "an
 import {
   CopyOutlined,
   DeleteOutlined,
-  MenuFoldOutlined,
-  MenuUnfoldOutlined,
+  CloseOutlined,
   MoreOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -16,12 +15,14 @@ import type { QueryRecord } from "../types";
 const { Text } = Typography;
 
 interface Props {
+  open: boolean;
   records: QueryRecord[];
   activeConversation: string | null;
   onOpen: (record: QueryRecord) => void;
   onNew: () => void;
   onRefresh: () => void;
   onDelete: (record: QueryRecord) => Promise<void>;
+  onClose: () => void;
 }
 
 const statusLabels: Record<string, string> = {
@@ -34,8 +35,7 @@ const statusLabels: Record<string, string> = {
   cancelled: "已停止",
 };
 
-export default function HistorySidebar({ records, activeConversation, onOpen, onNew, onRefresh, onDelete }: Props) {
-  const [collapsed, setCollapsed] = useState(false);
+export default function HistorySidebar({ open, records, activeConversation, onOpen, onNew, onRefresh, onDelete, onClose }: Props) {
   const [keyword, setKeyword] = useState("");
   const filtered = useMemo(
     () => records.filter((record) => (record.title || record.user_query).toLowerCase().includes(keyword.trim().toLowerCase())),
@@ -43,16 +43,18 @@ export default function HistorySidebar({ records, activeConversation, onOpen, on
   );
 
   return (
-    <aside className={`history-sidebar ${collapsed ? "collapsed" : ""}`}>
+    <>
+    <button className={`history-backdrop ${open ? "open" : ""}`} onClick={onClose} aria-label="关闭历史会话" />
+    <aside className={`history-sidebar ${open ? "open" : ""}`} aria-hidden={!open}>
       <div className="history-sidebar-header">
         <Text strong className="history-title">最近对话</Text>
-        <Tooltip title={collapsed ? "展开会话列表" : "收起会话列表"}>
+        <Tooltip title="关闭会话列表">
           <Button
             type="text"
             shape="circle"
-            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-            onClick={() => setCollapsed((value) => !value)}
-            aria-label={collapsed ? "展开会话列表" : "收起会话列表"}
+            icon={<CloseOutlined />}
+            onClick={onClose}
+            aria-label="关闭会话列表"
           />
         </Tooltip>
       </div>
@@ -142,5 +144,6 @@ export default function HistorySidebar({ records, activeConversation, onOpen, on
         </div>
       </div>
     </aside>
+    </>
   );
 }

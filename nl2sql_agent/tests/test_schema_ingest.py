@@ -27,9 +27,13 @@ from nl2sql_agent.services.schema_ingest.mysql_fetcher import (
     TableMeta,
     fetch_information_schema,
 )
+from nl2sql_agent.services.schema_ingest.profiler import profile_table
 from nl2sql_agent.services.schema_ingest.review_queue import ReviewStore
-from nl2sql_agent.services.schema_ingest.text_builder import write_mschema_table_embeddings
-from nl2sql_agent.services.schema_ingest.text_builder import build_table_level_text
+from nl2sql_agent.services.schema_ingest.text_builder import (
+    build_column_level_text,
+    build_table_level_text,
+    write_mschema_table_embeddings,
+)
 from nl2sql_agent.testing import build_test_deps
 
 
@@ -41,8 +45,10 @@ class FakeSchemaExecutor:
         self.samples: dict[str, list[dict]] = {}
         self.constraints: list[dict] = []
         self.indexes: list[dict] = []
+        self.executed_sql: list[str] = []
 
     def execute(self, sql: str, timeout_seconds: int = 30, params: tuple | None = None):
+        self.executed_sql.append(sql)
         up = sql.upper()
         if "INFORMATION_SCHEMA.TABLES" in up:
             return [
@@ -101,6 +107,53 @@ def _make_deps(executor, monkeypatch=None, fake_llm=None):
 
         monkeypatch.setattr(llm, "get_model_for_node", lambda node: fake_llm)
     return deps
+
+
+def test_profile_query_selects_safe_bounded_columns_only():
+    table = TableMeta(
+        table_name="customer",
+        table_comment="客户表",
+        columns=[
+            ColumnMeta(name="STATUS", type="varchar", comment="客户状态"),
+            ColumnMeta(name="PRODUCT_CODE", type="varchar", comment="产品编码"),
+            ColumnMeta(name="AMT", type="decimal", comment="贷款金额"),
+            ColumnMeta(name="ID_NO", type="varchar", comment="身份证号", sensitive=True),
+            ColumnMeta(name="PASSWORD_HASH", type="varchar", comment="密码"),
+            ColumnMeta(name="RAW_BODY", type="blob", comment="原始报文"),
+        ],
+    )
+    ex = FakeSchemaExecutor({"customer": {"comment": "客户表", "columns": []}})
+    ex.samples["customer"] = [{
+        "STATUS": "正常", "PRODUCT_CODE": "P01", "AMT": 1000,
+    }]
+
+    summary = profile_table(ex, table, max_columns=2, sensitive_mode="skip")
+
+    sample_sql = ex.executed_sql[-1]
+    assert "`STATUS`" in sample_sql
+    assert "`PRODUCT_CODE`" in sample_sql
+    assert "`AMT`" not in sample_sql
+    assert "ID_NO" not in sample_sql
+    assert "PASSWORD_HASH" not in sample_sql
+    assert "RAW_BODY" not in sample_sql
+    assert table.columns[0].profile["examples"] == ["正常"]
+    assert table.columns[3].profile == {}
+    assert summary == {
+        "status": "sampled", "sampled_columns": 2,
+        "sampled_rows": 1, "skipped_columns": 4,
+    }
+
+
+def test_vector_text_only_contains_safe_enum_examples():
+    text = build_column_level_text("customer", [
+        ("STATUS", {"category": "enum", "examples": ["正常", "逾期"]}),
+        ("NAME", {"category": "text", "examples": ["张三"]}),
+        ("ID_TYPE", {"category": "enum", "examples": ["身份证"], "sensitive": True}),
+    ])
+
+    assert "正常" in text and "逾期" in text
+    assert "张三" not in text
+    assert "身份证" not in text
 
 
 # ---------------- 验收 1/2:质量判断 ----------------
@@ -222,6 +275,29 @@ def test_incremental_only_processes_changed(tmp_path):
     report = sync("ds", "s", deps, _config(), store, mode="incremental", catalog_dir=tmp_path)
     assert report.ingested == 1   # 只有 t2 被重处理
     assert report.skipped == 1    # t1 未变化
+
+
+def test_incremental_reprofiles_when_sampling_policy_changes(tmp_path):
+    tables = {"t1": _good_table()}
+    initial_config = json.loads(json.dumps(_config()))
+    ex = FakeSchemaExecutor(tables)
+    deps = _make_deps(ex)
+    store = ReviewStore(tmp_path / "review.db")
+    sync("ds", "s", deps, initial_config, store, mode="full", catalog_dir=tmp_path)
+
+    changed_config = json.loads(json.dumps(initial_config))
+    changed_config["profiling"]["max_columns_per_query"] = 1
+    ex = FakeSchemaExecutor(tables)
+    deps = _make_deps(ex)
+    report = sync(
+        "ds", "s", deps, changed_config, store,
+        mode="incremental", catalog_dir=tmp_path,
+    )
+
+    assert report.ingested == 1
+    assert report.skipped == 0
+    sample_queries = [sql for sql in ex.executed_sql if "FROM `t1`" in sql]
+    assert len(sample_queries) == 1
 
 
 # ---------------- 验收 6:删表清理幽灵表 ----------------
@@ -397,3 +473,18 @@ class _FakeCommentLLM:
     def complete_json(self, prompt, schema, retries=1):
         self.calls += 1
         return {"table_comment": "坏表说明", "columns": {"A": "字段A说明", "B": "字段B说明"}}
+
+
+def test_comment_generation_reuses_profile_without_second_sample_query(tmp_path, monkeypatch):
+    ex = FakeSchemaExecutor({"bad_table": _bad_table()})
+    ex.samples["bad_table"] = [{"A": 1, "B": "样例"}]
+    deps = _make_deps(ex, monkeypatch, _FakeCommentLLM())
+    store = ReviewStore(tmp_path / "review.db")
+
+    sync("ds", "s", deps, _config(), store, mode="full", catalog_dir=tmp_path)
+
+    data_queries = [
+        sql for sql in ex.executed_sql
+        if "FROM `bad_table`" in sql and "INFORMATION_SCHEMA" not in sql.upper()
+    ]
+    assert len(data_queries) == 1

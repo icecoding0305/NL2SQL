@@ -9,6 +9,7 @@ export const clearAccessToken = () => localStorage.removeItem(ACCESS_TOKEN_KEY);
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getAccessToken();
   const resp = await fetch(path, {
+    cache: "no-store",
     ...init,
     headers: {
       "Content-Type": "application/json",
@@ -18,7 +19,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
-    throw new Error((body as { detail?: string }).detail || `HTTP ${resp.status}`);
+    const detail = (body as { detail?: string | { message?: string; errors?: string[] } }).detail;
+    const message = typeof detail === "string"
+      ? detail
+      : detail?.errors?.join("；") || detail?.message;
+    throw new Error(message || `HTTP ${resp.status}`);
   }
   return resp.json() as Promise<T>;
 }
@@ -29,6 +34,17 @@ export const apiPost = <T>(path: string, body?: unknown) =>
 export const apiPut = <T>(path: string, body?: unknown) =>
   request<T>(path, { method: "PUT", body: JSON.stringify(body ?? {}) });
 export const apiDelete = <T>(path: string) => request<T>(path, { method: "DELETE" });
+
+const adminRequest = <T>(path: string, method: "POST" | "PUT" | "DELETE", body?: unknown) =>
+  request<T>(path, {
+    method,
+    headers: { "X-Admin-Token": localStorage.getItem("admin_token") || getAccessToken() },
+    body: method === "DELETE" ? undefined : JSON.stringify(body ?? {}),
+  });
+
+export const apiAdminPost = <T>(path: string, body?: unknown) => adminRequest<T>(path, "POST", body);
+export const apiAdminPut = <T>(path: string, body?: unknown) => adminRequest<T>(path, "PUT", body);
+export const apiAdminDelete = <T>(path: string) => adminRequest<T>(path, "DELETE");
 
 export interface QueryInput {
   user_query: string;

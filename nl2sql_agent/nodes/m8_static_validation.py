@@ -12,6 +12,7 @@ data_scope 只负责系统/表权限，不能作为表内字段过滤值。
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from sqlglot import exp
@@ -19,15 +20,91 @@ from sqlglot import exp
 from nl2sql_agent.state import NL2SQLState
 
 
+def _candidate_update(
+    state: NL2SQLState, status: str, errors: list[str] | None = None, sql: str | None = None
+) -> list:
+    """Update only the selected SQL candidate; retain rejected attempts for audit."""
+    updated = []
+    for candidate in state.query_candidates:
+        if candidate.stage == "sql" and candidate.selected:
+            updated.append(candidate.model_copy(update={
+                "status": status,
+                "validation_errors": list(errors or []),
+                "sql": sql if sql is not None else candidate.sql,
+            }))
+        else:
+            updated.append(candidate)
+    return updated
+
+
 def _fail(state: NL2SQLState, errors: list[str]) -> dict[str, Any]:
-    new_count = state.retry_count + 1
+    sql_hash = hashlib.sha256((state.generated_sql or "").encode("utf-8")).hexdigest()
+    failed_hashes = list(state.failed_sql_hashes or [])
+    repeated = bool(state.generated_sql) and sql_hash in failed_hashes
+    if state.generated_sql and not repeated:
+        failed_hashes.append(sql_hash)
+    non_retryable = state.sql_generation_source == "deterministic" or repeated
+    new_count = state.max_retries if non_retryable else state.retry_count + 1
     out: dict[str, Any] = {
         "validation_errors": [*state.validation_errors[-5:], *errors],
         "retry_count": new_count,
+        "failed_sql_hashes": failed_hashes,
+        **({"query_candidates": _candidate_update(state, "rejected", errors)}
+           if state.query_candidates else {}),
     }
     if new_count >= state.max_retries:
-        out["final_answer"] = "SQL 生成多次校验失败,请人工介入\n" + "；".join(errors[:5])
+        out["terminal_status"] = "error"
+        reason = "确定性 SQL 编译结果未通过校验" if non_retryable else "SQL 生成多次校验失败"
+        out["final_answer"] = reason + ",请人工介入\n" + "；".join(errors[:5])
     return out
+
+
+def _plan_shape_errors(expr, state: NL2SQLState) -> list[str]:
+    """Verify material QueryPlan operators survived SQL translation."""
+    plan = state.query_plan
+    if plan is None:
+        return []
+    selects = list(expr.find_all(exp.Select))
+    root_select = expr if isinstance(expr, exp.Select) else (selects[0] if selects else None)
+    if root_select is None:
+        return ["SQL 缺少可验证的 SELECT 结构"]
+
+    has_where = any(select.args.get("where") is not None for select in selects)
+    has_having = any(select.args.get("having") is not None for select in selects)
+    has_group = any(select.args.get("group") is not None for select in selects)
+    root_order = root_select.args.get("order")
+    root_limit = root_select.args.get("limit")
+    errors: list[str] = []
+
+    if bool(plan.filters) != has_where:
+        errors.append("SQL WHERE 与已验证 QueryPlan 的过滤要求不一致")
+    if bool(plan.having) != has_having:
+        errors.append("SQL HAVING 与已验证 QueryPlan 的聚合过滤要求不一致")
+    if bool(plan.group_by) != has_group:
+        errors.append("SQL GROUP BY 与已验证 QueryPlan 的分组要求不一致")
+
+    actual_orders = list(root_order.expressions) if root_order is not None else []
+    if len(actual_orders) != len(plan.order_by):
+        errors.append("SQL ORDER BY 数量与已验证 QueryPlan 不一致")
+    else:
+        for expected, actual in zip(plan.order_by, actual_orders):
+            actual_direction = "desc" if bool(actual.args.get("desc")) else "asc"
+            if actual_direction != expected.direction:
+                errors.append(
+                    f"SQL 排序方向不一致：{expected.concept} 应为 {expected.direction}"
+                )
+
+    actual_limit = None
+    if root_limit is not None and root_limit.expression is not None:
+        try:
+            actual_limit = int(root_limit.expression.this)
+        except (TypeError, ValueError):
+            actual_limit = None
+    if actual_limit != plan.limit:
+        errors.append(
+            f"SQL LIMIT 与已验证 QueryPlan 不一致：期望={plan.limit!r}，实际={actual_limit!r}"
+        )
+    return errors
 
 
 def make_static_validation_node(deps):
@@ -52,7 +129,14 @@ def make_static_validation_node(deps):
                 "validation_errors": [f"命中危险操作: {danger},禁止执行"],
                 "blocked_reason": danger,
                 "final_answer": f"SQL 被拦截: 检测到危险操作 {danger}",
+                **({"query_candidates": _candidate_update(
+                    state, "rejected", [f"命中危险操作: {danger}"]
+                )} if state.query_candidates else {}),
             }
+
+        plan_shape_errors = _plan_shape_errors(expr, state)
+        if plan_shape_errors:
+            return _fail(state, plan_shape_errors)
 
         # data_scope 是系统命名空间，不是任何表字段的业务值。即使模型或旧 few-shot
         # 误把 risk_mart/dw/core 写进 WHERE，也在确定性校验层拦截并要求重新生成。
@@ -173,6 +257,8 @@ def make_static_validation_node(deps):
                         "validation_errors": [reason],
                         "blocked_reason": reason,
                         "final_answer": "查询因行级权限配置不完整而被阻断。",
+                        **({"query_candidates": _candidate_update(state, "rejected", [reason])}
+                           if state.query_candidates else {}),
                     }
                 injected = sqlsvc.to_sql(expr, dialect)
                 for qualifier in qualifiers:
@@ -180,8 +266,17 @@ def make_static_validation_node(deps):
                     injected = sqlsvc.inject_row_level_filter(
                         injected_expr, dialect, column, qualifier, values
                     )
-                return {"generated_sql": injected, "validation_errors": []}
+                return {
+                    "generated_sql": injected,
+                    "validation_errors": [],
+                    **({"query_candidates": _candidate_update(state, "validated", sql=injected)}
+                       if state.query_candidates else {}),
+                }
 
-        return {"validation_errors": []}
+        return {
+            "validation_errors": [],
+            **({"query_candidates": _candidate_update(state, "validated")}
+               if state.query_candidates else {}),
+        }
 
     return static_validation_node

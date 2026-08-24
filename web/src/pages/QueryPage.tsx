@@ -10,6 +10,9 @@ import {
 } from "antd";
 import {
   ClockCircleOutlined,
+  DatabaseOutlined,
+  HistoryOutlined,
+  PlusOutlined,
   DownOutlined,
   ExclamationCircleOutlined,
   RightOutlined,
@@ -355,6 +358,7 @@ export default function QueryPage() {
   const [databases, setDatabases] = useState<DatabaseConfig[]>([]);
   const [databaseId, setDatabaseId] = useState<string>();
   const [input, setInput] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
   const controllers = useRef<Record<string, QueryController>>({});
   const [stoppingTraceId, setStoppingTraceId] = useState<string>();
   const activeTurns = useMemo(
@@ -703,19 +707,27 @@ export default function QueryPage() {
   return (
     <div className="query-workspace">
       <HistorySidebar
+        open={historyOpen}
         records={sidebarRecords}
         activeConversation={activeConversation}
-        onOpen={openHistory}
+        onOpen={(record) => { openHistory(record); setHistoryOpen(false); }}
         onRefresh={refreshHistory}
         onDelete={deleteConversation}
-        onNew={() => { setActiveConversation(null); setInput(""); }}
+        onNew={() => { setActiveConversation(null); setInput(""); setHistoryOpen(false); }}
+        onClose={() => setHistoryOpen(false)}
       />
 
       <main className="conversation-main">
         <div className="conversation-toolbar">
-          <Text strong>{active ? "数据对话" : "新对话"}</Text>
-          <Space>
-            <Text type="secondary">查询数据库</Text>
+          <div className="conversation-toolbar-main">
+            <Button type="text" icon={<HistoryOutlined />} onClick={() => setHistoryOpen(true)}>历史会话</Button>
+            <div className="conversation-title-block">
+              <Text strong>{active ? "数据对话" : "新对话"}</Text>
+              <Text type="secondary">{activeTurns.length ? `${activeTurns.length} 轮问答` : "开始一次新的数据探索"}</Text>
+            </div>
+          </div>
+          <Space className="conversation-toolbar-actions">
+            <DatabaseOutlined className="toolbar-database-icon" />
             <Select
               className="scope-select"
               value={databaseId}
@@ -734,11 +746,14 @@ export default function QueryPage() {
                 disabled: item.schema_status !== "ready",
               }))}
             />
+            <Button icon={<PlusOutlined />} onClick={() => { setActiveConversation(null); setInput(""); }}>新建</Button>
           </Space>
         </div>
         <div className="conversation-scroll">
           <ConversationThread
             sessions={activeTurns}
+            databaseName={databases.find((item) => item.id === databaseId)?.name}
+            onSuggestion={setInput}
             renderStep={(turn, node, title) => {
               const step = turn.steps[node];
               if (!step || step.status === "idle") return null;

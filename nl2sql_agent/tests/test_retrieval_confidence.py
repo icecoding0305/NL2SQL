@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import Command
 
 from nl2sql_agent.graph import build_graph
 from nl2sql_agent.services.executor import InMemoryExecutor
@@ -50,9 +49,11 @@ def test_acceptance_1_new_metric_not_blocked_at_module2(deps):
     snap = graph.get_state(cfg)
     # 模块2(时间范围)没有拦截(术语库没有"逾期总金额"也不能在模块2被拒答)
     assert snap.values.get("need_clarification") is False
-    # 走到了模块3,停在 clarify_low_confidence(提示继续,而非拒答)
-    assert snap.next == ("clarify_low_confidence",)
+    # 低置信由系统自动改写并重新召回，不再暂停让用户选择物理 Schema。
+    assert snap.next != ("clarify_low_confidence",)
     assert "schema_retrieval" in snap.values.get("trace_steps", [])
+    assert "rewrite_retrieval" in snap.values.get("trace_steps", [])
+    assert snap.values.get("retrieval_rewrite_count") == 1
 
 
 # ---------------- 验收 2:多相近物理表 → 系统自动规划 ----------------
@@ -98,9 +99,29 @@ def test_acceptance_3_field_candidates_become_business_options(deps):
     assert any("dwd_ar_loan_info.OVD_BAL" == value for value in bindings.values())
 
 
-# ---------------- 验收 4:低置信 → 继续 → 强制计划+强制人工确认 ----------------
+def test_identical_business_labels_do_not_become_user_choices(deps):
+    from nl2sql_agent.nodes.m3_schema_retrieval import _retain_true_business_ambiguities
+    from nl2sql_agent.state import FieldCandidate
 
-def test_acceptance_4_low_confidence_continue_forces_plan_and_review(deps):
+    ambiguities = {"产品编码": [
+        FieldCandidate(
+            table_name="dwd_ar_loan_info", column_name="PRD_CODE",
+            query_slot="产品编码", final_score=0.91,
+        ),
+        FieldCandidate(
+            table_name="dwd_ev_repay_detail", column_name="PRD_CODE",
+            query_slot="产品编码", final_score=0.90,
+        ),
+    ]}
+
+    assert _retain_true_business_ambiguities(
+        deps, ["risk_mart"], ambiguities
+    ) == {}
+
+
+# ---------------- 验收 4:低置信 → 自动改写重检索 → 统一计划 ----------------
+
+def test_acceptance_4_low_confidence_rewrites_without_user_interrupt(deps):
     llm = FakeLLM(
         sql_rules=[(r".*", SQLResult(
             "SELECT LOAN_NO FROM dwd_ar_loan_info", ["dwd_ar_loan_info"],
@@ -117,27 +138,13 @@ def test_acceptance_4_low_confidence_continue_forces_plan_and_review(deps):
     deps = build_test_deps(llm=llm, executor=InMemoryExecutor(tables=FAKE_TABLES))
     graph = build_graph(deps, checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "rc-a4"}}
-    graph.invoke(make_input("查询逾期的总金额"), cfg)
-    assert graph.get_state(cfg).next == ("clarify_low_confidence",)
-    result = graph.invoke(Command(resume={"continue": True}), cfg)
-    # 用户选择继续 → low_confidence_flag=True
+    result = graph.invoke(make_input("查询逾期的总金额"), cfg)
     assert result.get("low_confidence_flag") is True
-    # 所有查询统一走计划路径，不再依赖复杂度规则
+    assert result.get("retrieval_rewrite_count") == 1
+    assert result.get("trace_steps", []).count("schema_retrieval") == 2
+    assert "rewrite_retrieval" in result.get("trace_steps", [])
+    assert "clarify_low_confidence" not in result.get("trace_steps", [])
     assert "plan_generation" in result.get("trace_steps", [])
-    # 模块9 强制人工确认(即便其它敏感规则不命中),停在 human_review
-    assert result.get("is_sensitive") is True
-    assert graph.get_state(cfg).next == ("human_review",)
-
-
-def test_acceptance_4_low_confidence_abort_ends(deps):
-    graph = build_graph(deps, checkpointer=InMemorySaver())
-    cfg = {"configurable": {"thread_id": "rc-a4b"}}
-    graph.invoke(make_input("查询逾期的总金额"), cfg)
-    assert graph.get_state(cfg).next == ("clarify_low_confidence",)
-    result = graph.invoke(Command(resume={"continue": False}), cfg)
-    assert result.get("need_clarification") is True
-    assert not result.get("low_confidence_flag")  # 未设置继续标记
-    assert result.get("execution_result") is None
 
 
 # ---------------- 验收 5:高置信单一候选直接放行 ----------------

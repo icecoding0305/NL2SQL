@@ -85,6 +85,14 @@ def fetch_masked_sample_values(
     return samples
 
 
+def profile_sample_values(table: TableMeta, limit: int = 3) -> dict[str, list[str]]:
+    """Reuse collected safe profile samples without another database query."""
+    return {
+        column.name: [str(value) for value in column.profile.get("examples", [])[:limit]]
+        for column in table.columns
+    }
+
+
 # ---------------- LLM 生成候选注释 ----------------
 
 def _field_evidence(table: TableMeta, sample_values: dict[str, list[str]]) -> str:

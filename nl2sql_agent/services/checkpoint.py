@@ -51,6 +51,7 @@ def checkpoint_serializer() -> JsonPlusSerializer:
                 "QueryMSchema",
                 "LogicalOperation",
                 "LogicalPlan",
+                "QueryCandidate",
             )
         ]
     )

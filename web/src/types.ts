@@ -141,8 +141,40 @@ export interface DatabaseRelation {
   preferred_join_type: "inner" | "left";
   description?: string;
   enabled: boolean;
+  status: "candidate" | "inferred" | "verified" | "confirmed" | "rejected";
+  source: "user_configured" | "schema_relation_discovery" | string;
+  confidence: number;
+  evidence: string[];
+  validation_summary: Record<string, unknown>;
   created_at?: string;
   updated_at?: string;
+}
+
+export type KnowledgeType = "term" | "synonym" | "business_rule" | "optimization_case";
+export type KnowledgeStatus = "draft" | "published" | "disabled";
+
+export interface KnowledgeItem {
+  id: string;
+  knowledge_type: KnowledgeType;
+  name: string;
+  description: string;
+  database_id?: string | null;
+  namespace: string;
+  status: KnowledgeStatus;
+  priority: number;
+  version: number;
+  payload: Record<string, unknown>;
+  source: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  published_at?: string | null;
+}
+
+export interface KnowledgeSummary {
+  total: number;
+  by_type: Record<KnowledgeType, number>;
+  by_status: Record<KnowledgeStatus, number>;
 }
 
 // WebSocket 推送的 pipeline 节点事件(node 与后端节点名一致)

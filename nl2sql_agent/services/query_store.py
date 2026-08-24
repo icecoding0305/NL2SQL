@@ -48,6 +48,9 @@ class QueryStore:
                     plan_json       TEXT,
                     logical_plan    TEXT,
                     query_mschema   TEXT,
+                    query_mschema_precision TEXT,
+                    query_mschema_recall TEXT,
+                    query_candidates TEXT,
                     retrieved_schema TEXT,
                     sensitive_reasons TEXT,
                     execution_result TEXT,
@@ -98,6 +101,9 @@ class QueryStore:
                 "next_node TEXT",
                 "logical_plan TEXT",
                 "query_mschema TEXT",
+                "query_mschema_precision TEXT",
+                "query_mschema_recall TEXT",
+                "query_candidates TEXT",
                 "retrieval_confidence REAL",
                 "retrieval_candidates TEXT",
                 "query_intent TEXT",
@@ -307,7 +313,9 @@ class QueryStore:
         d = dict(row)
         d["conversation_id"] = d.get("conversation_id") or d.get("trace_id")
         for key in (
-            "data_scope", "plan_json", "logical_plan", "query_mschema", "retrieved_schema", "sensitive_reasons",
+            "data_scope", "plan_json", "logical_plan", "query_mschema",
+            "query_mschema_precision", "query_mschema_recall", "query_candidates",
+            "retrieved_schema", "sensitive_reasons",
             "execution_result", "result_summary", "trace_steps", "node_latencies", "node_latency_history",
             "llm_calls", "retrieval_candidates",
             "query_intent", "resolved_query", "semantic_graph", "semantic_coverage", "business_clarification", "decision_summary",

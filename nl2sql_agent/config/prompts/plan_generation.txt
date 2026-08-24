@@ -28,9 +28,15 @@ PLATFORM_CODE、business_line 等过滤条件；行级权限由后续确定性�
 {retry_feedback}
 </RETRY_DATA>
 
+以下是按查询骨架检索到的结构示例，仅用于参考算子组合，不包含也不授权任何物理表、字段或取值。
+不得从示例推断标识符；本次可用标识符仍仅以 SCHEMA_DATA 为准。
+<FEW_SHOT_DATA format="json">
+{few_shot_block}
+</FEW_SHOT_DATA>
+
 要求：
 - 只规划 SELECT，不规划写操作、DDL、存储过程或外部调用
-- SCHEMA_DATA 只能包含本次查询裁剪后的 query_mschema 和业务语义，严禁索取、推断或使用完整数据库 Schema
+- SCHEMA_DATA 只包含本次查询裁剪后的 query_mschema 和业务语义，是唯一可用 Schema；严禁索取、推断或使用完整数据库 Schema
 - target_tables、字段只能来自 SCHEMA_DATA.query_mschema.tables；未出现的表和字段一律视为不可用
 - 严格采用 query_mschema.tables 的角色和最小关系子图，bridge 表不是替代主表
 - JOIN 只能采用 SCHEMA_DATA.query_mschema.relations 中的关系，并严格使用给出的两侧字段；没有合格关系时不得猜测 JOIN
@@ -45,10 +51,12 @@ PLATFORM_CODE、business_line 等过滤条件；行级权限由后续确定性�
 - 必须显式填写 output_fields 和 output_grain。output_fields 只描述最终返回列；output_grain 描述每一行代表实体、明细记录、分组聚合还是全局聚合
 - output_grain.level=entity/record 时必须给出可用的 keys；level=aggregate 时 keys 必须与 group_by 完全一致；level=global 时 keys 必须为空
 - semantic_graph 中的 group_by、order_by、limit 是用户查询契约，必须分别原样落实到 QueryPlan.group_by、order_by、limit，不得遗漏
+- 每个 filters/having 条件都必须绑定至少一个真实的 source_atom_ids；不得因为返回“逾期情况、贷款情况”等字段而擅自增加状态过滤
+- output_grain.level 为 entity/record/aggregate 时，output_fields 必须返回 output_grain.keys 对应的粒度键；多表明细还应包含用户目标实体的主键，确保每行结果可识别；如果同时存在聚合输出，粒度键还必须进入 group_by
+- 聚合输出和非聚合输出同时存在时，所有非聚合字段必须进入 group_by；无法满足时应调整输出粒度或删除未经用户要求的字段
 - output_bindings 中的 aggregation 是已经确认的计算方式；同一个物理字段可以分别生成 SUM、AVG 等多个独立 output_fields，不得合并
 - 普通行级条件写入 filters；累计、合计、平均、最大、最小等聚合结果条件必须写入 having，并声明 aggregation，禁止写入 WHERE
 - filters.scope 必须区分 row/cohort/measure；多事实查询中 cohort 条件用于限制最终实体集合，measure 条件只影响所属指标子计划
-- SCHEMA_DATA.query_mschema 是唯一可用 Schema，必须只以它规划字段与关系；不得请求完整 Schema 或从数据库常识猜测额外字段
 - status、exists、not_exists 条件必须落实为可执行过滤/连接语义；无法实现时降低置信度并让校验失败，禁止静默删除
 - 正向 exists 应把父 atom_id 标注到实现该存在关系的 join/filter；服务端会在所有子条件已完整实现时做确定性补全。not_exists 不会自动补全，必须明确规划反连接语义
 - 当 query_intent.query_type=fact_filter 且用户要求返回实体信息/列表时，条件只写入 filters，metric_logic 必须为 null；“统计”不能被擅自理解为 SUM/COUNT
@@ -59,7 +67,8 @@ PLATFORM_CODE、business_line 等过滤条件；行级权限由后续确定性�
 - join_type 只能是 inner/left/right/full/cross；filter operator 只能使用 QueryPlan 支持的标准运算符
 - confidence 是对当前计划事实完备性的评估；缺少口径或 JOIN 事实时必须降低
 - metric_logic 只能为 null，或严格使用 {{"metric_name":"...","definition":"...","columns":["table.column"],"expression":null,"source_atom_ids":["atom_id"]}}；禁止使用 name、field 等未定义键
+- order_by 每项只能使用 {{"concept":"贷款总金额","table":"table","column":"loan_amt","expression":null,"direction":"desc","source_output_id":"output_2","aggregation":"sum"}}；禁止复制 semantic_graph.order_by 中的 grounding_concept、source_text
 - 只输出符合以下 QueryPlan 结构的实际数据，不输出解释文字：
-  {{"target_tables":["table"],"join_logic":[{{"left_table":"table","right_table":"table","left_column":"column","right_column":"column","join_type":"inner","source_atom_ids":[]}}],"filters":[{{"column":"column","operator":">","value":10000,"table":"table","source_atom_ids":["atom_1"],"scope":"row","aggregation":null}}],"having":[],"metric_logic":null,"group_by":[],"order_by":[],"limit":null,"output_fields":[{{"concept":"客户姓名","table":"table","column":"customer_name","expression":null,"alias":null,"aggregation":null,"source_output_ids":["output_1"]}}],"output_grain":{{"level":"entity","entity":"客户","keys":["table.customer_id"],"description":"每行一位客户"}},"covered_atom_ids":["atom_1"],"covered_output_ids":["output_1"],"confidence":0.9}}
+  {{"target_tables":["table"],"join_logic":[{{"left_table":"table","right_table":"table","left_column":"column","right_column":"column","join_type":"inner","source_atom_ids":[]}}],"filters":[{{"column":"column","operator":">","value":10000,"table":"table","source_atom_ids":["atom_1"],"scope":"row","aggregation":null}}],"having":[],"metric_logic":null,"group_by":["table.product_code"],"order_by":[{{"concept":"贷款总金额","table":"table","column":"loan_amt","expression":null,"direction":"desc","source_output_id":"output_2","aggregation":"sum"}}],"limit":3,"output_fields":[{{"concept":"产品","table":"table","column":"product_code","expression":null,"alias":"产品","aggregation":null,"source_output_ids":["output_1"]}},{{"concept":"贷款总金额","table":"table","column":"loan_amt","expression":null,"alias":"贷款总金额","aggregation":"sum","source_output_ids":["output_2"]}}],"output_grain":{{"level":"aggregate","entity":"产品","keys":["table.product_code"],"description":"按产品分组统计"}},"covered_atom_ids":[],"covered_output_ids":["output_1","output_2"],"confidence":0.9}}
 
 输出字段：target_tables、join_logic[]、filters[]、having[]、metric_logic、group_by[]、order_by[]、limit、output_fields[]、output_grain、covered_atom_ids[]、covered_output_ids[]、confidence。

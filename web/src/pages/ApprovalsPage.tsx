@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  Alert,
   Button,
   Card,
   Drawer,
@@ -19,7 +20,9 @@ import { PIPELINE_NODES, type QueryRecord } from "../types";
 import { StepCard, stepsFromState, type StepState } from "./QueryPage";
 import { buildBaseColumns, StatusTag } from "../components/queryColumns";
 
-const { Text } = Typography;
+import { ReloadOutlined, SafetyCertificateOutlined } from "@ant-design/icons";
+
+const { Text, Title } = Typography;
 
 function waitText(createdAt?: string) {
   if (!createdAt) return "未知";
@@ -38,10 +41,16 @@ export default function ApprovalsPage() {
   const [rejectReason, setRejectReason] = useState("");
   const [target, setTarget] = useState<QueryRecord | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const refresh = useCallback(async () => {
-    const list = await apiGet<QueryRecord[]>("/api/approvals").catch(() => []);
-    setItems(list);
+  const refresh = useCallback(async (manual = false) => {
+    if (manual) setRefreshing(true);
+    try {
+      const list = await apiGet<QueryRecord[]>("/api/approvals").catch(() => []);
+      setItems(list);
+    } finally {
+      if (manual) setRefreshing(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -130,13 +139,62 @@ export default function ApprovalsPage() {
     },
   ];
 
+  const urgentCount = items.filter((item) => (
+    item.created_at
+      ? (Date.now() - new Date(item.created_at).getTime()) / 1000 > URGENT_SECONDS
+      : false
+  )).length;
+
   return (
-    <Card title={`审批队列(${items.length})`}>
-      {items.length === 0 ? (
-        <Empty description="没有待审批的敏感查询" />
-      ) : (
-        <Table size="small" rowKey="trace_id" columns={columns} dataSource={items} pagination={false} />
-      )}
+    <div className="management-page approval-page">
+      <div className="management-page-header">
+        <div>
+          <Space size={10}>
+            <span className="page-icon approval-page-icon"><SafetyCertificateOutlined /></span>
+            <Title level={3} style={{ margin: 0 }}>查询审批</Title>
+          </Space>
+          <Text type="secondary">审核命中敏感规则的查询，查看完整生成过程并决定是否继续执行。</Text>
+        </div>
+        <Button icon={<ReloadOutlined />} loading={refreshing} onClick={() => void refresh(true)}>
+          刷新队列
+        </Button>
+      </div>
+
+      <div className="approval-summary-grid">
+        <Card className="approval-summary-card">
+          <Text type="secondary">待审批</Text>
+          <Text strong>{items.length}</Text>
+        </Card>
+        <Card className={`approval-summary-card ${urgentCount > 0 ? "urgent" : ""}`}>
+          <Text type="secondary">等待超过 10 分钟</Text>
+          <Text strong>{urgentCount}</Text>
+        </Card>
+      </div>
+
+      <Alert
+        className="management-alert"
+        type={urgentCount > 0 ? "warning" : "info"}
+        showIcon
+        message={urgentCount > 0 ? `有 ${urgentCount} 条查询等待时间较长` : "审批队列每 10 秒自动更新"}
+        description="通过后查询会从中断点继续执行；驳回原因会进入反馈闭环，帮助后续修正规则和术语映射。"
+      />
+
+      <Card className="management-card approval-list-card" title="待处理查询">
+        {items.length === 0 ? (
+          <div className="approval-empty-state"><Empty description="没有待审批的敏感查询" /></div>
+        ) : (
+          <Table
+            rowKey="trace_id"
+            columns={columns}
+            dataSource={items}
+            pagination={{ pageSize: 10, hideOnSinglePage: true }}
+            scroll={{ x: 1080 }}
+            rowClassName={(record) => record.created_at
+              && (Date.now() - new Date(record.created_at).getTime()) / 1000 > URGENT_SECONDS
+              ? "approval-row-urgent" : ""}
+          />
+        )}
+      </Card>
 
       {/* 审批确认:驳回必须填原因 */}
       <Modal
@@ -168,6 +226,7 @@ export default function ApprovalsPage() {
 
       {/* 审批详情:完整 pipeline 过程 */}
       <Drawer
+        className="approval-detail-drawer"
         title={`查询详情 ${detail?.trace_id || ""}`}
         open={open}
         onClose={() => setOpen(false)}
@@ -191,7 +250,7 @@ export default function ApprovalsPage() {
           </div>
         )}
       </Drawer>
-    </Card>
+    </div>
   );
 }
 

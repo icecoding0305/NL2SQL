@@ -8,7 +8,7 @@
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class SchemaHit(BaseModel):
@@ -48,6 +48,43 @@ class QueryAssumption(BaseModel):
     content: str
     source: Literal["user", "conversation", "configured_default", "system_inference"]
     materiality: Literal["low", "medium", "high"] = "low"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_model_output(cls, value):
+        """Accept common model aliases without paying for a second LLM call."""
+        if isinstance(value, str):
+            return {
+                "content": value,
+                "source": "system_inference",
+                "materiality": "low",
+            }
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if not normalized.get("content"):
+            normalized["content"] = (
+                normalized.get("assumption")
+                or normalized.get("description")
+                or normalized.get("text")
+            )
+        source = str(normalized.get("source") or "system_inference").lower()
+        normalized["source"] = {
+            "inferred": "system_inference",
+            "inference": "system_inference",
+            "system": "system_inference",
+            "default": "configured_default",
+            "context": "conversation",
+        }.get(source, source)
+        if normalized["source"] not in {
+            "user", "conversation", "configured_default", "system_inference",
+        }:
+            normalized["source"] = "system_inference"
+        materiality = str(normalized.get("materiality") or "low").lower()
+        normalized["materiality"] = (
+            materiality if materiality in {"low", "medium", "high"} else "low"
+        )
+        return normalized
 
 
 class SemanticSubject(BaseModel):
@@ -197,7 +234,10 @@ class ProjectionFieldSelection(BaseModel):
 
 class ProjectionFieldExclusion(BaseModel):
     business_label: str
-    reason: str
+    # Exclusion rationale is display metadata, not a SQL correctness field.
+    # Some compatible models occasionally omit it; do not invalidate an
+    # otherwise usable projection decision for that omission.
+    reason: str = ""
 
 
 class ProjectionDecision(BaseModel):
@@ -352,6 +392,35 @@ class OrderSpec(_PlanPart):
     expression: Optional[str] = None
     direction: Literal["asc", "desc"] = "asc"
     source_output_id: Optional[str] = None
+    # Models often express an aggregate sort as {column, aggregation}. The
+    # normalizer binds it to source_output_id, but accepting the semantic hint
+    # keeps an otherwise valid plan from failing structural parsing first.
+    aggregation: Optional[Literal[
+        "count", "count_distinct", "sum", "avg", "min", "max",
+    ]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_model_order_shape(cls, value):
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        operator = data.pop("operator", None)
+        # Ordering is traced to a semantic output, not a predicate atom. Some
+        # models copy the filter shape here; discard that inapplicable key and
+        # let structural normalization bind source_output_id authoritatively.
+        data.pop("source_atom_ids", None)
+        # These keys belong to SemanticOrder, not the physical QueryPlan. They
+        # are harmless model hints; the normalizer binds the authoritative
+        # physical order through concept/source_output_id after parsing.
+        data.pop("grounding_concept", None)
+        data.pop("source_text", None)
+        if operator and not data.get("direction"):
+            normalized = str(operator).strip().lower()
+            data["direction"] = "desc" if normalized in {
+                "desc", "descending", "降序", "高到低",
+            } else "asc"
+        return data
 
 
 class OutputGrain(_PlanPart):
@@ -381,6 +450,27 @@ class QueryPlan(BaseModel):
     order_by: list[OrderSpec] = Field(default_factory=list)
     limit: Optional[int] = Field(default=None, ge=1)
     output_fields: list[OutputFieldSpec] = Field(default_factory=list)
+
+    @field_validator("group_by", mode="before")
+    @classmethod
+    def normalize_model_group_by_shape(cls, value):
+        normalized = []
+        for item in value or []:
+            if not isinstance(item, dict):
+                normalized.append(item)
+                continue
+            table = item.get("table") or item.get("table_name")
+            column = item.get("column") or item.get("column_name")
+            expression = item.get("expression")
+            if table and column:
+                normalized.append(f"{table}.{column}")
+            elif column:
+                normalized.append(str(column))
+            elif expression:
+                normalized.append(str(expression))
+            else:
+                normalized.append(item)
+        return normalized
     output_grain: OutputGrain = Field(default_factory=OutputGrain)
     covered_atom_ids: list[str] = Field(default_factory=list)
     covered_output_ids: list[str] = Field(default_factory=list)
@@ -418,6 +508,7 @@ class QueryMSchema(BaseModel):
     """Minimal, query-scoped projection of the effective M-Schema."""
 
     model_config = ConfigDict(extra="forbid")
+    profile: Literal["precision", "recall"] = "precision"
     tables: list[QuerySchemaTable] = Field(default_factory=list)
     relations: list[QuerySchemaRelation] = Field(default_factory=list)
     semantic_bindings: dict[str, dict] = Field(default_factory=dict)
@@ -454,6 +545,31 @@ class LogicalPlan(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class QueryCandidate(BaseModel):
+    """One auditable plan/SQL candidate, independent of its generation source."""
+
+    model_config = ConfigDict(extra="forbid")
+    candidate_id: str
+    stage: Literal["plan", "sql"]
+    source: Literal[
+        "plan_model", "deterministic_compiler", "model_sql_fallback",
+        "model_sql_candidate", "model_sql_refiner",
+    ]
+    schema_profile: Literal["precision", "recall"] = "precision"
+    status: Literal[
+        "generated", "normalized", "validated", "compiled", "rejected",
+        "executed", "execution_error",
+    ] = "generated"
+    query_plan: Optional[QueryPlan] = None
+    logical_plan: Optional[LogicalPlan] = None
+    sql: Optional[str] = None
+    validation_errors: list[str] = Field(default_factory=list)
+    execution_error: Optional[str] = None
+    selected: bool = False
+    score: Optional[float] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class NL2SQLState(BaseModel):
     # ---------- 模块 1:用户提问 ----------
     user_query: str
@@ -488,6 +604,8 @@ class NL2SQLState(BaseModel):
     # 检索置信度与候选(模块 3.5 判定用)
     retrieval_confidence: float = 0.0
     retrieval_candidates: list[SchemaHit] = Field(default_factory=list)
+    retrieval_rewrite_count: int = 0
+    retrieval_rewrites: list[str] = Field(default_factory=list)
     # 术语精确命中的主表数(不含向量补充的关联表),供复杂度判断
     main_table_count: int = 0
     low_confidence_flag: bool = False
@@ -506,7 +624,10 @@ class NL2SQLState(BaseModel):
     # ---------- 模块 5b/6:计划 ----------
     query_plan: Optional[QueryPlan] = None
     query_mschema: Optional[QueryMSchema] = None
+    query_mschema_precision: Optional[QueryMSchema] = None
+    query_mschema_recall: Optional[QueryMSchema] = None
     logical_plan: Optional[LogicalPlan] = None
+    query_candidates: list[QueryCandidate] = Field(default_factory=list)
     plan_normalizations: list[str] = Field(default_factory=list)
     plan_validation_errors: list[str] = Field(default_factory=list)
     plan_generation_error_kind: Optional[str] = None
@@ -520,6 +641,8 @@ class NL2SQLState(BaseModel):
     validation_errors: list[str] = Field(default_factory=list)
     retry_count: int = 0
     max_retries: int = 3
+    sql_generation_source: Optional[Literal["deterministic", "model"]] = None
+    failed_sql_hashes: list[str] = Field(default_factory=list)
     # 危险操作(非 SELECT)硬失败,不进入重试
     blocked_reason: Optional[str] = None
 

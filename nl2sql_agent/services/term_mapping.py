@@ -37,8 +37,9 @@ class TermResolution:
 
 
 class TermMappingService:
-    def __init__(self, loader: ConfigLoader):
+    def __init__(self, loader: ConfigLoader, overlay_entries: dict[str, dict] | None = None):
         self.loader = loader
+        self.overlay_entries = dict(overlay_entries or {})
         self._namespaces: dict[str, dict[str, TermEntry]] = {}
         self._global: dict[str, TermEntry] = {}
         self._mtimes: tuple[int, ...] = ()
@@ -66,6 +67,17 @@ class TermMappingService:
                     self._global[term] = entry
                 else:
                     self._namespaces.setdefault(ns_name, {})[term] = entry
+        for term, cfg in self.overlay_entries.items():
+            namespace = str(cfg.get("business_line") or "global")
+            entry = TermEntry(
+                term=term,
+                business_line=namespace,
+                resolved_fields=[str(x) for x in cfg.get("resolved_fields", [])],
+                definition=str(cfg.get("definition") or ""),
+                composite_metric=bool(cfg.get("composite_metric", False)),
+                aliases=[str(x) for x in cfg.get("aliases", [])],
+            )
+            self._namespaces.setdefault(namespace, {})[term] = entry
         self._mtimes = self._current_mtimes()
 
     def _current_mtimes(self) -> tuple[int, ...]:

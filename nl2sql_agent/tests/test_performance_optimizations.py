@@ -4,7 +4,7 @@ from sqlglot import exp
 
 from nl2sql_agent.nodes.m2_query_resolution import _should_use_llm_resolution
 from nl2sql_agent.nodes.m5b_plan_generation import build_plan_prompt
-from nl2sql_agent.nodes.m7_sql_generation import build_prompt_from_query
+from nl2sql_agent.nodes.m7_sql_generation import build_prompt_from_plan, build_prompt_from_query
 from nl2sql_agent.services.deps import build_deps
 from nl2sql_agent.services.executor import InMemoryExecutor
 from nl2sql_agent.services.sql_compiler import UnsupportedPlanError, compile_query_plan
@@ -116,3 +116,28 @@ def test_runtime_prompts_never_include_complete_retrieved_schema(deps):
         assert "FULL_SCHEMA_SECRET" not in prompt
         assert "UNPLANNED_SECRET" not in prompt
         assert '"query_mschema"' in prompt
+
+
+def test_validated_plan_sql_fallback_does_not_reinterpret_conversation(deps):
+    state = _state("当前问题不应再次解释")
+    state.conversation_history = [
+        {"role": "user", "content": "previous-conversation-secret"},
+    ]
+    state.retrieved_schema = [SchemaHit(table_name="loan", columns=[
+        {"name": "CUST_ID", "type": "varchar", "comment": "客户编号"},
+    ])]
+    state.schema_plan = SchemaPlan(anchor_tables=[{
+        "table_name": "loan", "role": "primary_fact",
+        "selected_columns": ["CUST_ID"],
+    }])
+    state.query_plan = QueryPlan(
+        target_tables=["loan"],
+        output_fields=[{"concept": "客户", "table": "loan", "column": "CUST_ID"}],
+        output_grain={"level": "record", "keys": ["loan.CUST_ID"]},
+    )
+
+    prompt = build_prompt_from_plan(state, deps)
+
+    assert "previous-conversation-secret" not in prompt
+    assert "当前问题不应再次解释" not in prompt
+    assert "CUST_ID" in prompt

@@ -17,8 +17,12 @@ from nl2sql_agent.state import (
 )
 
 
-def build_query_mschema(state: NL2SQLState) -> QueryMSchema:
-    """Build the smallest useful schema view from retrieval and grounding facts."""
+def build_query_mschema(
+    state: NL2SQLState, profile: str = "precision"
+) -> QueryMSchema:
+    """Build a bounded query schema; recall adds alternatives without adding tables."""
+    if profile not in {"precision", "recall"}:
+        raise ValueError(f"unsupported Query M-Schema profile: {profile}")
     roles: dict[str, str] = {}
     selected: dict[str, set[str]] = {}
     if state.schema_plan:
@@ -52,6 +56,20 @@ def build_query_mschema(state: NL2SQLState) -> QueryMSchema:
             if table and column:
                 selected.setdefault(table, set()).add(column)
 
+    if profile == "recall":
+        # Preserve the planned table subgraph. Only add strong alternative columns
+        # on those tables, so expanded recall cannot invent a disconnected JOIN.
+        by_slot: dict[str, list] = {}
+        for candidate in state.field_candidates:
+            by_slot.setdefault(candidate.query_slot, []).append(candidate)
+        for candidates in by_slot.values():
+            candidates.sort(key=lambda item: item.final_score, reverse=True)
+            top_score = candidates[0].final_score if candidates else 0.0
+            threshold = max(0.42, top_score * 0.75)
+            for candidate in candidates:
+                if candidate.table_name in roles and candidate.final_score >= threshold:
+                    selected.setdefault(candidate.table_name, set()).add(candidate.column_name)
+
     planned_tables = set(roles)
     tables: list[QuerySchemaTable] = []
     for hit in state.retrieved_schema:
@@ -69,7 +87,8 @@ def build_query_mschema(state: NL2SQLState) -> QueryMSchema:
             wanted.update(
                 str(column.get("name")) for column in hit.columns[:8] if column.get("name")
             )
-        source_columns = [c for c in hit.columns if c.get("name") in wanted][:16]
+        column_limit = 24 if profile == "recall" else 16
+        source_columns = [c for c in hit.columns if c.get("name") in wanted][:column_limit]
         columns = [
             QuerySchemaColumn(
                 name=column.get("name", ""),
@@ -107,11 +126,17 @@ def build_query_mschema(state: NL2SQLState) -> QueryMSchema:
         if relation.get("source_table") and relation.get("target_table")
     ]
     return QueryMSchema(
+        profile=profile,
         tables=tables,
         relations=query_relations,
         semantic_bindings=state.semantic_bindings,
         output_bindings=state.output_bindings,
     )
+
+
+def build_query_mschema_bundle(state: NL2SQLState) -> tuple[QueryMSchema, QueryMSchema]:
+    """Return both prompt-safe views from the same grounding facts."""
+    return build_query_mschema(state, "precision"), build_query_mschema(state, "recall")
 
 
 def _join_kind(source_atom_ids: list[str], state: NL2SQLState) -> str:

@@ -18,7 +18,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Body, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
@@ -28,7 +28,13 @@ from pydantic import BaseModel, Field
 from nl2sql_agent.graph import build_graph
 from nl2sql_agent.services.checkpoint import create_sqlite_checkpointer
 from nl2sql_agent.services.database_store import DatabaseConfigStore
-from nl2sql_agent.services.deps import build_deps, load_env
+from nl2sql_agent.services.config_loader import ConfigLoader
+from nl2sql_agent.services.deps import CONFIG_DIR, build_deps, load_env
+from nl2sql_agent.services.knowledge_management import (
+    seed_from_legacy_config,
+    validate_knowledge,
+)
+from nl2sql_agent.services.knowledge_store import KnowledgeStore
 from nl2sql_agent.services.query_store import QueryStore
 from nl2sql_agent.services.query_cancellation import QueryExecutionCancelled
 from nl2sql_agent.services.relation_store import DatabaseRelationStore
@@ -46,6 +52,9 @@ _deps: dict[str, tuple[str, Any]] = {}
 _store = QueryStore(DATA_DIR / "nl2sql.db")
 _database_store = DatabaseConfigStore(DATA_DIR / "nl2sql.db", DATA_DIR.parent)
 _relation_store = DatabaseRelationStore(DATA_DIR / "nl2sql.db")
+_knowledge_store = KnowledgeStore(DATA_DIR / "nl2sql.db")
+_knowledge_seeded = False
+_knowledge_seed_lock = threading.Lock()
 _deps_lock = threading.Lock()
 _active_query_cancellations: dict[str, threading.Event] = {}
 _active_query_cancellations_lock = threading.Lock()
@@ -68,10 +77,15 @@ def get_deps(database_id: str | None = None):
         if cached and cached[0] == version:
             return cached[1]
         schema_path = _database_store.schema_path(cache_key)
+        _ensure_knowledge_seeded()
+        knowledge_bundle = _knowledge_store.runtime_bundle(
+            cache_key, str(record.get("namespace") or "risk_mart")
+        )
         deps = build_deps(
             database_url=_database_store.connection_url(cache_key),
             m_schema_path=schema_path,
             relation_overrides=_relation_store.runtime_relations(cache_key),
+            knowledge_bundle=knowledge_bundle,
         )
         _deps[cache_key] = (version, deps)
         return deps
@@ -138,6 +152,17 @@ def _state_to_dict(state: dict) -> dict:
         "query_mschema": (
             state["query_mschema"].model_dump() if state.get("query_mschema") is not None else None
         ),
+        "query_mschema_precision": (
+            state["query_mschema_precision"].model_dump()
+            if state.get("query_mschema_precision") is not None else None
+        ),
+        "query_mschema_recall": (
+            state["query_mschema_recall"].model_dump()
+            if state.get("query_mschema_recall") is not None else None
+        ),
+        "query_candidates": [
+            item.model_dump() for item in (state.get("query_candidates") or [])
+        ],
         "retrieved_schema": [h.model_dump() for h in hits],
         "sensitive_reasons": state.get("sensitive_reasons") or [],
         "execution_result": state.get("execution_result"),
@@ -202,6 +227,9 @@ def _persist(
         plan_json=d["plan"],
         logical_plan=d["logical_plan"],
         query_mschema=d["query_mschema"],
+        query_mschema_precision=d["query_mschema_precision"],
+        query_mschema_recall=d["query_mschema_recall"],
+        query_candidates=d["query_candidates"],
         retrieved_schema=d["retrieved_schema"],
         sensitive_reasons=d["sensitive_reasons"],
         execution_result=d["execution_result"],
@@ -319,7 +347,7 @@ async def _ws_query_handler(ws: WebSocket, msg: dict) -> None:
                                 "data": existing, "trace_id": trace_id})
             await ws.close()
             return
-        if status in ("done", "blocked", "rejected"):
+        if status in ("done", "blocked", "rejected", "error", "cancelled"):
             await ws.send_json({"event": "final", "data": existing, "trace_id": trace_id})
             await ws.close()
             return
@@ -713,6 +741,12 @@ class DatabaseRelationUpdate(BaseModel):
     preferred_join_type: str | None = None
     description: str | None = None
     enabled: bool | None = None
+    status: str | None = None
+
+
+class DatabaseRelationBatchDecision(BaseModel):
+    relation_ids: list[str] = Field(min_length=1, max_length=200)
+    status: Literal["verified", "rejected"]
 
 
 def _schema_options(database_id: str) -> list[dict]:
@@ -766,14 +800,22 @@ def _validate_relation(database_id: str, values: dict, current: dict | None = No
         raise HTTPException(400, "不支持的关系基数")
     if merged.get("preferred_join_type", "inner") not in {"inner", "left"}:
         raise HTTPException(400, "关联方式仅支持 inner 或 left")
-    return {
+    status = str(merged.get("status") or "verified")
+    if status not in {"candidate", "inferred", "verified", "confirmed", "rejected"}:
+        raise HTTPException(400, "不支持的关系状态")
+    validated = {
         key: merged[key]
         for key in (
             "source_table", "source_columns", "target_table", "target_columns",
-            "cardinality", "preferred_join_type", "description", "enabled",
+            "cardinality", "preferred_join_type", "description", "enabled", "status",
         )
         if key in merged
     }
+    if status in {"verified", "confirmed"}:
+        validated["enabled"] = True
+    elif status in {"candidate", "inferred", "rejected"}:
+        validated["enabled"] = False
+    return validated
 
 
 @router.get("/databases")
@@ -874,7 +916,16 @@ async def api_sync_database_schema(database_id: str):
                 mode=mode,
                 business_line=record["namespace"],
             )
-            message = f"入库 {report.ingested}，待审核 {report.queued}，跳过 {report.skipped}"
+            schema_payload = json.loads(path.read_text(encoding="utf-8"))
+            _relation_store.replace_discovered(
+                database_id, schema_payload.get("relation_candidates") or []
+            )
+            message = (
+                f"入库 {report.ingested}，待审核 {report.queued}，跳过 {report.skipped}；"
+                f"画像 {report.profiled_tables} 表/{report.profiled_columns} 字段，"
+                f"跳过 {report.profile_skipped_columns} 字段；"
+                f"发现 {report.relation_candidates} 条候选关系"
+            )
             _database_store.set_schema_status(database_id, "ready", message)
             _invalidate_deps(database_id)
         except Exception as exc:  # noqa: BLE001
@@ -897,6 +948,64 @@ async def api_database_relations(database_id: str):
     return _relation_store.list(database_id)
 
 
+@router.post("/databases/{database_id}/relations/discover")
+async def api_discover_database_relations(database_id: str):
+    database = _database_store.get(database_id)
+    if not database:
+        raise HTTPException(404, "数据库配置不存在")
+    if database.get("schema_status") != "ready":
+        raise HTTPException(409, "请先完成 Schema 同步")
+
+    path = _database_store.schema_path(database_id)
+    if not path.exists():
+        raise HTTPException(409, "该数据库尚未同步 Schema")
+    try:
+        schema = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(500, "M-Schema 文件无法读取") from exc
+
+    from nl2sql_agent.services.schema_ingest.relation_discovery import (
+        discover_relation_candidates,
+        tables_from_mschema,
+    )
+
+    config = ConfigLoader(CONFIG_DIR).load("schema_ingest.yaml") or {}
+    discovery = config.get("relation_discovery") or {}
+    if not discovery.get("enabled", True):
+        raise HTTPException(409, "关系发现功能已关闭")
+    datasource = _database_store.artifact_key(database_id)
+    overrides = _review_store().overrides(datasource)
+    candidates = discover_relation_candidates(
+        tables_from_mschema(schema, overrides),
+        schema.get("relations") or schema.get("foreign_keys") or [],
+        min_confidence=float(discovery.get("min_confidence", 0.68)),
+        inferred_confidence=float(discovery.get("inferred_confidence", 0.84)),
+        max_candidates=int(discovery.get("max_candidates", 200)),
+        allow_profile_inference=bool(discovery.get("allow_profile_inference", True)),
+        warehouse_anchor_threshold=float(
+            discovery.get("warehouse_anchor_threshold", 0.62)
+        ),
+        max_edges_per_identifier=int(
+            discovery.get("max_edges_per_identifier", 25)
+        ),
+    )
+    stored = _relation_store.replace_discovered(database_id, candidates)
+    schema["relation_candidates"] = candidates
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_path.replace(path)
+    _invalidate_deps(database_id)
+    return {
+        "status": "completed",
+        "database_id": database_id,
+        "discovered": len(candidates),
+        "stored": stored,
+        "message": f"发现 {len(candidates)} 条待确认关系",
+    }
+
+
 @router.post("/databases/{database_id}/relations")
 async def api_create_database_relation(database_id: str, body: DatabaseRelationInput):
     values = _validate_relation(database_id, body.model_dump())
@@ -906,6 +1015,26 @@ async def api_create_database_relation(database_id: str, body: DatabaseRelationI
         raise HTTPException(409, "相同的表关系已经存在") from exc
     _invalidate_deps(database_id)
     return relation
+
+
+@router.post("/databases/{database_id}/relations/batch-decision")
+async def api_batch_decide_database_relations(
+    database_id: str, body: DatabaseRelationBatchDecision
+):
+    if not _database_store.get(database_id):
+        raise HTTPException(404, "数据库配置不存在")
+    updated = _relation_store.decide_many(
+        database_id, body.relation_ids, body.status
+    )
+    if not updated:
+        raise HTTPException(409, "所选关系已处理或不属于当前数据库")
+    _invalidate_deps(database_id)
+    return {
+        "status": "completed",
+        "decision": body.status,
+        "updated_ids": updated,
+        "updated": len(updated),
+    }
 
 
 @router.put("/databases/{database_id}/relations/{relation_id}")
@@ -936,10 +1065,154 @@ async def api_delete_database_relation(database_id: str, relation_id: str):
     return {"status": "deleted", "id": relation_id}
 
 
-# ---------------- 配置管理(术语映射) ----------------
+# ---------------- 企业知识管理 ----------------
+
+class KnowledgeItemInput(BaseModel):
+    knowledge_type: str
+    name: str
+    description: str = ""
+    database_id: str | None = None
+    namespace: str = "global"
+    status: str = "draft"
+    priority: int = 100
+    payload: dict = Field(default_factory=dict)
+    created_by: str = "admin"
+
+
+def _ensure_knowledge_seeded() -> None:
+    global _knowledge_seeded
+    if _knowledge_seeded:
+        return
+    with _knowledge_seed_lock:
+        if not _knowledge_seeded:
+            seed_from_legacy_config(_knowledge_store, ConfigLoader(CONFIG_DIR))
+            _knowledge_seeded = True
+
+
+def _knowledge_schema(database_id: str | None) -> list[dict]:
+    if not database_id:
+        return []
+    return _schema_options(database_id)
+
+
+def _validate_knowledge_or_raise(values: dict) -> None:
+    if values.get("knowledge_type") == "optimization_case":
+        payload = values.setdefault("payload", {})
+        if payload.get("case_type") == "sql_fallback" and values.get("database_id"):
+            database = _database_store.get(values["database_id"])
+            if database:
+                payload["dialect"] = database.get("engine") or "mysql"
+    errors = validate_knowledge(values, _knowledge_schema(values.get("database_id")))
+    if errors:
+        raise HTTPException(400, {"message": "知识校验失败", "errors": errors})
+
+
+@router.get("/knowledge/summary")
+async def api_knowledge_summary(database_id: str | None = None):
+    _ensure_knowledge_seeded()
+    return _knowledge_store.summary(database_id)
+
+
+@router.get("/knowledge/items")
+async def api_knowledge_items(
+    knowledge_type: str | None = None,
+    database_id: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+):
+    _ensure_knowledge_seeded()
+    return _knowledge_store.list(
+        knowledge_type=knowledge_type,
+        database_id=database_id,
+        status=status,
+        query=q,
+    )
+
+
+@router.post("/knowledge/items")
+async def api_create_knowledge(
+    body: KnowledgeItemInput,
+    admin_token: str | None = Header(default=None),
+):
+    if not _admin_ok(admin_token):
+        raise HTTPException(403, "需要管理权限(Header X-Admin-Token)")
+    _ensure_knowledge_seeded()
+    values = body.model_dump()
+    if values["database_id"] and not _database_store.get(values["database_id"]):
+        raise HTTPException(404, "数据库配置不存在")
+    if values["status"] == "published":
+        _validate_knowledge_or_raise(values)
+    try:
+        item = _knowledge_store.create(values)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _invalidate_deps(values["database_id"])
+    return item
+
+
+@router.put("/knowledge/items/{item_id}")
+async def api_update_knowledge(
+    item_id: str,
+    body: KnowledgeItemInput,
+    admin_token: str | None = Header(default=None),
+):
+    if not _admin_ok(admin_token):
+        raise HTTPException(403, "需要管理权限(Header X-Admin-Token)")
+    _ensure_knowledge_seeded()
+    current = _knowledge_store.get(item_id)
+    if not current:
+        raise HTTPException(404, "知识记录不存在")
+    values = body.model_dump()
+    if values["status"] == "published":
+        _validate_knowledge_or_raise(values)
+    try:
+        item = _knowledge_store.update(item_id, values)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    old_database = current.get("database_id")
+    new_database = values.get("database_id")
+    _invalidate_deps(new_database if old_database == new_database else None)
+    return item
+
+
+@router.post("/knowledge/items/{item_id}/publish")
+async def api_publish_knowledge(
+    item_id: str,
+    admin_token: str | None = Header(default=None),
+):
+    if not _admin_ok(admin_token):
+        raise HTTPException(403, "需要管理权限(Header X-Admin-Token)")
+    _ensure_knowledge_seeded()
+    current = _knowledge_store.get(item_id)
+    if not current:
+        raise HTTPException(404, "知识记录不存在")
+    _validate_knowledge_or_raise(current)
+    item = _knowledge_store.update(item_id, {**current, "status": "published"})
+    _invalidate_deps(current.get("database_id"))
+    return item
+
+
+@router.delete("/knowledge/items/{item_id}")
+async def api_delete_knowledge(
+    item_id: str,
+    admin_token: str | None = Header(default=None),
+):
+    if not _admin_ok(admin_token):
+        raise HTTPException(403, "需要管理权限(Header X-Admin-Token)")
+    current = _knowledge_store.get(item_id)
+    if not current:
+        raise HTTPException(404, "知识记录不存在")
+    _knowledge_store.delete(item_id)
+    _invalidate_deps(current.get("database_id"))
+    return {"status": "deleted", "id": item_id}
+
+
+# ---------------- 旧配置管理(兼容术语映射) ----------------
 
 def _admin_ok(admin_token: str | None) -> bool:
-    expected = os.getenv("ADMIN_TOKEN")
+    # Single-user/private deployments may reuse the platform access token.
+    # Setting ADMIN_TOKEN immediately restores a distinct management boundary.
+    expected = os.getenv("ADMIN_TOKEN") or os.getenv("PLATFORM_ACCESS_TOKEN")
     return bool(expected) and admin_token == expected
 
 
@@ -1000,17 +1273,50 @@ def _review_store():
     return ReviewStore(DATA_DIR / "schema_ingest.db")
 
 
+def _schema_rows_from_mschema(path: Path, overrides: dict) -> list[dict]:
+    """Build a database-specific management view directly from M-Schema."""
+    schema = json.loads(path.read_text(encoding="utf-8"))
+    result: list[dict] = []
+    for table_name, table in (schema.get("tables") or {}).items():
+        columns = []
+        for column_name, field in (table.get("fields") or {}).items():
+            final = overrides.get((table_name, column_name))
+            original = str(field.get("comment") or "")
+            columns.append({
+                "name": column_name,
+                "type": field.get("raw_type") or field.get("type") or "",
+                "comment": original,
+                "eff_comment": final or original,
+                "overridden": bool(final),
+                "sensitive": bool(field.get("sensitive")),
+            })
+        result.append({
+            "table_name": table_name,
+            "comment": overrides.get((table_name, None)) or table.get("comment") or "",
+            "columns": columns,
+        })
+    return result
+
+
 @router.get("/schema")
 async def api_schema(business_line: str = "risk_mart", database_id: str | None = None):
     """返回某系统的表结构(每表字段名/类型/已有注释/是否有 override)。供前端浏览与补充注释。"""
     database = _database_store.get(database_id) if database_id else None
     if database_id and not database:
         raise HTTPException(404, "数据库配置不存在")
-    deps = get_deps(database_id)
-    scope = str(database.get("namespace") or business_line) if database else business_line
     datasource = _database_store.artifact_key(database_id) if database_id else business_line
-    tables = deps.catalog.tables_for_scope([scope])
     overrides = _review_store().overrides(datasource)
+    if database_id:
+        path = _database_store.schema_path(database_id)
+        if not path.exists():
+            raise HTTPException(409, "该数据库尚未同步 Schema")
+        try:
+            return _schema_rows_from_mschema(path, overrides)
+        except (OSError, ValueError, TypeError) as exc:
+            raise HTTPException(500, "M-Schema 文件无法读取") from exc
+
+    deps = get_deps(database_id)
+    tables = deps.catalog.tables_for_scope([business_line])
     result = []
     for t in tables:
         cols = []
@@ -1142,10 +1448,21 @@ async def api_reingest(
     db_name = getattr(deps.executor, "conn_kwargs", {}).get("database") or datasource
     report = sync(datasource, db_name, deps, config, store, mode="incremental", business_line=business_line)
     if database_id:
+        schema_payload = json.loads(
+            _database_store.schema_path(database_id).read_text(encoding="utf-8")
+        )
+        _relation_store.replace_discovered(
+            database_id, schema_payload.get("relation_candidates") or []
+        )
         _database_store.set_schema_status(
             database_id,
             "ready",
-            f"入库 {report.ingested}，待审核 {report.queued}，跳过 {report.skipped}",
+            (
+                f"入库 {report.ingested}，待审核 {report.queued}，跳过 {report.skipped}；"
+                f"画像 {report.profiled_tables} 表/{report.profiled_columns} 字段，"
+                f"跳过 {report.profile_skipped_columns} 字段；"
+                f"发现 {report.relation_candidates} 条候选关系"
+            ),
         )
         _invalidate_deps(database_id)
     return {
@@ -1154,6 +1471,11 @@ async def api_reingest(
         "queued": report.queued,
         "skipped": report.skipped,
         "removed": report.removed,
+        "profiled_tables": report.profiled_tables,
+        "profiled_columns": report.profiled_columns,
+        "profiled_rows": report.profiled_rows,
+        "profile_skipped_columns": report.profile_skipped_columns,
+        "relation_candidates": report.relation_candidates,
     }
 
 

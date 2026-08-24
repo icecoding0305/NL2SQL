@@ -12,6 +12,7 @@ from nl2sql_agent.state import (
     SchemaPlan,
     SemanticOutput,
 )
+from nl2sql_agent.services.field_labels import concise_business_label
 from nl2sql_agent.services.schema_planner import is_generic_projection
 
 
@@ -71,7 +72,8 @@ def _candidate_fields(
         if table.name not in entity_names:
             continue
         for column in table.columns:
-            comment = str(column.get("comment") or "").strip()
+            raw_comment = str(column.get("comment") or "").strip()
+            comment = concise_business_label(raw_comment, str(column.get("name") or ""))
             if not comment:
                 continue
             candidates.append({
@@ -157,6 +159,107 @@ def _fallback_topic_decision(
     )
 
 
+_GENERIC_FIELD_GROUPS = (
+    ("姓名", "客户名称", "名称"),
+    ("手机号码", "手机号", "联系电话", "联系号码", "电话"),
+    ("户籍地址", "居住地址", "通讯地址", "联系地址", "地址", "住址"),
+    ("性别",),
+    ("年龄",),
+    ("客户状态", "账户状态", "状态"),
+    ("客户类别", "客户类型", "客户分类", "类别"),
+    ("证件类型",),
+)
+
+
+def _fallback_generic_decision(
+    *, request: str, target_entity: str, query: str, candidates: list[dict]
+) -> ProjectionDecision:
+    """Choose readable entity fields when generic projection model output is invalid.
+
+    This is deliberately Schema-driven: labels come from the query-scoped candidate
+    set. It provides continuity for requests such as ``客户基本信息`` without
+    maintaining table-specific projection configuration.
+    """
+    selected: list[ProjectionFieldSelection] = []
+    excluded: list[ProjectionFieldExclusion] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(candidate: dict, reason: str) -> None:
+        key = (str(candidate["table_name"]), str(candidate["column_name"]))
+        if key in seen or len(selected) >= 8:
+            return
+        label = str(candidate.get("business_label") or candidate["column_name"])
+        if any(word in label for word in _DIRECT_IDENTIFIER_WORDS) and not _explicitly_requested(query, candidate):
+            excluded.append(ProjectionFieldExclusion(
+                business_label=label,
+                reason="属于直接身份或账户标识，用户未明确要求",
+            ))
+            return
+        selected.append(ProjectionFieldSelection(
+            table_name=key[0],
+            column_name=key[1],
+            business_label=label,
+            reason=reason,
+        ))
+        seen.add(key)
+
+    # Keep an entity key when one is available, then add business-readable fields.
+    identifier = next((item for item in candidates if item.get("primary_key")), None)
+    if identifier is not None:
+        add(identifier, "用于标识结果中的业务实体")
+
+    groups = _GENERIC_FIELD_GROUPS
+    if "联系方式" in request:
+        groups = _GENERIC_FIELD_GROUPS[1:3]
+    for words in groups:
+        match = next(
+            (
+                item for item in candidates
+                if (str(item["table_name"]), str(item["column_name"])) not in seen
+                and any(word in str(item.get("business_label") or "") for word in words)
+            ),
+            None,
+        )
+        if match is not None:
+            add(match, f"字段含义属于“{request}”的常用组成部分")
+
+    # Unusual Schemas may not use common Chinese labels. Preserve availability by
+    # selecting a few readable dimensions, while still excluding direct identifiers.
+    primary_keys = {
+        (str(item["table_name"]), str(item["column_name"]))
+        for item in candidates if item.get("primary_key")
+    }
+    readable_count = sum(
+        (item.table_name, item.column_name) not in primary_keys for item in selected
+    )
+    if readable_count == 0:
+        for item in candidates:
+            if item.get("primary_key") or str(item.get("semantic_role") or "") == "measure":
+                continue
+            add(item, f"作为“{request}”的可读实体属性")
+            if sum(
+                (choice.table_name, choice.column_name) not in primary_keys
+                for choice in selected
+            ) >= 3:
+                break
+
+    readable = [
+        item for item in selected
+        if (item.table_name, item.column_name) not in primary_keys
+    ]
+    if not readable:
+        selected = []
+    return ProjectionDecision(
+        request=request,
+        target_entity=target_entity,
+        understood_description=f"返回{target_entity}的{request}",
+        selected_fields=selected,
+        excluded_fields=excluded,
+        missing_concepts=[] if selected else [request],
+        confidence=0.72 if selected else 0.0,
+    )
+
+
 def _explicitly_requested(query: str, candidate: dict) -> bool:
     return any(
         value and str(value).lower() in query.lower()
@@ -204,16 +307,18 @@ def _validated_decision(
                 reason="属于直接身份或账户标识，用户未明确要求",
             ))
             continue
-        aggregation = choice.aggregation
+        aggregate_request = any(word in query for word in ("统计", "汇总", "计算"))
+        # A model must not silently turn a lookup into a grouped calculation.
+        aggregation = choice.aggregation if aggregate_request else None
         if aggregation and not _numeric_type(candidate) and aggregation != "count_distinct":
             aggregation = None
         if request.endswith(TOPIC_SUFFIXES) and aggregation is None:
             aggregation = _topic_aggregation(
-                label, candidate, any(word in query for word in ("统计", "汇总", "计算"))
+                label, candidate, aggregate_request
             )
         if (
             request.endswith(TOPIC_SUFFIXES)
-            and any(word in query for word in ("统计", "汇总", "计算"))
+            and aggregate_request
             and aggregation is None
         ):
             excluded.append(ProjectionFieldExclusion(
@@ -276,6 +381,17 @@ def resolve_vague_projection(
             missing_concepts=[request],
             confidence=0.0,
         )
+    if request.endswith(TOPIC_SUFFIXES):
+        deterministic = _fallback_topic_decision(
+            request=request,
+            target_entity=target_entity,
+            query=state.clarified_query or state.user_query,
+            candidates=candidates,
+        )
+        # One direct, non-sensitive Schema field is not an ambiguity. Avoid a
+        # remote model round trip merely to repeat the only valid choice.
+        if len(deterministic.selected_fields) == 1:
+            return deterministic.model_copy(update={"confidence": 0.9})
     prompt = deps.prompts.render(
         "projection_resolution",
         user_query=json.dumps(state.clarified_query or state.user_query, ensure_ascii=False),
@@ -290,6 +406,13 @@ def resolve_vague_projection(
     except Exception:  # noqa: BLE001 - leave an auditable partial decision
         if request.endswith(TOPIC_SUFFIXES):
             return _fallback_topic_decision(
+                request=request,
+                target_entity=target_entity,
+                query=state.clarified_query or state.user_query,
+                candidates=candidates,
+            )
+        if is_generic_projection(request):
+            return _fallback_generic_decision(
                 request=request,
                 target_entity=target_entity,
                 query=state.clarified_query or state.user_query,
@@ -311,6 +434,13 @@ def resolve_vague_projection(
     )
     if request.endswith(TOPIC_SUFFIXES) and not validated.selected_fields:
         return _fallback_topic_decision(
+            request=request,
+            target_entity=target_entity,
+            query=state.clarified_query or state.user_query,
+            candidates=candidates,
+        )
+    if is_generic_projection(request) and not validated.selected_fields:
+        return _fallback_generic_decision(
             request=request,
             target_entity=target_entity,
             query=state.clarified_query or state.user_query,
