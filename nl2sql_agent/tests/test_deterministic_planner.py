@@ -5,6 +5,7 @@ from nl2sql_agent.nodes.m8_static_validation import _plan_shape_errors
 from nl2sql_agent.services.deterministic_planner import build_deterministic_query_plan
 from nl2sql_agent.services.schema_catalog import TableDef
 from nl2sql_agent.services.schema_planner import (
+    prefer_coherent_field_bindings,
     prefer_minimal_table_cover,
     prefer_primary_fact_fields,
 )
@@ -222,6 +223,52 @@ def test_minimal_table_cover_prefers_one_detail_table_for_all_slots():
         first_by_slot.setdefault(item.query_slot, item.table_name)
 
     assert set(first_by_slot.values()) == {"loan_detail"}
+
+
+def test_joint_field_binding_prefers_connected_single_table_assignment():
+    intent = QueryIntent(
+        query_type="aggregation",
+        measures=[IntentSlot(text="贷款金额", role="measure")],
+        dimensions=[IntentSlot(text="产品", role="dimension")],
+    )
+    tables = [
+        TableDef("dws_ar_loan_info", "借据信息表", "risk_mart", [
+            {"name": "loan_amt", "type": "decimal", "comment": "贷款金额"},
+            {"name": "prd_code", "type": "varchar", "comment": "产品编码"},
+        ]),
+        TableDef("app_fpd_report", "首逾分析表", "risk_mart", [
+            {"name": "prd_code", "type": "varchar", "comment": "产品编码"},
+        ]),
+    ]
+    candidates = [
+        FieldCandidate(
+            table_name="dws_ar_loan_info", column_name="loan_amt",
+            query_slot="贷款金额", semantic_role="measure",
+            final_score=0.95, phrase_coverage=1.0,
+        ),
+        FieldCandidate(
+            table_name="app_fpd_report", column_name="prd_code",
+            query_slot="产品", semantic_role="dimension",
+            final_score=0.96, phrase_coverage=1.0,
+        ),
+        FieldCandidate(
+            table_name="dws_ar_loan_info", column_name="prd_code",
+            query_slot="产品", semantic_role="dimension",
+            final_score=0.90, phrase_coverage=1.0,
+        ),
+    ]
+
+    reranked = prefer_coherent_field_bindings(
+        candidates, intent, tables, relations=[]
+    )
+    first_by_slot = {}
+    for item in reranked:
+        first_by_slot.setdefault(item.query_slot, item.table_name)
+
+    assert first_by_slot == {
+        "贷款金额": "dws_ar_loan_info",
+        "产品": "dws_ar_loan_info",
+    }
 
 
 def test_value_grounding_cannot_escape_planned_table_subgraph():

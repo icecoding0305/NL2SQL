@@ -14,6 +14,10 @@ from typing import Any
 
 from nl2sql_agent.state import NL2SQLState, QueryCandidate
 from nl2sql_agent.services.prompt_context import compact_schema_facts, conversation_facts, effective_query, prompt_json, term_facts
+from nl2sql_agent.services.logical_planner import (
+    build_query_mschema,
+    query_mschema_runtime_kwargs,
+)
 from nl2sql_agent.services.sql_dialect import dialect_tips
 from nl2sql_agent.services.sql_compiler import UnsupportedPlanError, compile_query_plan
 from nl2sql_agent.services.sql_candidate_selector import rank_sql_candidates
@@ -43,13 +47,20 @@ def _term_view(state: NL2SQLState, deps) -> tuple[str, str]:
 def build_prompt_from_plan(state: NL2SQLState, deps) -> str:
     plan = state.query_plan
     terms_label, terms = _term_view(state, deps)
+    execution_schema = build_query_mschema(
+        state,
+        "execution",
+        **query_mschema_runtime_kwargs(state, deps),
+    )
     return deps.prompts.render("sql_from_plan",
         user_query=prompt_json(effective_query(state)),
         dialect=deps.config.dialect,
         dialect_tips=dialect_tips(deps.config.dialect),
         query_plan=prompt_json(plan.model_dump()),
         retry_feedback=_retry_feedback(state, deps),
-        schema_view=prompt_json(compact_schema_facts(state, include_semantics=False)),
+        schema_view=prompt_json(compact_schema_facts(
+            state, execution_schema, include_semantics=False
+        )),
         terms_label=terms_label,
         terms=terms,
         conversation_block=prompt_json(conversation_facts(state)),
@@ -82,6 +93,14 @@ def build_prompt_from_query(state: NL2SQLState, deps) -> str:
 
 def make_sql_generation_node(deps):
     def sql_generation_node(state: NL2SQLState) -> NL2SQLState | dict:
+        execution_schema = (
+            build_query_mschema(
+                state,
+                "execution",
+                **query_mschema_runtime_kwargs(state, deps),
+            )
+            if state.query_plan is not None else None
+        )
         alternatives = sorted(
             (
                 item for item in state.query_candidates
@@ -116,7 +135,7 @@ def make_sql_generation_node(deps):
                     candidate_id=f"sql_{state.retry_count + 1}",
                     stage="sql",
                     source="deterministic_compiler",
-                    schema_profile=(state.query_mschema.profile if state.query_mschema else "precision"),
+                    schema_profile="execution",
                     status="compiled",
                     query_plan=state.query_plan,
                     logical_plan=state.logical_plan,
@@ -131,6 +150,7 @@ def make_sql_generation_node(deps):
                     "execution_error": None,
                     "sql_generation_source": "deterministic",
                     "query_candidates": candidates,
+                    "query_mschema_execution": execution_schema,
                 }
             except (UnsupportedPlanError, ValueError):
                 # Compatibility path for old/incomplete plans. It remains validated
@@ -180,7 +200,8 @@ def make_sql_generation_node(deps):
                 stage="sql",
                 source=source,
                 schema_profile=(
-                    state.query_mschema.profile if state.query_mschema else "precision"
+                    "execution" if execution_schema is not None
+                    else state.query_mschema.profile if state.query_mschema else "precision"
                 ),
                 status="generated",
                 query_plan=state.query_plan,
@@ -204,6 +225,7 @@ def make_sql_generation_node(deps):
             "execution_error": None,
             "sql_generation_source": "model",
             "query_candidates": candidates,
+            "query_mschema_execution": execution_schema,
         }
         return out
 

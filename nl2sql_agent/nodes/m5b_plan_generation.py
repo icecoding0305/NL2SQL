@@ -15,6 +15,7 @@ from nl2sql_agent.services.prompt_context import compact_schema_facts, conversat
 from nl2sql_agent.services.logical_planner import (
     build_logical_plan,
     build_query_mschema_bundle,
+    query_mschema_runtime_kwargs,
 )
 from nl2sql_agent.services.llm import (
     LLMOutputTruncatedError,
@@ -25,7 +26,12 @@ from nl2sql_agent.services.plan_normalizer import normalize_structural_coverage
 from nl2sql_agent.state import NL2SQLState, QueryCandidate, QueryPlan
 
 
-def build_plan_prompt(state: NL2SQLState, deps) -> str:
+def _select_planning_schema(state: NL2SQLState, precision, recall):
+    """Escalate only when retry evidence or contract coverage requires it."""
+    return recall if state.plan_validation_errors or precision.warnings else precision
+
+
+def build_plan_prompt(state: NL2SQLState, deps, query_mschema=None) -> str:
     terms = term_facts(state, deps)
 
     terms_label = (
@@ -43,10 +49,11 @@ def build_plan_prompt(state: NL2SQLState, deps) -> str:
             errors=prompt_json(state.plan_validation_errors[-5:]),
         )
 
-    precision_schema, recall_schema = build_query_mschema_bundle(state)
-    # First attempt stays narrow. A validation retry gets bounded alternatives,
-    # but never a full database schema or a disconnected table.
-    query_mschema = recall_schema if state.plan_validation_errors else precision_schema
+    if query_mschema is None:
+        precision_schema, recall_schema = build_query_mschema_bundle(
+            state, **query_mschema_runtime_kwargs(state, deps)
+        )
+        query_mschema = _select_planning_schema(state, precision_schema, recall_schema)
     schema_view = compact_schema_facts(state, query_mschema)
     few_shot_block = prompt_json(deps.few_shot.retrieve_patterns(effective_query(state)))
     return deps.prompts.render("plan_generation",
@@ -62,7 +69,25 @@ def build_plan_prompt(state: NL2SQLState, deps) -> str:
 
 def make_plan_generation_node(deps):
     def plan_generation_node(state: NL2SQLState) -> NL2SQLState | dict:
-        prompt = build_plan_prompt(state, deps)
+        precision_schema, recall_schema = build_query_mschema_bundle(
+            state, **query_mschema_runtime_kwargs(state, deps)
+        )
+        query_mschema = _select_planning_schema(state, precision_schema, recall_schema)
+        if query_mschema.warnings:
+            return {
+                "query_plan": None,
+                "logical_plan": None,
+                "query_mschema": query_mschema,
+                "query_mschema_precision": precision_schema,
+                "query_mschema_recall": recall_schema,
+                "plan_normalizations": [],
+                "plan_generation_error_kind": "schema_context_incomplete",
+                "plan_validation_errors": [
+                    f"Query M-Schema 不完整：{warning}"
+                    for warning in query_mschema.warnings[:8]
+                ],
+            }
+        prompt = build_plan_prompt(state, deps, query_mschema)
         try:
             deterministic_cfg = deps.config.clarification_rules.get("deterministic_plan", {})
             deterministic_plan = (
@@ -80,7 +105,6 @@ def make_plan_generation_node(deps):
                     state.output_bindings,
                     state.semantic_bindings,
                 )
-                precision_schema, recall_schema = build_query_mschema_bundle(state)
                 logical_plan = build_logical_plan(plan, state)
                 candidate = QueryCandidate(
                     candidate_id=f"plan_{state.plan_retry_count + 1}",
@@ -117,8 +141,6 @@ def make_plan_generation_node(deps):
                 state.output_bindings,
                 state.semantic_bindings,
             )
-            precision_schema, recall_schema = build_query_mschema_bundle(state)
-            query_mschema = recall_schema if state.plan_validation_errors else precision_schema
             logical_plan = build_logical_plan(plan, state)
             candidate = QueryCandidate(
                 candidate_id=f"plan_{state.plan_retry_count + 1}",

@@ -508,11 +508,13 @@ class QueryMSchema(BaseModel):
     """Minimal, query-scoped projection of the effective M-Schema."""
 
     model_config = ConfigDict(extra="forbid")
-    profile: Literal["precision", "recall"] = "precision"
+    profile: Literal["precision", "recall", "execution"] = "precision"
     tables: list[QuerySchemaTable] = Field(default_factory=list)
     relations: list[QuerySchemaRelation] = Field(default_factory=list)
     semantic_bindings: dict[str, dict] = Field(default_factory=dict)
     output_bindings: dict[str, dict] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class LogicalOperation(_PlanPart):
@@ -555,7 +557,7 @@ class QueryCandidate(BaseModel):
         "plan_model", "deterministic_compiler", "model_sql_fallback",
         "model_sql_candidate", "model_sql_refiner",
     ]
-    schema_profile: Literal["precision", "recall"] = "precision"
+    schema_profile: Literal["precision", "recall", "execution"] = "precision"
     status: Literal[
         "generated", "normalized", "validated", "compiled", "rejected",
         "executed", "execution_error",
@@ -626,6 +628,7 @@ class NL2SQLState(BaseModel):
     query_mschema: Optional[QueryMSchema] = None
     query_mschema_precision: Optional[QueryMSchema] = None
     query_mschema_recall: Optional[QueryMSchema] = None
+    query_mschema_execution: Optional[QueryMSchema] = None
     logical_plan: Optional[LogicalPlan] = None
     query_candidates: list[QueryCandidate] = Field(default_factory=list)
     plan_normalizations: list[str] = Field(default_factory=list)

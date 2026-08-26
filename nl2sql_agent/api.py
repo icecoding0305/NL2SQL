@@ -160,6 +160,10 @@ def _state_to_dict(state: dict) -> dict:
             state["query_mschema_recall"].model_dump()
             if state.get("query_mschema_recall") is not None else None
         ),
+        "query_mschema_execution": (
+            state["query_mschema_execution"].model_dump()
+            if state.get("query_mschema_execution") is not None else None
+        ),
         "query_candidates": [
             item.model_dump() for item in (state.get("query_candidates") or [])
         ],
@@ -229,6 +233,7 @@ def _persist(
         query_mschema=d["query_mschema"],
         query_mschema_precision=d["query_mschema_precision"],
         query_mschema_recall=d["query_mschema_recall"],
+        query_mschema_execution=d["query_mschema_execution"],
         query_candidates=d["query_candidates"],
         retrieved_schema=d["retrieved_schema"],
         sensitive_reasons=d["sensitive_reasons"],

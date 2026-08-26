@@ -420,7 +420,8 @@ def make_plan_validation_node(deps):
 
         # retry_count 只统计失败后的重试，不把首次成功校验计为一次重试。
         non_retryable = state.plan_generation_error_kind in {
-            "output_truncated", "empty_response", "provider_non_retryable"
+            "output_truncated", "empty_response", "provider_non_retryable",
+            "schema_context_incomplete",
         }
         new_count = (
             state.max_plan_retries
@@ -449,6 +450,8 @@ def make_plan_validation_node(deps):
                 headline = "模型服务或结构化计划生成失败，未能生成可执行 SQL。"
             elif state.plan_generation_error_kind == "provider_non_retryable":
                 headline = "模型服务拒绝了查询计划请求，请检查模型配置、权限或账户状态。"
+            elif state.plan_generation_error_kind == "schema_context_incomplete":
+                headline = "当前问题所需字段或可信关联不完整，系统已停止生成，避免猜测 SQL。"
             else:
                 headline = "查询计划未通过完整性校验，未能生成可执行 SQL。"
             out["final_answer"] = headline + "\n" + "；".join(errors[:5])

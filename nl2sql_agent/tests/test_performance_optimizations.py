@@ -125,6 +125,7 @@ def test_validated_plan_sql_fallback_does_not_reinterpret_conversation(deps):
     ]
     state.retrieved_schema = [SchemaHit(table_name="loan", columns=[
         {"name": "CUST_ID", "type": "varchar", "comment": "客户编号"},
+        {"name": "UNUSED_SECRET", "type": "varchar", "comment": "无关字段"},
     ])]
     state.schema_plan = SchemaPlan(anchor_tables=[{
         "table_name": "loan", "role": "primary_fact",
@@ -141,3 +142,5 @@ def test_validated_plan_sql_fallback_does_not_reinterpret_conversation(deps):
     assert "previous-conversation-secret" not in prompt
     assert "当前问题不应再次解释" not in prompt
     assert "CUST_ID" in prompt
+    assert "UNUSED_SECRET" not in prompt
+    assert '"profile": "execution"' in prompt

@@ -14,6 +14,22 @@ clarification_rules:
     auto_min_confidence: 0.7
     llm_required_markers: [最新, 最早, 排名, 前, top, 同比, 环比, 占比, 增长率, 分别, 每个, 或者, 任一, 除外, 连续]
 
+  # ---------- Query M-Schema 上下文预算 ----------
+  # 必需字段不因预算被裁剪；以下限制只控制表扩展和备用字段。
+  query_mschema:
+    precision:
+      max_tables: 4
+      max_total_columns: 32
+      max_optional_columns: 8
+    recall:
+      max_tables: 6
+      max_total_columns: 56
+      max_optional_columns: 20
+    execution:
+      max_tables: 8
+      max_total_columns: 64
+      max_optional_columns: 0
+
   # ---------- 模块 5:高置信简单查询确定性计划 ----------
 deterministic_plan:
   enabled: true

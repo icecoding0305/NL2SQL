@@ -66,10 +66,14 @@ def compact_schema_facts(
         # caller-supplied state projection that may accidentally contain full Schema.
         query_mschema = build_query_mschema(state)
     model = query_mschema.model_dump()
+    # Metrics and local coverage diagnostics are persisted for audit, not sent to
+    # the model. They do not describe executable Schema facts.
+    model.pop("metrics", None)
+    model.pop("warnings", None)
     facts = {"query_mschema": model}
     if include_semantics:
         facts.update({
-            "query_intent": state.query_intent.model_dump() if state.query_intent else None,
+            "query_type": state.query_intent.query_type if state.query_intent else "unknown",
             "semantic_graph": state.semantic_graph.model_dump() if state.semantic_graph else None,
         })
     return facts

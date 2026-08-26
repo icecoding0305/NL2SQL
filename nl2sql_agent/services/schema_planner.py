@@ -458,6 +458,7 @@ def ground_output_bindings(
     candidates: list[FieldCandidate],
     overrides: dict[str, str] | None = None,
     tables: list[TableDef] | None = None,
+    preferred_tables: set[str] | None = None,
 ) -> dict[str, dict]:
     """Bind required outputs; broad result-only concepts may expand safely."""
     if graph is None:
@@ -466,6 +467,30 @@ def ground_output_bindings(
     by_slot: dict[str, list[FieldCandidate]] = {}
     for candidate in candidates:
         by_slot.setdefault(candidate.query_slot, []).append(candidate)
+
+    def prefer_planned(options: list[FieldCandidate]) -> list[FieldCandidate]:
+        """Keep output grounding aligned with the already selected schema subgraph."""
+        if not options or not preferred_tables:
+            return options
+        top_score = max(item.final_score for item in options)
+        planned = [
+            item for item in options
+            if item.table_name in preferred_tables
+            and item.final_score >= max(0.42, top_score * 0.80)
+            and item.phrase_coverage >= 0.65
+        ]
+        if not planned:
+            return options
+        planned_keys = {
+            (item.table_name, item.column_name, item.query_slot) for item in planned
+        }
+        return sorted(
+            options,
+            key=lambda item: (
+                (item.table_name, item.column_name, item.query_slot) not in planned_keys,
+                -item.final_score,
+            ),
+        )
 
     # Grouping dimensions should normally live with the measures they group.
     # Infer the dominant fact table from high-confidence aggregate outputs so
@@ -476,10 +501,10 @@ def ground_output_bindings(
         if not output.required or not output.aggregation or output.aggregation == "count_distinct":
             continue
         concept = output.grounding_concept or output.concept
-        metric_options = by_slot.get(concept, [])
+        metric_options = prefer_planned(by_slot.get(concept, []))
         if not metric_options:
             continue
-        selected_metric = max(metric_options, key=lambda item: item.final_score)
+        selected_metric = metric_options[0]
         fact_table_votes[selected_metric.table_name] = (
             fact_table_votes.get(selected_metric.table_name, 0) + 1
         )
@@ -540,7 +565,7 @@ def ground_output_bindings(
                     }],
                 }
                 continue
-        options = by_slot.get(concept, [])
+        options = prefer_planned(by_slot.get(concept, []))
         override = overrides.get(concept)
         if override:
             options = [
@@ -691,6 +716,134 @@ def _shortest_path(
             visited.add(neighbor)
             queue.append((neighbor, next_path, next_edges))
     return [], []
+
+
+def prefer_coherent_field_bindings(
+    candidates: list[FieldCandidate],
+    intent: QueryIntent,
+    tables: list[TableDef],
+    relations: list[dict],
+    overrides: dict[str, str] | None = None,
+    *,
+    max_hops: int = 3,
+    options_per_slot: int = 5,
+    beam_size: int = 24,
+) -> list[FieldCandidate]:
+    """Select field candidates as one coherent schema assignment.
+
+    A high-scoring column from an unrelated table must not displace a slightly
+    lower-scoring column that lives on the established fact table.  The bounded
+    beam search evaluates all query slots together and rewards co-location and
+    verified connectivity while strongly penalising disconnected table sets.
+    It only considers candidates close to each slot's semantic best, so graph
+    coherence can break a tie but cannot turn a weak field match into evidence.
+    """
+    if not candidates:
+        return candidates
+    overrides = overrides or {}
+    table_names = {table.name for table in tables}
+    ordered_slots = list(dict.fromkeys(
+        item.text
+        for item in [*intent.measures, *intent.filters, *intent.attributes, *intent.dimensions]
+        if item.text and not is_generic_projection(item.text)
+    ))
+    if len(ordered_slots) < 2:
+        return candidates
+
+    by_slot: dict[str, list[FieldCandidate]] = {}
+    for candidate in candidates:
+        by_slot.setdefault(candidate.query_slot, []).append(candidate)
+
+    slot_options: list[tuple[str, list[FieldCandidate]]] = []
+    for slot in ordered_slots:
+        options = by_slot.get(slot, [])
+        override = overrides.get(slot)
+        if override:
+            options = [
+                item for item in options
+                if f"{item.table_name}.{item.column_name}" == override
+            ]
+        if not options:
+            continue
+        top_score = max(item.final_score for item in options)
+        semantic_floor = max(0.42, top_score * 0.80)
+        credible = [
+            item for item in options
+            if item.final_score >= semantic_floor and item.phrase_coverage >= 0.65
+        ]
+        slot_options.append((slot, (credible or options[:1])[:options_per_slot]))
+    if len(slot_options) < 2:
+        return candidates
+
+    # (score, selected candidates, selected physical tables)
+    beam: list[tuple[float, list[FieldCandidate], frozenset[str]]] = [
+        (0.0, [], frozenset())
+    ]
+    path_cache: dict[tuple[str, str], tuple[list[str], list[dict]]] = {}
+
+    def path_between(left: str, right: str) -> tuple[list[str], list[dict]]:
+        key = tuple(sorted((left, right)))
+        if key not in path_cache:
+            path_cache[key] = _shortest_path(
+                left, right, relations, table_names, max_hops
+            )
+        return path_cache[key]
+
+    for _, options in slot_options:
+        expanded: list[tuple[float, list[FieldCandidate], frozenset[str]]] = []
+        for current_score, selected, selected_tables in beam:
+            for option in options:
+                score = current_score + option.final_score
+                if option.table_name in selected_tables:
+                    score += 0.16
+                elif selected_tables:
+                    connected = False
+                    shortest_hops: int | None = None
+                    for existing in selected_tables:
+                        path, _ = path_between(existing, option.table_name)
+                        if path:
+                            connected = True
+                            hops = len(path) - 1
+                            shortest_hops = hops if shortest_hops is None else min(shortest_hops, hops)
+                    if connected:
+                        score -= 0.08 + 0.03 * max(0, (shortest_hops or 1) - 1)
+                    else:
+                        score -= 0.70
+                expanded.append((
+                    score,
+                    [*selected, option],
+                    frozenset((*selected_tables, option.table_name)),
+                ))
+        expanded.sort(key=lambda item: (-item[0], len(item[2])))
+        beam = expanded[:beam_size]
+
+    if not beam:
+        return candidates
+    selected = {
+        (item.query_slot, item.table_name, item.column_name)
+        for item in beam[0][1]
+    }
+    reranked: list[FieldCandidate] = []
+    for item in candidates:
+        key = (item.query_slot, item.table_name, item.column_name)
+        if key in selected:
+            reranked.append(item.model_copy(update={
+                "evidence": list(dict.fromkeys([
+                    *item.evidence,
+                    "字段属于联合选择的最小连通 Schema 子图",
+                ])),
+            }))
+        else:
+            reranked.append(item)
+    return sorted(
+        reranked,
+        key=lambda item: (
+            (item.query_slot, item.table_name, item.column_name) not in selected,
+            -item.final_score,
+            item.table_name,
+            item.column_name,
+        ),
+    )
 
 
 def build_schema_plan(

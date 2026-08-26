@@ -463,3 +463,32 @@ def test_broad_address_output_expands_only_customer_own_full_addresses(deps):
         semantic_graph=graph, output_bindings={"output_1": binding},
     )
     assert any("customer.RESIADDR" in error for error in errors)
+
+
+def test_output_grounding_stays_on_preferred_schema_subgraph():
+    graph = SemanticGraph(outputs=[SemanticOutput(
+        id="output_1", subject_id="product", concept="产品",
+        grounding_concept="产品", source_text="产品", required=True,
+    )])
+    candidates = [
+        FieldCandidate(
+            table_name="app_fpd_report", column_name="prd_code",
+            column_comment="产品编码", query_slot="产品",
+            final_score=0.96, phrase_coverage=1.0,
+        ),
+        FieldCandidate(
+            table_name="dws_ar_loan_info", column_name="prd_code",
+            column_comment="产品编码", query_slot="产品",
+            final_score=0.90, phrase_coverage=1.0,
+        ),
+    ]
+
+    binding = ground_output_bindings(
+        graph,
+        candidates,
+        preferred_tables={"dws_ar_loan_info"},
+    )["output_1"]
+
+    assert binding["table_name"] == "dws_ar_loan_info"
+    assert binding["column_name"] == "prd_code"
+    assert binding["binding_mode"] == "exact"

@@ -26,6 +26,7 @@ from nl2sql_agent.services.schema_planner import (
     ground_output_bindings,
     parse_query_intent,
     plan_table_names,
+    prefer_coherent_field_bindings,
     prefer_minimal_table_cover,
     prefer_primary_fact_fields,
     rank_field_candidates,
@@ -641,6 +642,21 @@ def make_schema_retrieval_node(deps):
                     deps.config.clarification_rules.get("retrieval_confidence", {})
                     .get("max_join_path_hops", 3)
                 )
+                field_candidates = prefer_coherent_field_bindings(
+                    field_candidates,
+                    query_intent,
+                    visible_tables,
+                    relations,
+                    state.selected_field_overrides,
+                    max_hops=max_hops,
+                )
+                field_ambiguities = find_field_ambiguities(
+                    field_candidates, state.selected_field_overrides
+                )
+                field_ambiguities = {
+                    slot: options for slot, options in field_ambiguities.items()
+                    if slot not in output_only_slots and slot not in entity_identity_slots
+                }
                 schema_plan = build_schema_plan(
                     query_intent,
                     visible_tables,
@@ -654,6 +670,14 @@ def make_schema_retrieval_node(deps):
                 )
                 reranked_candidates = prefer_minimal_table_cover(
                     reranked_candidates, query_intent
+                )
+                reranked_candidates = prefer_coherent_field_bindings(
+                    reranked_candidates,
+                    query_intent,
+                    visible_tables,
+                    relations,
+                    state.selected_field_overrides,
+                    max_hops=max_hops,
                 )
                 if reranked_candidates != field_candidates:
                     field_candidates = reranked_candidates
@@ -699,6 +723,7 @@ def make_schema_retrieval_node(deps):
                     field_candidates,
                     state.selected_field_overrides,
                     visible_tables,
+                    set(plan_table_names(schema_plan)),
                 )
                 output_bindings.update(projection_bindings)
                 schema_plan = extend_schema_plan_for_output_bindings(
