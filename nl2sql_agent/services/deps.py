@@ -199,7 +199,10 @@ def build_vector_store(
     embedding_cfg = loader.load("model_config.yaml").get("embedding", {})
     semantic_embedding_cfg = {
         key: embedding_cfg.get(key)
-        for key in ("provider", "model", "model_path", "dimension")
+        for key in (
+            "provider", "model", "model_path", "dimension",
+            "text_normalization_version",
+        )
         if key in embedding_cfg
     }
     cache_signature = cache_signature_override or json.dumps(

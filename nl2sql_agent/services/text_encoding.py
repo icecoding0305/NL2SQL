@@ -35,6 +35,29 @@ def repair_mojibake(text: str) -> str:
     return text
 
 
+def is_likely_mojibake(text: str) -> bool:
+    """Return True for text that is unsafe to use as semantic metadata.
+
+    U+FFFD means bytes were already discarded and cannot be repaired. The
+    other markers cover common UTF-8-as-Latin-1/GBK artifacts without marking
+    ordinary English identifiers as corrupt.
+    """
+    value = str(text or "")
+    if not value:
+        return False
+    if "\ufffd" in value:
+        return True
+    markers = ("Ã", "Â", "æ", "ç", "ð", "锟斤拷")
+    marker_count = sum(value.count(marker) for marker in markers)
+    return marker_count >= 2 and _cjk_count(value) < max(2, len(value) // 8)
+
+
+def clean_semantic_text(text: str) -> str:
+    """Repair reversible mojibake and drop irreversibly corrupt metadata."""
+    repaired = repair_mojibake(str(text or ""))
+    return "" if is_likely_mojibake(repaired) else repaired
+
+
 def normalize_query_payload(value: Any) -> Any:
     """Recursively normalize user-controlled strings in a query payload."""
     if isinstance(value, str):

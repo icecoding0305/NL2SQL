@@ -48,7 +48,7 @@ artifact_dir: data/schema
 prompt_version: enterprise-xiyan-v1
 
 # 字段级 embedding 文本分组(几十上百个字段拼一条会损失检索精度)
-columns_per_chunk: 15
+columns_per_chunk: 1
 
 # 敏感字段标注关键字(列名/注释命中即标 sensitive,取值需脱敏)
 sensitive_patterns:

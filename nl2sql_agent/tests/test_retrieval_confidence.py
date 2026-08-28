@@ -60,6 +60,12 @@ def test_acceptance_1_new_metric_not_blocked_at_module2(deps):
 
 def test_acceptance_2_multi_table_candidates_do_not_ask_user(deps):
     _add_loan_copy_table(deps)
+    # This case verifies the non-governed ambiguity path. Production config
+    # deliberately makes “逾期本金” a strict single-source term, so disable
+    # that independent governance rule for this scenario only.
+    entry = deps.term_mapping._global["逾期本金"]  # noqa: SLF001
+    entry.strict_preferred_tables = False
+    entry.preferred_tables = []
     graph = build_graph(deps, checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "rc-a2"}}
     graph.invoke(make_input("查询新信贷的逾期本金"), cfg)

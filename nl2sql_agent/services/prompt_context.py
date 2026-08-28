@@ -40,6 +40,8 @@ def term_facts(state: NL2SQLState, deps) -> list[dict]:
         facts.append({
             "term": entry.term,
             "resolved_fields": entry.resolved_fields,
+            "preferred_tables": entry.preferred_tables,
+            "strict_preferred_tables": entry.strict_preferred_tables,
             "definition": entry.definition,
             "composite_metric": entry.composite_metric,
         })

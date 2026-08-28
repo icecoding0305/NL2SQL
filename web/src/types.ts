@@ -177,6 +177,60 @@ export interface KnowledgeSummary {
   by_status: Record<KnowledgeStatus, number>;
 }
 
+export interface SchemaEvaluationMetrics {
+  case_count: number;
+  table_recall_at_k: number;
+  column_recall: number;
+  forbidden_table_rate: number;
+  join_path_accuracy: number;
+  schema_plan_exact_match: number;
+  clarification_accuracy: number;
+}
+
+export interface SchemaEvaluationCase {
+  id: string;
+  suite: string;
+  tags: string[];
+  question: string;
+  passed: boolean;
+  predicted_tables: string[];
+  expected_tables: string[];
+  predicted_columns: string[];
+  expected_columns: string[];
+  predicted_joins: string[][];
+  expected_joins: string[][];
+  planned_tables: string[];
+  schema_plan_exact: boolean | null;
+  clarified: boolean;
+  expected_clarification?: boolean;
+  retrieval_confidence: number;
+  unresolved_slots: string[];
+  retrieval_evidence: Record<string, unknown>[];
+}
+
+export interface SchemaEvaluationReport {
+  dataset_version: number;
+  description: string;
+  coverage: Record<string, unknown>;
+  metrics: SchemaEvaluationMetrics;
+  metrics_by_suite: Record<string, SchemaEvaluationMetrics>;
+  cases: SchemaEvaluationCase[];
+  duration_seconds: number;
+  started_at: number;
+  finished_at: number;
+}
+
+export interface SchemaEvaluationStatus {
+  running: boolean;
+  dataset: {
+    version: number;
+    description: string;
+    coverage: Record<string, unknown>;
+    case_count: number;
+  };
+  report: SchemaEvaluationReport | null;
+}
+
 // WebSocket 推送的 pipeline 节点事件(node 与后端节点名一致)
 export interface PipelineEvent {
   event:

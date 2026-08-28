@@ -36,6 +36,7 @@ from nl2sql_agent.services.schema_ingest.text_builder import (
     remove_table_from_store,
     write_mschema_table_embeddings,
 )
+from nl2sql_agent.services.text_encoding import clean_semantic_text
 
 
 @dataclass
@@ -95,9 +96,13 @@ def apply_override(table: TableMeta, override: dict) -> TableMeta:
     """用覆盖层补全注释(原生为空时用 override 的最终注释)。"""
     cols = []
     for c in table.columns:
-        final = override.get((table.table_name, c.name))
-        cols.append(replace(c, comment=final or c.comment, profile=dict(c.profile)))
-    table_comment = override.get((table.table_name, None)) or table.table_comment
+        final = clean_semantic_text(override.get((table.table_name, c.name)) or "")
+        # 数据库原生注释优先；审核覆盖只能补空值，不能覆盖后来修正的源注释。
+        cols.append(replace(c, comment=c.comment or final, profile=dict(c.profile)))
+    table_override = clean_semantic_text(
+        override.get((table.table_name, None)) or ""
+    )
+    table_comment = table.table_comment or table_override
     return replace(table, table_comment=table_comment, columns=cols)
 
 
@@ -357,7 +362,7 @@ def sync(
                 effective_mschema,
                 table_name,
                 manifest,
-                columns_per_chunk=int(config.get("columns_per_chunk", 15)),
+                columns_per_chunk=int(config.get("columns_per_chunk", 1)),
             )
             review_store.update_snapshot(datasource, table_name, hashes[table_name])
             report.ingested += 1

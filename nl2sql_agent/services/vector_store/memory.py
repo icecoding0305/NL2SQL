@@ -140,7 +140,7 @@ class InMemoryVectorStore(VectorStoreAdapter):
         """增量同步前恢复上一快照，随后只重算发生变化的表。"""
         self._ensure_indexed()
 
-    def remove_table(self, table_name: str, columns_per_chunk: int = 15) -> None:
+    def remove_table(self, table_name: str, columns_per_chunk: int = 1) -> None:
         """删除一张表的表级 + 字段级向量条目(增量同步的删表清理)。"""
         self._store.get(self.COLLECTION_TABLE, {}).pop(table_name, None)
         col_coll = self._store.get(self.COLLECTION_COLUMN, {})

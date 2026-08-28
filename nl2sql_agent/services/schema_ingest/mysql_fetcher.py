@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nl2sql_agent.services.executor import SQLExecutor
+from nl2sql_agent.services.text_encoding import clean_semantic_text
 
 
 @dataclass
@@ -147,7 +148,7 @@ def fetch_information_schema(
     cols_by_table: dict[str, list[ColumnMeta]] = {}
     for c in col_rows:
         name = c["COLUMN_NAME"]
-        comment = c.get("COLUMN_COMMENT") or ""
+        comment = clean_semantic_text(c.get("COLUMN_COMMENT") or "")
         cols_by_table.setdefault(c["TABLE_NAME"], []).append(
             ColumnMeta(
                 name=name,
@@ -204,7 +205,7 @@ def fetch_information_schema(
         tables.append(
             TableMeta(
                 table_name=tname,
-                table_comment=t.get("TABLE_COMMENT") or "",
+                table_comment=clean_semantic_text(t.get("TABLE_COMMENT") or ""),
                 columns=columns,
                 row_count_estimate=int(t.get("TABLE_ROWS") or 0),
                 schema_name=schema_name,

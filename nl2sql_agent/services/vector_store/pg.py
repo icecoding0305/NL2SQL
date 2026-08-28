@@ -117,7 +117,7 @@ class PgVectorStore(VectorStoreAdapter):
             out.extend(tables)
         return out
 
-    def remove_table(self, table_name: str, columns_per_chunk: int = 15) -> None:
+    def remove_table(self, table_name: str, columns_per_chunk: int = 1) -> None:
         """删除一张表的向量条目(表级 + 字段级 chunk)。"""
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(

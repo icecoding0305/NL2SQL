@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 
 from nl2sql_agent.services.schema_planner import (
     build_schema_plan,
@@ -46,11 +47,211 @@ from nl2sql_agent.state import (
     DecisionSource,
     DecisionSummary,
     NL2SQLState,
+    QueryIntent,
     SchemaHit,
 )
 
 COLLECTION_COLUMN = "schema_column"
 COLLECTION_RELATION = "schema_relation"
+
+
+def _multipath_enabled(deps) -> bool:
+    rc = deps.config.clarification_rules.get("retrieval_confidence", {})
+    return bool(rc.get("multipath", {}).get("enabled", True))
+
+
+def _role_phrases(intent: QueryIntent | None) -> list[tuple[str, str, str]]:
+    """将已经冻结的 QueryIntent 转成检索短语，不重新理解用户问题。
+
+    返回 ``(slot, role, phrase)``。同一过滤槽的文本和值分别检索，但都把
+    证据归回原 slot，便于后续字段绑定使用。
+    """
+    if intent is None:
+        return []
+    out: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(slot: str, role: str, phrase) -> None:
+        text = str(phrase or "").strip()
+        key = (slot, text.casefold())
+        if not slot or not text or key in seen:
+            return
+        seen.add(key)
+        out.append((slot, role, text))
+
+    for item in intent.entities:
+        add(item.text, "table", item.text)
+    for item in intent.measures:
+        add(item.text, "measure", item.text)
+    for item in intent.attributes:
+        add(item.text, "attribute", item.text)
+    for item in intent.dimensions:
+        add(item.text, "dimension", item.text)
+    for item in intent.filters:
+        add(item.text, "filter", item.text)
+        if isinstance(item.value, str) and item.value.strip():
+            add(item.text, "value", item.value)
+    return out
+
+
+def _retrieval_phrases(deps, query: str, intent: QueryIntent | None) -> list[tuple[str, str, str]]:
+    """Combine frozen intent roles with configured business-concept expansions."""
+    phrases = list(_role_phrases(intent))
+    seen = {(slot, phrase.casefold()) for slot, _, phrase in phrases}
+    rc = deps.config.clarification_rules.get("retrieval_confidence", {})
+    for trigger, expansions in (rc.get("query_expansions") or {}).items():
+        trigger_text = str(trigger).strip()
+        if not trigger_text or trigger_text not in query:
+            continue
+        for phrase in [trigger_text, *(expansions or [])]:
+            text = str(phrase).strip()
+            key = (trigger_text, text.casefold())
+            if text and key not in seen:
+                seen.add(key)
+                phrases.append((trigger_text, "concept", text))
+    return phrases
+
+
+def _multipath_column_evidence(
+    deps,
+    query: str,
+    intent: QueryIntent | None,
+    scope: list[str],
+    top_k: int,
+) -> tuple[
+    dict[str, list[float]],
+    dict[tuple[str, str], float],
+    dict[tuple[str, str, str], float],
+    list[dict],
+]:
+    """按语义槽分路检索字段块，并保留可审计的最强命中证据。"""
+    if not _multipath_enabled(deps):
+        return {}, {}, {}, []
+    rc = deps.config.clarification_rules.get("retrieval_confidence", {})
+    cfg = rc.get("multipath", {})
+    phrase_top_k = max(1, int(cfg.get("phrase_top_k", max(6, top_k * 2))))
+    max_phrases = max(1, int(cfg.get("max_phrases", 12)))
+    role_weights = {
+        "table": 1.05,
+        "measure": 1.0,
+        "attribute": 1.0,
+        "dimension": 0.98,
+        "filter": 0.95,
+        "value": 0.88,
+        "concept": 1.05,
+        **(cfg.get("role_weights") or {}),
+    }
+    per_table: dict[str, list[float]] = {}
+    per_slot: dict[tuple[str, str], float] = {}
+    per_field: dict[tuple[str, str, str], float] = {}
+    evidence: dict[tuple[str, str], dict] = {}
+    for slot, role, phrase in _retrieval_phrases(deps, query, intent)[:max_phrases]:
+        weight = float(role_weights.get(role, 1.0))
+        for item in _search_collection(
+            deps, COLLECTION_COLUMN, phrase, scope, phrase_top_k
+        ):
+            metadata = item.get("metadata", {})
+            table_name = str(metadata.get("table_name") or "")
+            if not table_name:
+                continue
+            score = min(1.0, max(0.0, float(item.get("score", 0.0))) * weight)
+            per_table.setdefault(table_name, []).append(score)
+            key = (slot, table_name)
+            if score > per_slot.get(key, 0.0):
+                per_slot[key] = score
+                evidence[key] = {
+                    "slot": slot,
+                    "role": role,
+                    "phrase": phrase,
+                    "table_name": table_name,
+                    "column_names": list(metadata.get("column_names") or []),
+                    "score": round(score, 6),
+                    "source": "multipath_column_vector",
+                }
+            # New indexes contain one column per document. Keeping the loop also
+            # makes rolling upgrades compatible with old multi-column chunks.
+            for column_name in metadata.get("column_names") or []:
+                field_key = (slot, table_name, str(column_name))
+                per_field[field_key] = max(per_field.get(field_key, 0.0), score)
+    return per_table, per_slot, per_field, sorted(
+        evidence.values(), key=lambda item: (-item["score"], item["slot"], item["table_name"])
+    )
+
+
+def _lexical_table_evidence(
+    deps,
+    query: str,
+    intent: QueryIntent | None,
+    available: dict[str, SchemaHit],
+) -> tuple[dict[str, float], list[dict]]:
+    """Exact business-phrase evidence over trusted catalog descriptions.
+
+    Curated query expansions and frozen intent slots are much safer than
+    arbitrary character overlap. They receive a deterministic boost when they
+    match a table/column name or comment, compensating for generic embedding
+    models that confuse nearby financial domains such as repayment and claim.
+    """
+    phrases = [part.strip() for part in query.split() if len(part.strip()) >= 2]
+    phrases.extend(phrase for _, _, phrase in _role_phrases(intent))
+    phrases = list(dict.fromkeys(phrases))[:20]
+    rc = deps.config.clarification_rules.get("retrieval_confidence", {})
+    trusted_concepts: set[str] = set()
+    for trigger, expansions in (rc.get("query_expansions") or {}).items():
+        if str(trigger) in query:
+            trusted_concepts.update(str(item).strip() for item in (expansions or []) if str(item).strip())
+    scores: dict[str, float] = {}
+    evidence: list[dict] = []
+    for table_name, hit in available.items():
+        best = 0.0
+        best_phrase = ""
+        best_column = ""
+        searchable = [("", f"{hit.table_name}{getattr(hit, 'table_comment', '')}")]
+        searchable.extend(
+            (str(column.get("name") or ""), f"{column.get('name', '')}{column.get('comment', '')}")
+            for column in hit.columns
+        )
+        for column_name, raw_text in searchable:
+            field_text = re.sub(r"\s+", "", raw_text).casefold()
+            if not field_text:
+                continue
+            for phrase in phrases:
+                wanted = re.sub(r"\s+", "", phrase).casefold()
+                if len(wanted) < 3:
+                    continue
+                if wanted in field_text or field_text in wanted:
+                    score = 1.0
+                else:
+                    match = SequenceMatcher(None, wanted, field_text).find_longest_match()
+                    coverage = match.size / max(1, len(wanted))
+                    if match.size >= 4 and coverage >= 0.65:
+                        score = 0.82
+                    elif (
+                        phrase in trusted_concepts
+                        and len(wanted) >= 4
+                        and wanted[:2] in field_text
+                    ):
+                        # Configured concepts such as “代偿金额” and
+                        # catalog labels such as “代偿总额” share a stable
+                        # domain prefix. Arbitrary two-character overlap is forbidden.
+                        score = 0.9
+                    else:
+                        score = 0.0
+                if score > best:
+                    best = score
+                    best_phrase = phrase
+                    best_column = column_name
+        if best:
+            scores[table_name] = best
+            evidence.append({
+                "slot": best_phrase,
+                "role": "lexical",
+                "phrase": best_phrase,
+                "table_name": table_name,
+                "column_names": [best_column] if best_column else [],
+                "score": best,
+                "source": "catalog_exact_phrase",
+            })
+    return scores, evidence
 
 
 def _dedupe(hits: list[SchemaHit]) -> list[SchemaHit]:
@@ -358,6 +559,7 @@ def _catalog_hits(deps, scope: list[str]) -> dict[str, SchemaHit]:
     return {
         table.name: SchemaHit(
             table_name=table.name,
+            table_comment=table.comment,
             columns=[dict(column) for column in table.columns],
             business_terms=[],
         )
@@ -365,13 +567,28 @@ def _catalog_hits(deps, scope: list[str]) -> dict[str, SchemaHit]:
     }
 
 
-def _hybrid_vector_retrieval(deps, query: str, scope: list[str]) -> tuple[list[tuple[SchemaHit, float]], list[dict]]:
+def _hybrid_vector_retrieval(
+    deps,
+    query: str,
+    scope: list[str],
+    query_intent: QueryIntent | None = None,
+    *,
+    return_evidence: bool = False,
+):
     """融合表级和字段级分数，并返回可用于 Join 扩展的关系召回结果。"""
     top_k = deps.config.schema_search_top_k
     table_results = deps.vector_store.search_scored(query, top_k=top_k, data_scope=scope)
     column_results = _search_collection(deps, COLLECTION_COLUMN, query, scope, top_k * 3)
     relation_results = _search_collection(deps, COLLECTION_RELATION, query, scope, top_k * 3)
+    multipath_scores, slot_table_scores, slot_field_scores, retrieval_evidence = (
+        _multipath_column_evidence(deps, query, query_intent, scope, top_k)
+    )
     available = _catalog_hits(deps, scope)
+    lexical_scores, lexical_evidence = (
+        _lexical_table_evidence(deps, query, query_intent, available)
+        if _multipath_enabled(deps) else ({}, [])
+    )
+    retrieval_evidence.extend(lexical_evidence)
 
     table_scores = {hit.table_name: score for hit, score in table_results}
     column_scores: dict[str, float] = {}
@@ -379,6 +596,35 @@ def _hybrid_vector_retrieval(deps, query: str, scope: list[str]) -> tuple[list[t
         table_name = str(item.get("metadata", {}).get("table_name") or "")
         if table_name in available:
             column_scores[table_name] = max(column_scores.get(table_name, 0.0), item["score"])
+
+    # 多路召回按表聚合多个槽位证据。max 保住最强主题，Top-3 均值和
+    # 槽位覆盖奖励让多条件问题中的正确多字段表超过单个同名字段噪声表。
+    for table_name, scores in multipath_scores.items():
+        ordered = sorted(scores, reverse=True)
+        strongest = ordered[0]
+        top_mean = sum(ordered[:3]) / min(3, len(ordered))
+        coverage_bonus = min(len({slot for slot, table in slot_table_scores if table == table_name}), 4) * 0.025
+        aggregate = min(1.0, 0.7 * strongest + 0.3 * top_mean + coverage_bonus)
+        broad = column_scores.get(table_name)
+        if broad is None:
+            # 仅短语命中的表可以进入候选，但需降权，避免短查询噪声挤掉
+            # 整句语义已经稳定命中的表。
+            column_scores[table_name] = aggregate * 0.72
+        else:
+            # 整句是稳定锚点；多路证据用于校正而不是用 max 覆盖。
+            column_scores[table_name] = 0.88 * broad + 0.12 * aggregate
+
+    # 精确命中的内容来自 effective M-Schema/审核知识，不是模型猜测。
+    for table_name, lexical_score in lexical_scores.items():
+        broad = column_scores.get(table_name)
+        lexical_floor = float(
+            deps.config.clarification_rules.get("retrieval_confidence", {})
+            .get("catalog_lexical_floor", 0.7)
+        )
+        column_scores[table_name] = max(
+            min(1.0, (broad or 0.0) + 0.12 * lexical_score),
+            lexical_floor * lexical_score,
+        )
 
     table_weight, column_weight, _, _ = _hybrid_config(deps, query)
     ranked: list[tuple[SchemaHit, float]] = []
@@ -393,10 +639,22 @@ def _hybrid_vector_retrieval(deps, query: str, scope: list[str]) -> tuple[list[t
         else:
             # 只有一个索引有结果时不人为压低分数，兼容尚未生成字段向量的旧索引。
             score = table_score if table_score is not None else column_score
+        # Trusted catalog evidence must survive table/column score fusion. An
+        # exact business phrase should not be diluted below unrelated semantic
+        # neighbors merely because the generic table embedding is weak.
+        if table_name in lexical_scores and score is not None:
+            lexical_floor = float(
+                deps.config.clarification_rules.get("retrieval_confidence", {})
+                .get("catalog_lexical_floor", 0.7)
+            )
+            score = max(score, lexical_floor * lexical_scores[table_name])
         if table_name in available and score is not None:
             ranked.append((available[table_name], min(1.0, score)))
     ranked.sort(key=lambda pair: -pair[1])
-    return ranked[:top_k], relation_results
+    result = (ranked[:top_k], relation_results)
+    if return_evidence:
+        return (*result, slot_table_scores, slot_field_scores, retrieval_evidence)
+    return result
 
 
 def _relation_supplements(
@@ -439,7 +697,16 @@ def _join_path_supplements(deps, seed_names: set[str], scope: list[str]) -> list
     mschema, _ = source
     available = _catalog_hits(deps, scope)
     graph: dict[str, set[str]] = {}
-    for relation in _effective_relations(deps, mschema.get("relations", [])):
+    base_relations = list(mschema.get("relations", []))
+    effective = _effective_relations(deps, base_relations)
+    # 旧 M-Schema/离线评测可能只有表级边而没有列端点。它们只允许用于
+    # 召回阶段寻找桥表，不会进入最终 QueryPlan 或 SQL JOIN 事实。
+    table_only = [
+        relation for relation in base_relations
+        if relation.get("source_table") and relation.get("target_table")
+        and not relation.get("source_columns") and not relation.get("target_columns")
+    ]
+    for relation in [*effective, *table_only]:
         left = str(relation.get("source_table") or "")
         right = str(relation.get("target_table") or "")
         if left in available and right in available:
@@ -518,15 +785,31 @@ def make_schema_retrieval_node(deps):
         # 第一层:术语映射(业务线命名空间 → 全局兜底)
         hits: list[SchemaHit] = []
         matched_terms: list[str] = []
+        governed_entries = []
         has_required_multi_table_hit = False
         has_composite_term = False
+        has_strict_preferred_hit = False
         for term in deps.term_mapping.extract_terms(query, scope):
             res = deps.term_mapping.resolve(term, scope)
             if res.status.value == "found":
                 entry = res.entries[0]
+                governed_entries.append(entry)
                 has_composite_term = has_composite_term or bool(entry.composite_metric)
                 matched_terms.append(entry.term)
-                term_hits = deps.catalog.hits_for_term(entry.term, entry.resolved_fields, scope)
+                term_hits = deps.catalog.hits_for_term(
+                    entry.term,
+                    entry.resolved_fields,
+                    scope,
+                    entry.preferred_tables,
+                )
+                if entry.strict_preferred_tables:
+                    preferred = set(entry.preferred_tables)
+                    governed_hits = [
+                        hit for hit in term_hits if hit.table_name in preferred
+                    ]
+                    if governed_hits:
+                        term_hits = governed_hits
+                        has_strict_preferred_hit = True
                 if not term_hits:
                     term_hits = deps.catalog.hits_covering_term_fields(
                         entry.term, entry.resolved_fields, scope
@@ -536,11 +819,64 @@ def make_schema_retrieval_node(deps):
             # ambiguous/not_found 不参与检索,交给向量兜底
 
         # 第二层:表级 + 字段级混合向量检索；第三层关系向量仅用于受约束补表。
-        scored, relation_results = _hybrid_vector_retrieval(deps, query, scope)
+        scored, relation_results, slot_table_scores, slot_field_scores, retrieval_evidence = (
+            _hybrid_vector_retrieval(
+                deps,
+                query,
+                scope,
+                query_intent,
+                return_evidence=True,
+            )
+        )
+        # A governed term is authoritative field evidence, not merely a table
+        # retrieval shortcut. Inject it into the same slot-level structures
+        # consumed by field ranking so exact business definitions survive
+        # duplicate columns in wide/aggregate tables.
+        visible_by_name = {table.name: table for table in visible_tables}
+        intent_slots = [
+            *query_intent.measures,
+            *query_intent.filters,
+            *query_intent.attributes,
+            *query_intent.dimensions,
+        ]
+        for entry in governed_entries:
+            governed_phrases = [entry.term, *entry.aliases]
+            matching_slots = [
+                slot.text for slot in intent_slots
+                if any(
+                    phrase in slot.text or slot.text in phrase
+                    for phrase in governed_phrases
+                    if phrase and slot.text
+                )
+            ]
+            for table_name in entry.preferred_tables:
+                table = visible_by_name.get(table_name)
+                if table is None:
+                    continue
+                columns_by_name = {
+                    str(column.get("name") or "").casefold(): str(column.get("name") or "")
+                    for column in table.columns
+                }
+                for configured_field in entry.resolved_fields:
+                    column_name = columns_by_name.get(str(configured_field).casefold())
+                    if not column_name:
+                        continue
+                    for slot in matching_slots or [entry.term]:
+                        slot_table_scores[(slot, table_name)] = 1.0
+                        slot_field_scores[(slot, table_name, column_name)] = 1.0
+                        retrieval_evidence.append({
+                            "slot": slot,
+                            "role": "governed_term",
+                            "phrase": entry.term,
+                            "table_name": table_name,
+                            "column_names": [column_name],
+                            "score": 1.0,
+                            "source": "governed_term_mapping",
+                        })
         structured_intent = bool(
             query_intent.measures
             or query_intent.filters
-            or (query_intent.entities and query_intent.attributes)
+            or query_intent.attributes
             or query_intent.dimensions
             or query_intent.query_type == "existence"
         )
@@ -560,6 +896,12 @@ def make_schema_retrieval_node(deps):
             hits and (has_composite_term or not structured_intent or standalone_mapped_measure)
         )
         if use_term_hits:
+            strict_term_only = bool(
+                has_strict_preferred_hit
+                and len(hits) == 1
+                and not has_required_multi_table_hit
+                and (not structured_intent or standalone_mapped_measure)
+            )
             # 有术语命中:补充关联表(解决多表 join 查询缺表)。
             # 综合分 = 向量分 + 字段相关加成:查询剩余词(去掉已命中术语)命中表字段的
             # 表优先补充,避免"学历"这类过滤维度被无关表(如还款明细)挤掉。
@@ -579,11 +921,11 @@ def make_schema_retrieval_node(deps):
                 adaptive_min = max(supp_min, scored2[0][1] * relative)
                 scored2 = [(h, s) for h, s in scored2 if s >= adaptive_min]
             scored2.sort(key=lambda x: -x[1])
-            supplement = [h for h, _ in scored2[:supp_top_n]]
-            relation_supplement = _relation_supplements(
+            supplement = [] if strict_term_only else [h for h, _ in scored2[:supp_top_n]]
+            relation_supplement = [] if strict_term_only else _relation_supplements(
                 deps, relation_results, hit_names, scope
             )
-            path_supplement = _join_path_supplements(
+            path_supplement = [] if strict_term_only else _join_path_supplements(
                 deps,
                 hit_names | {hit.table_name for hit in supplement},
                 scope,
@@ -599,7 +941,11 @@ def make_schema_retrieval_node(deps):
 
                 score_by_table = {hit.table_name: score for hit, score in scored}
                 field_candidates = rank_field_candidates(
-                    query_intent, visible_tables, score_by_table
+                    query_intent,
+                    visible_tables,
+                    score_by_table,
+                    slot_table_scores,
+                    slot_field_scores,
                 )
                 field_candidates = prefer_minimal_table_cover(
                     field_candidates, query_intent
@@ -665,8 +1011,10 @@ def make_schema_retrieval_node(deps):
                     overrides=state.selected_field_overrides,
                     max_hops=max_hops,
                 )
-                reranked_candidates = prefer_primary_fact_fields(
-                    field_candidates, schema_plan
+                reranked_candidates = (
+                    field_candidates
+                    if query_intent.query_type == "multi_fact"
+                    else prefer_primary_fact_fields(field_candidates, schema_plan)
                 )
                 reranked_candidates = prefer_minimal_table_cover(
                     reranked_candidates, query_intent
@@ -774,6 +1122,7 @@ def make_schema_retrieval_node(deps):
                         "semantic_coverage": semantic_coverage,
                         "projection_decision": projection_decision,
                         "field_candidates": field_candidates[:30],
+                        "retrieval_evidence": retrieval_evidence[:40],
                         "field_ambiguities": field_ambiguities,
                         "schema_plan": schema_plan,
                         "business_clarification": business_clarification,
@@ -839,6 +1188,7 @@ def make_schema_retrieval_node(deps):
             "main_table_count": main_table_count,
             "query_intent": query_intent,
             "field_candidates": field_candidates[:30],
+            "retrieval_evidence": retrieval_evidence[:40],
             "field_ambiguities": field_ambiguities,
             "schema_plan": schema_plan,
             "business_clarification": business_clarification,

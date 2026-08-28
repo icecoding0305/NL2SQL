@@ -21,7 +21,7 @@ from nl2sql_agent.services.schema_ingest.comment_generator import (
     has_sufficient_comments,
     validate_comment_draft,
 )
-from nl2sql_agent.services.schema_ingest.diff_sync import sync
+from nl2sql_agent.services.schema_ingest.diff_sync import apply_override, sync
 from nl2sql_agent.services.schema_ingest.mysql_fetcher import (
     ColumnMeta,
     TableMeta,
@@ -35,6 +35,25 @@ from nl2sql_agent.services.schema_ingest.text_builder import (
     write_mschema_table_embeddings,
 )
 from nl2sql_agent.testing import build_test_deps
+
+
+def test_override_only_fills_missing_origin_comments_and_drops_mojibake():
+    table = TableMeta(
+        table_name="loan",
+        table_comment="",
+        columns=[
+            ColumnMeta(name="amount", type="decimal", comment="贷款金额"),
+            ColumnMeta(name="status", type="varchar", comment=""),
+        ],
+    )
+    effective = apply_override(table, {
+        ("loan", None): "\ufffd\ufffd\ufffd\ufffd",
+        ("loan", "amount"): "旧的错误覆盖",
+        ("loan", "status"): "贷款状态",
+    })
+    assert effective.table_comment == ""
+    assert effective.columns[0].comment == "贷款金额"
+    assert effective.columns[1].comment == "贷款状态"
 
 
 class FakeSchemaExecutor:
@@ -154,6 +173,16 @@ def test_vector_text_only_contains_safe_enum_examples():
     assert "正常" in text and "逾期" in text
     assert "张三" not in text
     assert "身份证" not in text
+
+
+def test_column_vector_text_includes_table_business_context():
+    text = build_column_level_text(
+        "claim_detail",
+        [("DC_ALL_BAL", {"category": "numeric", "comment": "代偿总额"})],
+        "代偿记录明细表",
+    )
+    assert "表说明:代偿记录明细表" in text
+    assert "代偿总额" in text
 
 
 # ---------------- 验收 1/2:质量判断 ----------------

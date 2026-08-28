@@ -1,0 +1,292 @@
+version: 2
+description: 生产 Schema Grounding 黄金集；所有物理对象来自 risk_mart effective M-Schema，query_intent 为人工冻结输入。
+m_schema_path: ../../data/schema/risk_mart/m-schema.json
+coverage:
+  case_count: 24
+  suites: {governed_metric: 5, entity_attribute: 4, event_disambiguation: 5, time_and_filter: 3, multi_table_join: 5, clarification: 2}
+  schema_tables: [dwd_ar_loan_info, dwd_ev_indv_crd_app, dwd_ev_repay_detail, dwd_ev_repay_plan, dwd_ip_indv_cust_info, dwd_sr_claim_detail]
+
+cases:
+  - id: metric_loan_amount_colloquial
+    suite: governed_metric
+    tags: [贷款, 口语, 时间, 聚合]
+    question: 上个月放了多少款
+    data_scope: [risk_mart]
+    query_intent: {query_type: aggregation, measures: [{text: 贷款金额, role: measure}], filters: [{text: 放款时间, role: time, operator: last_month}]}
+    expected_tables: [dwd_ar_loan_info]
+    expected_columns: [dwd_ar_loan_info.LOAN_AMT]
+    forbidden_tables: [dwd_ev_repay_plan, dwd_ev_repay_detail, dwd_sr_claim_detail]
+    expected_plan_tables: [dwd_ar_loan_info]
+    expected_clarification: false
+
+  - id: metric_overdue_principal
+    suite: governed_metric
+    tags: [贷款, 逾期, 平台过滤]
+    question: 新信贷的逾期本金余额是多少
+    data_scope: [risk_mart]
+    query_intent: {query_type: aggregation, measures: [{text: 逾期本金, role: measure}], filters: [{text: 平台, role: status, operator: '=', value: 新信贷}]}
+    expected_tables: [dwd_ar_loan_info]
+    expected_columns: [dwd_ar_loan_info.OVD_BAL, dwd_ar_loan_info.PLATFORM_CODE]
+    forbidden_tables: [dwd_ev_repay_detail, dwd_sr_claim_detail]
+    expected_plan_tables: [dwd_ar_loan_info]
+    expected_clarification: false
+
+  - id: metric_loan_balance
+    suite: governed_metric
+    tags: [贷款, 余额, 聚合]
+    question: 当前贷款本金余额合计
+    data_scope: [risk_mart]
+    query_intent: {query_type: aggregation, measures: [{text: 贷款余额, role: measure}]}
+    expected_tables: [dwd_ar_loan_info]
+    expected_columns: [dwd_ar_loan_info.PRIN_BAL]
+    forbidden_tables: [dwd_ev_repay_plan]
+    expected_plan_tables: [dwd_ar_loan_info]
+    expected_clarification: false
+
+  - id: metric_normal_principal_by_product
+    suite: governed_metric
+    tags: [贷款, 正常本金, 分组]
+    question: 按产品统计正常本金
+    data_scope: [risk_mart]
+    query_intent: {query_type: aggregation, measures: [{text: 正常本金, role: measure}], dimensions: [{text: 产品, role: dimension}]}
+    expected_tables: [dwd_ar_loan_info]
+    expected_columns: [dwd_ar_loan_info.NORMAL_BAL, dwd_ar_loan_info.PRD_CODE]
+    expected_plan_tables: [dwd_ar_loan_info]
+    expected_clarification: false
+
+  - id: metric_claim_total
+    suite: governed_metric
+    tags: [代偿, 产品, 聚合]
+    question: 按产品汇总代偿总额
+    data_scope: [risk_mart]
+    query_intent: {query_type: aggregation, measures: [{text: 代偿金额, role: measure}], dimensions: [{text: 产品, role: dimension}]}
+    expected_tables: [dwd_sr_claim_detail]
+    expected_columns: [dwd_sr_claim_detail.DC_ALL_BAL, dwd_sr_claim_detail.PRD_CODE]
+    forbidden_tables: [dwd_ar_loan_info, dwd_ev_repay_detail]
+    expected_plan_tables: [dwd_sr_claim_detail]
+    expected_clarification: false
+
+  - id: entity_customer_schooling
+    suite: entity_attribute
+    tags: [客户, 学历, 当前属性, 同名字段]
+    question: 学历为本科的客户
+    data_scope: [risk_mart]
+    query_intent: {query_type: fact_filter, entities: [{text: 客户, role: entity}], attributes: [{text: 客户姓名, role: attribute}], filters: [{text: 最高学历, role: status, operator: '=', value: 本科}]}
+    expected_tables: [dwd_ip_indv_cust_info]
+    expected_columns: [dwd_ip_indv_cust_info.HIGHEST_SCHOOLING, dwd_ip_indv_cust_info.NAME]
+    forbidden_tables: [dwd_ev_indv_crd_app]
+    expected_plan_tables: [dwd_ip_indv_cust_info]
+    expected_clarification: false
+
+  - id: entity_customer_profile
+    suite: entity_attribute
+    tags: [客户, 基本信息, 多字段]
+    question: 查询客户的姓名、年龄、婚姻状况和居住地址
+    data_scope: [risk_mart]
+    query_intent:
+      query_type: attribute_lookup
+      entities: [{text: 客户, role: entity}]
+      attributes: [{text: 姓名, role: attribute}, {text: 年龄, role: attribute}, {text: 婚姻状况, role: attribute}, {text: 居住地址, role: attribute}]
+    expected_tables: [dwd_ip_indv_cust_info]
+    expected_columns: [dwd_ip_indv_cust_info.NAME, dwd_ip_indv_cust_info.AGE, dwd_ip_indv_cust_info.MARRIAGE, dwd_ip_indv_cust_info.RESIADDR]
+    forbidden_tables: [dwd_ev_indv_crd_app]
+    expected_plan_tables: [dwd_ip_indv_cust_info]
+    expected_clarification: false
+
+  - id: entity_application_schooling_snapshot
+    suite: entity_attribute
+    tags: [授信申请, 学历, 事件快照, 同名字段]
+    question: 查询授信申请时填写的学历和手机号
+    data_scope: [risk_mart]
+    query_intent: {query_type: event_detail, entities: [{text: 授信申请, role: entity}], attributes: [{text: 申请时学历, role: attribute}, {text: 申请时手机号, role: attribute}]}
+    expected_tables: [dwd_ev_indv_crd_app]
+    expected_columns: [dwd_ev_indv_crd_app.DIPLOMA, dwd_ev_indv_crd_app.PHONE_NO]
+    forbidden_tables: [dwd_ip_indv_cust_info]
+    expected_plan_tables: [dwd_ev_indv_crd_app]
+    expected_clarification: false
+
+  - id: entity_customer_employment
+    suite: entity_attribute
+    tags: [客户, 职业, 单位, 收入]
+    question: 查询客户职业、工作单位和年收入情况
+    data_scope: [risk_mart]
+    query_intent: {query_type: attribute_lookup, entities: [{text: 客户, role: entity}], attributes: [{text: 职业, role: attribute}, {text: 工作单位, role: attribute}, {text: 年收入, role: attribute}]}
+    expected_tables: [dwd_ip_indv_cust_info]
+    expected_columns: [dwd_ip_indv_cust_info.CAREER_TYPE, dwd_ip_indv_cust_info.UNIT_NAME, dwd_ip_indv_cust_info.PER_MON_INCOME]
+    forbidden_tables: [dwd_ev_indv_crd_app]
+    expected_plan_tables: [dwd_ip_indv_cust_info]
+    expected_clarification: false
+
+  - id: event_credit_application_amount
+    suite: event_disambiguation
+    tags: [授信申请, 金额, 状态]
+    question: 查询授信申请额度、审批额度和授信状态
+    data_scope: [risk_mart]
+    query_intent: {query_type: event_detail, entities: [{text: 授信申请, role: entity}], attributes: [{text: 申请授信额度, role: attribute}, {text: 审批授信额度, role: attribute}, {text: 授信状态, role: attribute}]}
+    expected_tables: [dwd_ev_indv_crd_app]
+    expected_columns: [dwd_ev_indv_crd_app.APP_CRED_AMT, dwd_ev_indv_crd_app.APPRV_CRED_AMT, dwd_ev_indv_crd_app.APPRV_STATE]
+    forbidden_tables: [dwd_ar_loan_info]
+    expected_plan_tables: [dwd_ev_indv_crd_app]
+    expected_clarification: false
+
+  - id: event_repayment_plan
+    suite: event_disambiguation
+    tags: [应还, 还款计划, 期数]
+    question: 每一期应还本金、利息和总金额
+    data_scope: [risk_mart]
+    query_intent: {query_type: event_detail, entities: [{text: 还款计划, role: entity}], attributes: [{text: 当前期数, role: attribute}, {text: 应还本金, role: attribute}, {text: 应还利息, role: attribute}, {text: 应还总金额, role: attribute}]}
+    expected_tables: [dwd_ev_repay_plan]
+    expected_columns: [dwd_ev_repay_plan.TERM_NO, dwd_ev_repay_plan.RPY_PRINC, dwd_ev_repay_plan.RPY_INT, dwd_ev_repay_plan.RPY_AMT]
+    forbidden_tables: [dwd_ev_repay_detail]
+    expected_plan_tables: [dwd_ev_repay_plan]
+    expected_clarification: false
+
+  - id: event_actual_repayment
+    suite: event_disambiguation
+    tags: [实还, 还款明细, 期数]
+    question: 每期实际还了多少本金、利息和罚息
+    data_scope: [risk_mart]
+    query_intent: {query_type: event_detail, entities: [{text: 实际还款明细, role: entity}], attributes: [{text: 当前期数, role: attribute}, {text: 实还本金, role: attribute}, {text: 实还利息, role: attribute}, {text: 实还罚息, role: attribute}]}
+    expected_tables: [dwd_ev_repay_detail]
+    expected_columns: [dwd_ev_repay_detail.TERM_NO, dwd_ev_repay_detail.PRINC, dwd_ev_repay_detail.INT, dwd_ev_repay_detail.OVD]
+    forbidden_tables: [dwd_ev_repay_plan]
+    expected_plan_tables: [dwd_ev_repay_detail]
+    expected_clarification: false
+
+  - id: event_claim_components
+    suite: event_disambiguation
+    tags: [代偿, 本金, 利息, 罚息]
+    question: 查看每笔代偿的本金、利息、罚息和代偿类型
+    data_scope: [risk_mart]
+    query_intent: {query_type: event_detail, entities: [{text: 代偿记录, role: entity}], attributes: [{text: 代偿本金, role: attribute}, {text: 代偿利息, role: attribute}, {text: 代偿罚息, role: attribute}, {text: 代偿类型, role: attribute}]}
+    expected_tables: [dwd_sr_claim_detail]
+    expected_columns: [dwd_sr_claim_detail.DC_BAL, dwd_sr_claim_detail.DC_INT, dwd_sr_claim_detail.DC_FINC, dwd_sr_claim_detail.DC_TYPE]
+    forbidden_tables: [dwd_ev_repay_detail]
+    expected_plan_tables: [dwd_sr_claim_detail]
+    expected_clarification: false
+
+  - id: event_loan_contract_detail
+    suite: event_disambiguation
+    tags: [借据, 合同, 状态, 期限]
+    question: 查询借据编号、合同编号、贷款状态和贷款期数
+    data_scope: [risk_mart]
+    query_intent: {query_type: event_detail, entities: [{text: 贷款借据, role: entity}], attributes: [{text: 借据编号, role: attribute}, {text: 合同编号, role: attribute}, {text: 贷款状态, role: attribute}, {text: 贷款期数, role: attribute}]}
+    expected_tables: [dwd_ar_loan_info]
+    expected_columns: [dwd_ar_loan_info.LOAN_NO, dwd_ar_loan_info.CONT_NO, dwd_ar_loan_info.LOAN_STATUS, dwd_ar_loan_info.TOTAL_TERMS]
+    forbidden_tables: [dwd_ev_repay_plan]
+    expected_plan_tables: [dwd_ar_loan_info]
+    expected_clarification: false
+
+  - id: time_application_last_month
+    suite: time_and_filter
+    tags: [授信申请, 时间, 状态]
+    question: 上个月提交的授信申请及审批状态
+    data_scope: [risk_mart]
+    query_intent: {query_type: fact_filter, entities: [{text: 授信申请, role: entity}], attributes: [{text: 审批状态, role: attribute}], filters: [{text: 授信申请时间, role: time, operator: last_month}]}
+    expected_tables: [dwd_ev_indv_crd_app]
+    expected_columns: [dwd_ev_indv_crd_app.APPLY_DATE, dwd_ev_indv_crd_app.APPRV_STATE]
+    expected_plan_tables: [dwd_ev_indv_crd_app]
+    expected_clarification: false
+
+  - id: time_actual_repayment_range
+    suite: time_and_filter
+    tags: [实际还款, 时间范围, 聚合]
+    question: 今年一季度实际归还本金合计
+    data_scope: [risk_mart]
+    query_intent: {query_type: aggregation, measures: [{text: 实还本金, role: measure}], filters: [{text: 实还日期, role: time, operator: between, value: 今年一季度}]}
+    expected_tables: [dwd_ev_repay_detail]
+    expected_columns: [dwd_ev_repay_detail.PRINC, dwd_ev_repay_detail.REPAY_DATE]
+    forbidden_tables: [dwd_ev_repay_plan]
+    expected_plan_tables: [dwd_ev_repay_detail]
+    expected_clarification: false
+
+  - id: time_claim_by_day
+    suite: time_and_filter
+    tags: [代偿, 日期, 分组]
+    question: 按代偿日统计代偿金额
+    data_scope: [risk_mart]
+    query_intent: {query_type: aggregation, measures: [{text: 代偿金额, role: measure}], dimensions: [{text: 代偿日, role: dimension}]}
+    expected_tables: [dwd_sr_claim_detail]
+    expected_columns: [dwd_sr_claim_detail.DC_ALL_BAL, dwd_sr_claim_detail.DC_DT]
+    expected_plan_tables: [dwd_sr_claim_detail]
+    expected_clarification: false
+
+  - id: join_overdue_customer
+    suite: multi_table_join
+    tags: [贷款, 客户, 两表, 聚合]
+    question: 查询有逾期本金的客户最高学历和逾期本金
+    data_scope: [risk_mart]
+    query_intent: {query_type: multi_fact, entities: [{text: 客户, role: entity}], measures: [{text: 逾期本金, role: measure}], attributes: [{text: 最高学历, role: attribute}], filters: [{text: 逾期本金, role: status, operator: '>', value: 0}]}
+    expected_tables: [dwd_ar_loan_info, dwd_ip_indv_cust_info]
+    expected_columns: [dwd_ar_loan_info.OVD_BAL, dwd_ip_indv_cust_info.HIGHEST_SCHOOLING]
+    expected_joins: [[dwd_ar_loan_info.CUST_ID, dwd_ip_indv_cust_info.CUST_ID]]
+    forbidden_tables: [dwd_ev_indv_crd_app]
+    expected_plan_tables: [dwd_ar_loan_info, dwd_ip_indv_cust_info]
+    expected_clarification: false
+
+  - id: join_loan_repayment_plan
+    suite: multi_table_join
+    tags: [贷款, 应还, 两表]
+    question: 查询贷款金额及每一期应还本金
+    data_scope: [risk_mart]
+    query_intent: {query_type: multi_fact, entities: [{text: 贷款, role: entity}, {text: 还款计划, role: entity}], measures: [{text: 贷款金额, role: measure}, {text: 应还本金, role: measure}], dimensions: [{text: 当前期数, role: dimension}]}
+    expected_tables: [dwd_ar_loan_info, dwd_ev_repay_plan]
+    expected_columns: [dwd_ar_loan_info.LOAN_AMT, dwd_ev_repay_plan.RPY_PRINC, dwd_ev_repay_plan.TERM_NO]
+    expected_joins: [[dwd_ar_loan_info.LOAN_NO, dwd_ev_repay_plan.LOAN_NO]]
+    forbidden_tables: [dwd_ev_repay_detail]
+    expected_plan_tables: [dwd_ar_loan_info, dwd_ev_repay_plan]
+    expected_clarification: false
+
+  - id: join_plan_actual_comparison
+    suite: multi_table_join
+    tags: [应还, 实还, 复合键, 对比]
+    question: 对比每笔借据每一期的应还本金和实还本金
+    data_scope: [risk_mart]
+    query_intent: {query_type: multi_fact, entities: [{text: 还款计划, role: entity}, {text: 实际还款明细, role: entity}], measures: [{text: 应还本金, role: measure}, {text: 实还本金, role: measure}], dimensions: [{text: 借据编号, role: dimension}, {text: 当前期数, role: dimension}]}
+    expected_tables: [dwd_ev_repay_plan, dwd_ev_repay_detail]
+    expected_columns: [dwd_ev_repay_plan.RPY_PRINC, dwd_ev_repay_detail.PRINC, dwd_ev_repay_plan.LOAN_NO, dwd_ev_repay_plan.TERM_NO]
+    expected_joins: [[dwd_ev_repay_plan.LOAN_NO, dwd_ev_repay_detail.LOAN_NO], [dwd_ev_repay_plan.TERM_NO, dwd_ev_repay_detail.TERM_NO]]
+    expected_plan_tables: [dwd_ev_repay_plan, dwd_ev_repay_detail]
+    expected_clarification: false
+
+  - id: join_claim_customer_two_hop
+    suite: multi_table_join
+    tags: [代偿, 客户, 三表, 两跳]
+    question: 查询发生代偿的客户姓名、产品名称和代偿金额
+    data_scope: [risk_mart]
+    query_intent: {query_type: multi_fact, entities: [{text: 代偿记录, role: entity}, {text: 客户, role: entity}], measures: [{text: 代偿金额, role: measure}], attributes: [{text: 客户姓名, role: attribute}, {text: 产品名称, role: attribute}]}
+    expected_tables: [dwd_sr_claim_detail, dwd_ar_loan_info, dwd_ip_indv_cust_info]
+    expected_columns: [dwd_sr_claim_detail.DC_ALL_BAL, dwd_sr_claim_detail.PRD_NAME, dwd_ip_indv_cust_info.NAME]
+    expected_joins: [[dwd_sr_claim_detail.LOAN_NO, dwd_ar_loan_info.LOAN_NO], [dwd_ar_loan_info.CUST_ID, dwd_ip_indv_cust_info.CUST_ID]]
+    expected_plan_tables: [dwd_sr_claim_detail, dwd_ar_loan_info, dwd_ip_indv_cust_info]
+    expected_clarification: false
+
+  - id: join_repayment_customer_two_hop
+    suite: multi_table_join
+    tags: [实还, 客户, 三表, 两跳]
+    question: 按客户最高学历统计实际还款本金
+    data_scope: [risk_mart]
+    query_intent: {query_type: multi_fact, entities: [{text: 实际还款, role: entity}, {text: 客户, role: entity}], measures: [{text: 实还本金, role: measure}], dimensions: [{text: 最高学历, role: dimension}]}
+    expected_tables: [dwd_ev_repay_detail, dwd_ar_loan_info, dwd_ip_indv_cust_info]
+    expected_columns: [dwd_ev_repay_detail.PRINC, dwd_ip_indv_cust_info.HIGHEST_SCHOOLING]
+    expected_joins: [[dwd_ev_repay_detail.LOAN_NO, dwd_ar_loan_info.LOAN_NO], [dwd_ar_loan_info.CUST_ID, dwd_ip_indv_cust_info.CUST_ID]]
+    expected_plan_tables: [dwd_ev_repay_detail, dwd_ar_loan_info, dwd_ip_indv_cust_info]
+    expected_clarification: false
+
+  - id: clarify_schooling_context
+    suite: clarification
+    tags: [歧义, 学历, 当前属性, 申请快照]
+    question: 查询学历
+    data_scope: [risk_mart]
+    query_intent: {query_type: attribute_lookup, attributes: [{text: 学历, role: attribute}]}
+    expected_tables: []
+    expected_clarification: true
+
+  - id: clarify_amount_context
+    suite: clarification
+    tags: [歧义, 金额, 多业务事件]
+    question: 按产品统计金额
+    data_scope: [risk_mart]
+    query_intent: {query_type: aggregation, measures: [{text: 金额, role: measure}], dimensions: [{text: 产品, role: dimension}]}
+    expected_tables: []
+    expected_clarification: true

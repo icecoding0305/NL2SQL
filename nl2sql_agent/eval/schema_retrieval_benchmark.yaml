@@ -1,19 +1,40 @@
 cases:
-  - query: "上个月放了多少款"
+  - id: loan_amount_01
+    suite: single
+    tags: [时间, 聚合]
+    query: "上个月放了多少款"
     data_scope: [risk_mart]
     expected_tables: [dwd_ar_loan_info]
-  - query: "学历为本科的客户"
+  - id: customer_education_01
+    suite: single
+    tags: [过滤, 客户]
+    query: "学历为本科的客户"
     data_scope: [risk_mart]
     expected_tables: [dwd_ip_indv_cust_info]
-  - query: "查询代偿金额和代偿记录"
+    expected_columns: [dwd_ip_indv_cust_info.highest_schooling]
+  - id: claim_01
+    suite: single
+    tags: [指标, 明细]
+    query: "查询代偿金额和代偿记录"
     data_scope: [risk_mart]
     expected_tables: [dwd_sr_claim_detail]
-  - query: "每一期应还金额"
+    expected_columns: [dwd_sr_claim_detail.dc_all_bal]
+  - id: repay_plan_01
+    suite: single
+    tags: [分组, 指标]
+    query: "每一期应还金额"
     data_scope: [risk_mart]
     expected_tables: [dwd_ev_repay_plan]
-  - query: "客户实际还款明细"
+    expected_columns: [dwd_ev_repay_plan.rpy_amt]
+  - id: repay_detail_01
+    suite: single
+    tags: [客户, 明细]
+    query: "客户实际还款明细"
     data_scope: [risk_mart]
     expected_tables: [dwd_ev_repay_detail]
-  - query: "个人授信申请信息"
+  - id: credit_application_01
+    suite: single
+    tags: [授信, 明细]
+    query: "个人授信申请信息"
     data_scope: [risk_mart]
     expected_tables: [dwd_ev_indv_crd_app]

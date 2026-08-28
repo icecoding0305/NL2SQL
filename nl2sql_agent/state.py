@@ -15,6 +15,7 @@ class SchemaHit(BaseModel):
     """一次 Schema 检索命中:一张表及其列定义(含敏感标记/注释)。"""
 
     table_name: str
+    table_comment: str = ""
     columns: list[dict] = Field(default_factory=list)  # {name, type, comment, sensitive?}
     business_terms: list[str] = Field(default_factory=list)  # 命中的术语
 
@@ -608,6 +609,8 @@ class NL2SQLState(BaseModel):
     retrieval_candidates: list[SchemaHit] = Field(default_factory=list)
     retrieval_rewrite_count: int = 0
     retrieval_rewrites: list[str] = Field(default_factory=list)
+    # 角色化多路召回的可审计证据；不包含模型思维过程或敏感样例值。
+    retrieval_evidence: list[dict[str, Any]] = Field(default_factory=list)
     # 术语精确命中的主表数(不含向量补充的关联表),供复杂度判断
     main_table_count: int = 0
     low_confidence_flag: bool = False

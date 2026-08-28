@@ -2,7 +2,10 @@ from nl2sql_agent.nodes.m6_plan_validation import validate_plan
 from nl2sql_agent.nodes.m5b_plan_generation import make_plan_generation_node
 from nl2sql_agent.services.plan_normalizer import normalize_structural_coverage
 from nl2sql_agent.services.semantic_parser import build_semantic_graph
-from nl2sql_agent.state import NL2SQLState, QueryPlan, SchemaHit, SemanticGraph, SemanticPredicate
+from nl2sql_agent.state import (
+    NL2SQLState, PlannedTable, QueryPlan, SchemaHit, SchemaPlan,
+    SemanticGraph, SemanticPredicate,
+)
 
 
 def test_positive_exists_parent_is_attached_to_join_and_covered(deps):
@@ -143,9 +146,36 @@ def test_plan_generation_node_normalizes_exists_before_validation(deps):
             ]),
             SchemaHit(table_name="customer", columns=[{"name": "CUST_ID"}]),
         ],
+        schema_plan=SchemaPlan(
+            anchor_tables=[PlannedTable(table_name="loan", role="primary_fact", score=0.95)],
+            dimension_tables=[PlannedTable(table_name="customer", role="entity", score=0.95)],
+            relations=[{
+                "source_table": "loan", "source_columns": ["CUST_ID"],
+                "target_table": "customer", "target_columns": ["CUST_ID"],
+                "status": "verified",
+            }],
+            confidence=0.95,
+        ),
+        output_bindings={"output_1": {
+            "table_name": "customer", "column_name": "CUST_ID",
+            "confidence": 0.95, "binding_mode": "exact",
+            "bindings": [{
+                "table_name": "customer", "column_name": "CUST_ID", "confidence": 0.95,
+            }],
+        }},
+        semantic_bindings={
+            "atom_1": {
+                "table_name": "loan", "column_name": "LOAN_AMT",
+                "operator": ">", "value": 1000, "confidence": 0.95,
+            },
+            "atom_2_status": {
+                "table_name": "loan", "column_name": "OVD_BAL",
+                "operator": ">", "value": 0, "confidence": 0.95,
+            },
+        },
     )
 
     out = make_plan_generation_node(deps)(state)
 
     assert out["query_plan"].join_logic[0].source_atom_ids == ["atom_2"]
-    assert out["plan_normalizations"] == ["atom_2 自动绑定到关联操作"]
+    assert "atom_2 自动绑定到关联操作" in out["plan_normalizations"]

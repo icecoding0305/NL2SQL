@@ -234,9 +234,18 @@ def rank_field_candidates(
     intent: QueryIntent,
     tables: Iterable[TableDef],
     column_table_scores: dict[str, float] | None = None,
+    slot_table_scores: dict[tuple[str, str], float] | None = None,
+    slot_field_scores: dict[tuple[str, str, str], float] | None = None,
 ) -> list[FieldCandidate]:
-    """为每个度量/过滤槽位独立排序字段，列级命中可独立产生表候选。"""
+    """为每个语义槽独立排序字段。
+
+    ``column_table_scores`` 是整句检索得到的表级字段证据；
+    ``slot_table_scores`` 是角色化短语检索得到的 ``(槽位, 表)`` 证据。
+    后者只影响对应槽位，避免多条件问题被一个最强主题支配。
+    """
     column_table_scores = column_table_scores or {}
+    slot_table_scores = slot_table_scores or {}
+    slot_field_scores = slot_field_scores or {}
     slots = {
         slot.text: slot
         for slot in [*intent.measures, *intent.filters, *intent.attributes, *intent.dimensions]
@@ -262,11 +271,32 @@ def rank_field_candidates(
                     role_score = 1.0 if _is_numeric(column) and role in ("measure", "") else 0.35
                 else:
                     role_score = 1.0 if not _is_numeric(column) or role == "dimension" else 0.5
-                vector = max(0.0, float(column_table_scores.get(table.name, 0.0)))
+                broad_vector = max(
+                    0.0, float(column_table_scores.get(table.name, 0.0))
+                )
+                slot_vector = max(
+                    0.0, float(slot_table_scores.get((slot_text, table.name), 0.0))
+                )
+                field_vector = max(
+                    0.0,
+                    float(slot_field_scores.get(
+                        (slot_text, table.name, str(column.get("name") or "")), 0.0
+                    )),
+                )
+                # 槽位证据优先；整句证据作为覆盖旧索引/旧调用方的稳定兜底。
+                vector = max(field_vector, slot_vector * 0.80, broad_vector * 0.60)
                 score = (
                     0.30 * lexical + 0.25 * coverage + 0.20 * vector
                     + 0.15 * role_score + 0.10 * entity_affinity
                 )
+                if slot.role == "attribute" and not intent.measures and entity_affinity >= 0.9:
+                    score += 0.15
+                    entity_names = {
+                        normalize_semantic_text(entity.text) for entity in intent.entities
+                    }
+                    table_comment = normalize_semantic_text(table.comment)
+                    if any(name and table_comment.endswith(name) for name in entity_names):
+                        score += 0.12
                 if coverage <= 0.25 and vector <= 0.25:
                     continue
                 evidence = []
@@ -278,6 +308,10 @@ def rank_field_candidates(
                     evidence.append("字段角色为度量")
                 if entity_affinity >= 0.9:
                     evidence.append("字段所在表同时匹配目标实体")
+                if slot_vector > broad_vector and slot_vector > 0:
+                    evidence.append(f"角色化召回命中语义槽“{slot_text}”")
+                if field_vector > 0 and field_vector >= slot_vector * 0.8:
+                    evidence.append(f"字段级角色化召回命中语义槽“{slot_text}”")
                 candidates.append(FieldCandidate(
                     table_name=table.name,
                     column_name=str(column.get("name") or ""),
@@ -318,10 +352,15 @@ def find_field_ambiguities(
         ):
             continue
         top_score = options[0].final_score
+        exact_top = (
+            options[0].lexical_score >= 0.99
+            and options[0].phrase_coverage >= 0.99
+        )
         close = [
             item for item in options
             if item.final_score >= minimum_score
             and item.phrase_coverage >= 0.65
+            and (not exact_top or item.lexical_score >= 0.99)
             and (top_score - item.final_score) / max(top_score, 1e-9) < relative_gap
         ]
         distinct = {(item.table_name, item.column_name) for item in close}
@@ -410,6 +449,11 @@ def prefer_minimal_table_cover(
     requested fields. This bounded set-cover tie-breaker changes only ordering;
     it does not inflate semantic confidence or invent relations.
     """
+    # Multi-fact questions intentionally require multiple business grains.
+    # Rewarding co-location here can collapse scheduled repayment, actual
+    # repayment and customer attributes into one semantically wrong wide table.
+    if intent.query_type == "multi_fact":
+        return candidates
     slots = list(dict.fromkeys(
         item.text
         for item in [*intent.measures, *intent.filters, *intent.attributes, *intent.dimensions]
@@ -795,7 +839,7 @@ def prefer_coherent_field_bindings(
             for option in options:
                 score = current_score + option.final_score
                 if option.table_name in selected_tables:
-                    score += 0.16
+                    score += 0.0 if intent.query_type == "multi_fact" else 0.16
                 elif selected_tables:
                     connected = False
                     shortest_hops: int | None = None
@@ -806,7 +850,9 @@ def prefer_coherent_field_bindings(
                             hops = len(path) - 1
                             shortest_hops = hops if shortest_hops is None else min(shortest_hops, hops)
                     if connected:
-                        score -= 0.08 + 0.03 * max(0, (shortest_hops or 1) - 1)
+                        score -= (
+                            0.02 if intent.query_type == "multi_fact" else 0.08
+                        ) + 0.03 * max(0, (shortest_hops or 1) - 1)
                     else:
                         score -= 0.70
                 expanded.append((

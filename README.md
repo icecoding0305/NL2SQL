@@ -221,6 +221,21 @@ data/schema/<数据库或连接标识>/m-schema.json
 手工执行额外的“生成 M-Schema”步骤。内存向量后端使用同目录的 `vector-cache.json` 缓存向量；
 M-Schema 语义哈希或 Embedding 配置变化时自动重建。
 
+Schema 检索支持 `legacy / multipath` 对照。`multipath` 复用问题理解阶段已经冻结的
+`QueryIntent`，按主体、指标、属性、维度、过滤和值分别召回字段证据，再与整句表/字段向量、
+精确术语和可信关系合并；不会增加额外 LLM 调用。每条槽位证据写入查询审计，便于定位错表或
+漏字段。可在 `clarification_rules.yaml` 的 `retrieval_confidence.multipath.enabled` 紧急回退。
+
+离线对比命令：
+
+```powershell
+python -m nl2sql_agent.eval.run_schema_retrieval_benchmark --strategy legacy
+python -m nl2sql_agent.eval.run_schema_retrieval_benchmark --strategy multipath
+```
+
+评测集支持 `expected_tables`、`expected_columns`、`expected_joins` 和 `forbidden_tables`；正式调参前
+应使用脱敏的真实业务问题扩充黄金集，不能只根据仓库内少量冒烟用例调整权重。
+
 ## 企业知识管理
 
 左侧“企业知识管理”统一维护业务名词、同义表达、业务规则和优化案例。知识记录保存在
@@ -423,7 +438,13 @@ WebSocket 事件包括 `trace`、`node_start`、`node_complete`、`retry`、`int
 uv run pytest
 uv run python -m nl2sql_agent.eval.run_eval
 uv run python -m nl2sql_agent.eval.run_schema_retrieval_benchmark
+uv run python -m nl2sql_agent.eval.run_schema_golden_eval --json-output logs/schema-golden-report.json
 ```
+
+`schema_retrieval_benchmark` 用于隔离比较向量召回策略；`schema_golden_eval` 则直接运行生产
+Schema 检索节点，覆盖术语治理、字段重排、关系补全、最小 `SchemaPlan` 与澄清决策。黄金样本位于
+`nl2sql_agent/eval/schema_golden_set.yaml`，其中冻结的 `query_intent` 用于把问题理解误差与 Schema
+Grounding 误差分开评估。该评测使用内存执行器，不连接或查询业务数据库。
 
 重点覆盖：
 

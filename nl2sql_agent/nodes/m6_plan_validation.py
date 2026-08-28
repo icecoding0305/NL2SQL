@@ -454,7 +454,7 @@ def make_plan_validation_node(deps):
                 headline = "当前问题所需字段或可信关联不完整，系统已停止生成，避免猜测 SQL。"
             else:
                 headline = "查询计划未通过完整性校验，未能生成可执行 SQL。"
-            out["final_answer"] = headline + "\n" + "；".join(errors[:5])
+            out["final_answer"] = headline + "请人工介入检查业务口径或 Schema 配置。\n" + "；".join(errors[:5])
         return out
 
     return plan_validation_node

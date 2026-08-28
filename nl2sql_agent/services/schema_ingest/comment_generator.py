@@ -17,6 +17,7 @@ from collections import defaultdict
 from nl2sql_agent.services.executor import SQLExecutor
 from nl2sql_agent.services.schema_ingest.mysql_fetcher import TableMeta
 from nl2sql_agent.services.schema_ingest.profiler import mask_value
+from nl2sql_agent.services.text_encoding import clean_semantic_text, is_likely_mojibake
 
 
 def _quality_config(config: dict) -> dict:
@@ -247,13 +248,19 @@ def validate_comment_draft(table: TableMeta, draft: dict) -> tuple[dict, list[st
             columns.pop(name, None)
     sensitive_pattern = re.compile(r"(?<!\d)(?:1\d{10}|\d{17}[\dXx])(?!\d)")
     for name, comment in list(columns.items()):
-        if sensitive_pattern.search(str(comment)):
+        if is_likely_mojibake(str(comment)):
+            errors.append(f"字段 {name} 描述存在乱码")
+            columns.pop(name, None)
+        elif sensitive_pattern.search(str(comment)):
             errors.append(f"字段 {name} 描述疑似包含真实敏感值")
             columns.pop(name, None)
         elif len(str(comment)) > 100:
             errors.append(f"字段 {name} 描述超过 100 字")
     table_comment = str(draft.get("table_comment") or "").strip()
-    if sensitive_pattern.search(table_comment):
+    if is_likely_mojibake(table_comment):
+        errors.append("表描述存在乱码")
+        table_comment = ""
+    elif sensitive_pattern.search(table_comment):
         errors.append("表描述疑似包含真实敏感值")
         table_comment = ""
     elif len(table_comment) > 300:
@@ -273,7 +280,11 @@ def validate_comment_draft(table: TableMeta, draft: dict) -> tuple[dict, list[st
         confidence += 0.05
     confidence -= min(0.3, 0.1 * len(errors))
     confidence = round(max(0.0, min(1.0, confidence)), 3)
-    cleaned = {**draft, "table_comment": table_comment, "columns": columns}
+    cleaned = {
+        **draft,
+        "table_comment": clean_semantic_text(table_comment),
+        "columns": {name: clean_semantic_text(value) for name, value in columns.items()},
+    }
     return cleaned, errors, confidence
 
 

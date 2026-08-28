@@ -635,6 +635,13 @@ button, input, textarea { font: inherit; }
   .audit-summary-card .ant-card-body, .approval-summary-card .ant-card-body { padding: 13px 14px; }
 }
 
+.evaluation-page > .ant-alert,
+.evaluation-page > .ant-row,
+.evaluation-section {
+  margin-bottom: 16px;
+}
+.evaluation-case-detail { padding: 8px 20px 14px; }
+
 /* ---------------------------------------------------------------
  * 语义色统一:把 antd Tag 的默认蓝/绿/红/橙映射到主题色
  * (antd Tag color="blue|green|red|orange|gold" 使用的是自带色板,

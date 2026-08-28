@@ -28,6 +28,8 @@ class TermEntry:
     definition: str
     composite_metric: bool = False
     aliases: list[str] = field(default_factory=list)
+    preferred_tables: list[str] = field(default_factory=list)
+    strict_preferred_tables: bool = False
 
 
 @dataclass
@@ -62,6 +64,8 @@ class TermMappingService:
                     definition=cfg.get("definition", ""),
                     composite_metric=bool(cfg.get("composite_metric", False)),
                     aliases=[str(x) for x in cfg.get("aliases", [])],
+                    preferred_tables=[str(x) for x in cfg.get("preferred_tables", [])],
+                    strict_preferred_tables=bool(cfg.get("strict_preferred_tables", False)),
                 )
                 if ns_name == "_global":
                     self._global[term] = entry
@@ -76,6 +80,8 @@ class TermMappingService:
                 definition=str(cfg.get("definition") or ""),
                 composite_metric=bool(cfg.get("composite_metric", False)),
                 aliases=[str(x) for x in cfg.get("aliases", [])],
+                preferred_tables=[str(x) for x in cfg.get("preferred_tables", [])],
+                strict_preferred_tables=bool(cfg.get("strict_preferred_tables", False)),
             )
             self._namespaces.setdefault(namespace, {})[term] = entry
         self._mtimes = self._current_mtimes()

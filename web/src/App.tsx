@@ -25,12 +25,13 @@ const KnowledgePage = lazy(() => import("./pages/KnowledgePage"));
 const SchemaPage = lazy(() => import("./pages/SchemaPage"));
 const DatabasePage = lazy(() => import("./pages/DatabasePage"));
 const RelationsPage = lazy(() => import("./pages/RelationsPage"));
+const EvaluationPage = lazy(() => import("./pages/EvaluationPage"));
 
 const { Sider, Content } = Layout;
 const { Text } = Typography;
 
 type PageKey = "query" | "approvals" | "schema" | "databases" | "relations" | "history"
-  | "knowledge-overview" | "knowledge-terms" | "knowledge-synonyms" | "knowledge-rules" | "knowledge-cases";
+  | "evaluation" | "knowledge-overview" | "knowledge-terms" | "knowledge-synonyms" | "knowledge-rules" | "knowledge-cases";
 
 const MENU_PARENT_BY_PAGE: Partial<Record<PageKey, string>> = {
   databases: "data-management",
@@ -82,6 +83,7 @@ export default function App() {
       ],
     },
     { key: "history", icon: <HistoryOutlined />, label: "历史与审计" },
+    { key: "evaluation", icon: <ExperimentOutlined />, label: "召回评测" },
   ];
 
   return (
@@ -122,6 +124,7 @@ export default function App() {
               {page === "databases" && <DatabasePage />}
               {page === "relations" && <RelationsPage />}
               {page === "history" && <HistoryPage />}
+              {page === "evaluation" && <EvaluationPage />}
               {page === "knowledge-overview" && <KnowledgePage view="overview" />}
               {page === "knowledge-terms" && <KnowledgePage view="term" />}
               {page === "knowledge-synonyms" && <KnowledgePage view="synonym" />}

@@ -60,6 +60,29 @@ def test_extract_terms(deps):
     assert "逾期率" in terms2
 
 
+def test_claim_concept_resolves_to_audited_amount_field(deps):
+    terms = deps.term_mapping.extract_terms("查询代偿金额和代偿记录", ["risk_mart"])
+    assert terms == ["代偿"]
+    resolved = deps.term_mapping.resolve("代偿", ["risk_mart"])
+    assert resolved.status.value == "found"
+    assert resolved.entries[0].resolved_fields == ["DC_ALL_BAL"]
+    assert resolved.entries[0].preferred_tables == ["dwd_sr_claim_detail"]
+    assert resolved.entries[0].strict_preferred_tables is True
+
+
+def test_term_hits_prioritize_governed_fact_source(deps):
+    from nl2sql_agent.services.schema_catalog import TableDef
+
+    deps.catalog._tables_by_line["risk_mart"] = [  # noqa: SLF001
+        TableDef("summary", "汇总表", "risk_mart", [{"name": "loan_amt"}]),
+        TableDef("fact", "事实表", "risk_mart", [{"name": "loan_amt"}]),
+    ]
+    hits = deps.catalog.hits_for_term(
+        "贷款金额", ["LOAN_AMT"], ["risk_mart"], ["fact"]
+    )
+    assert [hit.table_name for hit in hits] == ["fact", "summary"]
+
+
 # ---------------- 模块 3:Schema 检索 ----------------
 
 def test_schema_retrieval_by_system(deps):
@@ -113,6 +136,120 @@ def test_relative_candidate_gap_and_dynamic_weights(deps):
     assert _candidate_is_close(deps, 0.25, 0.18) is False
     table_weight, column_weight, _, _ = _hybrid_config(deps, "学历为本科的客户")
     assert column_weight > table_weight
+
+
+def test_role_phrases_reuse_frozen_intent_without_reparsing():
+    from nl2sql_agent.nodes.m3_schema_retrieval import _role_phrases
+    from nl2sql_agent.state import IntentSlot, QueryIntent
+
+    intent = QueryIntent(
+        entities=[IntentSlot(text="客户", role="entity")],
+        measures=[IntentSlot(text="贷款金额", role="measure")],
+        attributes=[IntentSlot(text="姓名", role="attribute")],
+        filters=[IntentSlot(text="学历", role="status", value="本科")],
+    )
+
+    assert _role_phrases(intent) == [
+        ("客户", "table", "客户"),
+        ("贷款金额", "measure", "贷款金额"),
+        ("姓名", "attribute", "姓名"),
+        ("学历", "filter", "学历"),
+        ("学历", "value", "本科"),
+    ]
+
+
+def test_retrieval_phrases_add_configured_concepts_without_llm(deps):
+    from nl2sql_agent.nodes.m3_schema_retrieval import _retrieval_phrases
+
+    deps.config.clarification_rules.setdefault("retrieval_confidence", {})[
+        "query_expansions"
+    ] = {"放了多少款": ["放款金额", "贷款金额"]}
+    assert _retrieval_phrases(deps, "上个月放了多少款", None) == [
+        ("放了多少款", "concept", "放了多少款"),
+        ("放了多少款", "concept", "放款金额"),
+        ("放了多少款", "concept", "贷款金额"),
+    ]
+
+
+def test_catalog_lexical_evidence_uses_only_configured_concept_prefix(deps):
+    from nl2sql_agent.nodes.m3_schema_retrieval import _lexical_table_evidence
+    from nl2sql_agent.state import SchemaHit
+
+    deps.config.clarification_rules.setdefault("retrieval_confidence", {})[
+        "query_expansions"
+    ] = {"代偿": ["代偿金额", "代偿记录"]}
+    available = {
+        "claim": SchemaHit(
+            table_name="claim",
+            table_comment="代偿明细",
+            columns=[{"name": "TOTAL", "comment": "代偿总额"}],
+        ),
+        "repay": SchemaHit(
+            table_name="repay",
+            table_comment="还款明细",
+            columns=[{"name": "TOTAL", "comment": "还款金额"}],
+        ),
+    }
+    scores, evidence = _lexical_table_evidence(
+        deps, "查询代偿 代偿金额 代偿记录", None, available
+    )
+    assert scores["claim"] >= 0.9
+    assert "repay" not in scores
+    assert any(item["table_name"] == "claim" for item in evidence)
+
+
+def test_slot_vector_evidence_only_boosts_matching_slot():
+    from nl2sql_agent.services.schema_catalog import TableDef
+    from nl2sql_agent.services.schema_planner import rank_field_candidates
+    from nl2sql_agent.state import IntentSlot, QueryIntent
+
+    intent = QueryIntent(
+        measures=[IntentSlot(text="贷款金额", role="measure")],
+        attributes=[IntentSlot(text="客户姓名", role="attribute")],
+    )
+    tables = [
+        TableDef("loan", "贷款", "risk_mart", [
+            {"name": "LOAN_AMT", "type": "decimal", "comment": "金额"},
+            {"name": "NAME", "type": "varchar", "comment": "名称"},
+        ]),
+        TableDef("customer", "客户", "risk_mart", [
+            {"name": "TOTAL", "type": "decimal", "comment": "总额"},
+            {"name": "NAME", "type": "varchar", "comment": "姓名"},
+        ]),
+    ]
+    candidates = rank_field_candidates(
+        intent,
+        tables,
+        {"loan": 0.5, "customer": 0.5},
+        {("贷款金额", "loan"): 0.95, ("客户姓名", "customer"): 0.95},
+    )
+    by_slot = {}
+    for item in candidates:
+        by_slot.setdefault(item.query_slot, item)
+    assert by_slot["贷款金额"].table_name == "loan"
+    assert by_slot["客户姓名"].table_name == "customer"
+    assert any("角色化召回" in value for value in by_slot["客户姓名"].evidence)
+
+
+def test_field_vector_evidence_selects_the_matching_column_within_a_table():
+    from nl2sql_agent.services.schema_catalog import TableDef
+    from nl2sql_agent.services.schema_planner import rank_field_candidates
+    from nl2sql_agent.state import IntentSlot, QueryIntent
+
+    intent = QueryIntent(attributes=[IntentSlot(text="customer identifier", role="attribute")])
+    tables = [TableDef("customer", "客户", "risk_mart", [
+        {"name": "LEGACY_ID", "type": "varchar", "comment": "历史编号"},
+        {"name": "CUST_NO", "type": "varchar", "comment": "客户号"},
+    ])]
+    candidates = rank_field_candidates(
+        intent,
+        tables,
+        {"customer": 0.5},
+        {("customer identifier", "customer"): 0.8},
+        {("customer identifier", "customer", "CUST_NO"): 0.98},
+    )
+    assert candidates[0].column_name == "CUST_NO"
+    assert any("字段级角色化召回" in value for value in candidates[0].evidence)
 
 
 def test_join_path_adds_only_bridge_tables(deps, monkeypatch):

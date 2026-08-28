@@ -3,6 +3,8 @@
 逾期本金:
   business_line: global
   resolved_fields: [OVD_BAL]
+  preferred_tables: [dwd_ar_loan_info]
+  strict_preferred_tables: true
   definition: "逾期本金余额(OVD_BAL)"
   composite_metric: false
   aliases: [逾期金额, 逾期本金余额]
@@ -10,6 +12,8 @@
 逾期率:
   business_line: global
   resolved_fields: [OVD_BAL, LOAN_STATUS]
+  preferred_tables: [dwd_ar_loan_info]
+  strict_preferred_tables: true
   definition: "逾期借据数 / 总借据数(OVD_BAL>0 视为逾期)"
   composite_metric: true
   aliases: [逾期贷款率]
@@ -17,6 +21,8 @@
 贷款余额:
   business_line: global
   resolved_fields: [PRIN_BAL]
+  preferred_tables: [dwd_ar_loan_info]
+  strict_preferred_tables: true
   definition: "贷款本金余额(PRIN_BAL)"
   composite_metric: false
   aliases: [本金余额, 余额]
@@ -24,19 +30,34 @@
 贷款金额:
   business_line: global
   resolved_fields: [LOAN_AMT]
+  preferred_tables: [dwd_ar_loan_info]
+  strict_preferred_tables: true
   definition: "贷款金额(LOAN_AMT)"
   composite_metric: false
   aliases: [放款金额, 放款额]
 
+代偿:
+  business_line: global
+  resolved_fields: [DC_ALL_BAL]
+  preferred_tables: [dwd_sr_claim_detail]
+  strict_preferred_tables: true
+  definition: "代偿记录的代偿总额（DC_ALL_BAL）"
+  composite_metric: false
+  aliases: [代偿金额, 代偿总额, 代偿额, 代偿记录]
+
 正常本金:
   business_line: global
   resolved_fields: [NORMAL_BAL]
+  preferred_tables: [dwd_ar_loan_info]
+  strict_preferred_tables: true
   definition: "正常本金余额(NORMAL_BAL)"
   composite_metric: false
 
 借据笔数:
   business_line: global
   resolved_fields: [LOAN_NO]
+  preferred_tables: [dwd_ar_loan_info]
+  strict_preferred_tables: true
   definition: "借据笔数(COUNT LOAN_NO)"
   composite_metric: false
   aliases: [借据数, 贷款笔数]

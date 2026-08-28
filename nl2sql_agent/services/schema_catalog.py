@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from nl2sql_agent.services.config_loader import ConfigLoader
 from nl2sql_agent.state import SchemaHit
+from nl2sql_agent.services.text_encoding import clean_semantic_text
 
 
 @dataclass
@@ -25,6 +26,9 @@ class TableDef:
 
     def column_names(self) -> set[str]:
         return {c["name"] for c in self.columns}
+
+    def normalized_column_names(self) -> set[str]:
+        return {str(c["name"]).casefold() for c in self.columns}
 
 
 class SchemaCatalog:
@@ -110,7 +114,7 @@ class SchemaCatalog:
                 column = {
                     "name": column_name,
                     "type": field_data.get("type", ""),
-                    "comment": field_data.get("comment", ""),
+                    "comment": clean_semantic_text(field_data.get("comment", "")),
                     "raw_type": field_data.get("raw_type") or field_data.get("type", ""),
                     "nullable": bool(field_data.get("nullable", True)),
                     "primary_key": bool(field_data.get("primary_key", False)),
@@ -130,7 +134,7 @@ class SchemaCatalog:
                 columns.append(column)
             tables.append({
                 "name": table_name,
-                "comment": table.get("comment", ""),
+                "comment": clean_semantic_text(table.get("comment", "")),
                 "business_line": namespace,
                 "shared": bool(table.get("shared", False)),
                 "columns": columns,
@@ -182,23 +186,39 @@ class SchemaCatalog:
         out.extend(self._shared_tables)
         return out
 
-    def hits_for_term(self, term: str, resolved_fields: list[str], data_scope: list[str]) -> list[SchemaHit]:
+    def hits_for_term(
+        self,
+        term: str,
+        resolved_fields: list[str],
+        data_scope: list[str],
+        preferred_tables: list[str] | None = None,
+    ) -> list[SchemaHit]:
         """术语解析出的字段 → 在 data_scope 内找到包含这些字段的表。
 
         返回整张表的列定义(生成 SQL 时需要用全表字段),并记录命中的术语。
         """
-        want = set(resolved_fields)
+        want = {str(field).casefold() for field in resolved_fields}
         hits: list[SchemaHit] = []
         for tbl in self.tables_for_scope(data_scope):
-            if want and want <= tbl.column_names():
+            if want and want <= tbl.normalized_column_names():
                 hits.append(
                     SchemaHit(
                         table_name=tbl.name,
+                        table_comment=tbl.comment,
                         columns=[dict(c) for c in tbl.columns],
                         business_terms=[term],
                     )
                 )
-        return hits
+        preferred_order = {
+            table_name: index for index, table_name in enumerate(preferred_tables or [])
+        }
+        return sorted(
+            hits,
+            key=lambda hit: (
+                0 if hit.table_name in preferred_order else 1,
+                preferred_order.get(hit.table_name, len(preferred_order)),
+            ),
+        )
 
     def hits_covering_term_fields(
         self, term: str, resolved_fields: list[str], data_scope: list[str]
@@ -208,23 +228,24 @@ class SchemaCatalog:
         仅在不存在单表完整命中时使用；如果可见表的字段并集仍不完整，则返回空，
         防止把部分口径误报成确定命中。
         """
-        uncovered = set(resolved_fields)
+        uncovered = {str(field).casefold() for field in resolved_fields}
         selected: list[TableDef] = []
         candidates = list(self.tables_for_scope(data_scope))
         while uncovered:
             best = max(
                 candidates,
-                key=lambda table: len(uncovered & table.column_names()),
+                key=lambda table: len(uncovered & table.normalized_column_names()),
                 default=None,
             )
-            if best is None or not (uncovered & best.column_names()):
+            if best is None or not (uncovered & best.normalized_column_names()):
                 return []
             selected.append(best)
-            uncovered -= best.column_names()
+            uncovered -= best.normalized_column_names()
             candidates.remove(best)
         return [
             SchemaHit(
                 table_name=table.name,
+                table_comment=table.comment,
                 columns=[dict(column) for column in table.columns],
                 business_terms=[term],
             )
@@ -232,8 +253,9 @@ class SchemaCatalog:
         ]
 
     def find_table_with_column(self, column: str, data_scope: list[str]) -> str | None:
+        wanted = str(column).casefold()
         for tbl in self.tables_for_scope(data_scope):
-            if column in tbl.column_names():
+            if wanted in tbl.normalized_column_names():
                 return tbl.name
         return None
 

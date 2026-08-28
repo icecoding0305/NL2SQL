@@ -37,6 +37,7 @@ class FakeLLM:
     plan_rules: list[tuple[str, dict]] = field(default_factory=list)
     sql_calls: int = 0
     plan_calls: int = 0
+    last_plan_prompt: str = ""
     summarize_template: str = "查询「{query}」共返回 {n} 行结果。"
 
     def add_sql(self, pattern: str, responder):
@@ -48,12 +49,14 @@ class FakeLLM:
     def complete_sql(self, prompt: str, retries: int = 2) -> SQLResult:
         self.sql_calls += 1
         for pattern, responder in self.sql_rules:
-            if re.search(pattern, prompt):
+            if re.search(pattern, prompt) or re.search(pattern, self.last_plan_prompt):
                 return responder(self) if callable(responder) else responder
         raise ValueError("FakeLLM: 没有匹配的 SQL 规则")
 
     def complete_structured(self, prompt: str, model: type[BaseModel], retries: int = 2) -> BaseModel:
         self.plan_calls += 1
+        if model.__name__ == "QueryPlan":
+            self.last_plan_prompt = prompt
         for pattern, plan in self.plan_rules:
             if re.search(pattern, prompt):
                 data = dict(plan)
@@ -78,9 +81,20 @@ class FakeLLM:
             )
             tables = [query_schema_table.group(1)] if query_schema_table else []
             if not tables:
-                tables = re.findall(r'"table"\s*:\s*"([A-Za-z0-9_]+)"', prompt)
-            if not tables:
                 tables = re.findall(r'"table_name"\s*:\s*"([A-Za-z0-9_]+)"', prompt)
+            if not tables:
+                tables = [
+                    value
+                    for value in re.findall(r'"table"\s*:\s*"([A-Za-z0-9_]+)"', prompt)
+                    if value.casefold() not in {"table", "unknown"}
+                ]
+            if not tables:
+                # Prompt formats may represent Query M-Schema as text instead
+                # of JSON objects. Test schemas use warehouse-style physical
+                # identifiers; prefer those over contract placeholders.
+                tables = list(dict.fromkeys(re.findall(
+                    r"\b(?:dwd|dws|app)_[A-Za-z0-9_]+\b", prompt, re.IGNORECASE
+                )))
             atom_ids = list(dict.fromkeys(
                 atom for atom in re.findall(r'"atom_id"\s*:\s*"([^"]+)"', prompt)
                 if atom != "boolean_root"

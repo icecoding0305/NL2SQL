@@ -30,16 +30,6 @@ clarification_rules:
       max_total_columns: 64
       max_optional_columns: 0
 
-  # ---------- 模块 5:高置信简单查询确定性计划 ----------
-deterministic_plan:
-  enabled: true
-  min_confidence: 0.78
-
-# 仅模型 SQL 路径首轮生成多个候选；简单确定性 SQL 不增加任何模型调用
-sql_candidate_refinement:
-  enabled: true
-  candidate_count: 2
-
   # ---------- 模块 2:缺时间范围 ----------
   time_range_missing:
     enabled: true
@@ -78,6 +68,8 @@ sql_candidate_refinement:
     # 表级/字段级向量的融合权重；只有单路有结果时沿用该路原始分数
     table_vector_weight: 0.65
     column_vector_weight: 0.35
+    # effective M-Schema 表/列说明的精确业务短语是可审计证据，为其提供候选分下限。
+    catalog_lexical_floor: 0.7
     # 关系向量只补充与主候选直接相连的表，避免无约束扩散
     relation_expand_top_n: 2
     relation_threshold: 0.1
@@ -86,11 +78,35 @@ sql_candidate_refinement:
     field_query_markers: [为, 等于, 超过, 不超过, 至少, 至多, 大于, 小于, 高于, 低于, 包含, 按, 分组, 明细, 字段, 哪些客户]
     field_query_table_weight: 0.4
     field_query_column_weight: 0.6
+    # 复用模块 2 已冻结的 QueryIntent，按主体/指标/属性/维度/过滤和值分路召回。
+    # legacy 开关仅用于 A/B 和紧急回退，不引入额外 LLM 调用。
+    multipath:
+      enabled: true
+      phrase_top_k: 10
+      max_phrases: 12
+      role_weights:
+        table: 1.05
+        measure: 1.0
+        attribute: 1.0
+        dimension: 0.98
+        filter: 0.95
+        value: 0.88
+        concept: 1.05
     # 显式领域查询扩展；集中配置，避免散落在术语 alias 中
     query_expansions:
       借了多少: [贷款金额, 放款金额]
       放了多少款: [放款金额, 贷款金额]
       坏账: [不良贷款, 逾期, 核销]
       不良: [不良贷款, 逾期]
-      代偿: [代偿金额, 代偿记录]
+      代偿: [代偿金额, 代偿总额, 代偿记录]
       销账: [核销, 坏账]
+
+  # ---------- 模块 5:高置信简单查询确定性计划 ----------
+  deterministic_plan:
+    enabled: true
+    min_confidence: 0.78
+
+  # 仅模型 SQL 路径首轮生成多个候选；简单确定性 SQL 不增加模型调用。
+  sql_candidate_refinement:
+    enabled: true
+    candidate_count: 2

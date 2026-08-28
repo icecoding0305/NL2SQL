@@ -1,4 +1,9 @@
-from nl2sql_agent.services.text_encoding import normalize_query_payload, repair_mojibake
+from nl2sql_agent.services.text_encoding import (
+    clean_semantic_text,
+    is_likely_mojibake,
+    normalize_query_payload,
+    repair_mojibake,
+)
 
 
 QUERY = "查询贷款金额超过 1000 元且逾期本金余额大于 0"
@@ -24,3 +29,10 @@ def test_normalizes_conversation_history_recursively():
     broken = QUERY.encode("gbk").decode("latin-1")
     payload = [{"role": "user", "content": broken}]
     assert normalize_query_payload(payload) == [{"role": "user", "content": QUERY}]
+
+
+def test_irreversible_mojibake_is_dropped_from_semantic_metadata():
+    broken = "\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd"
+    assert is_likely_mojibake(broken) is True
+    assert clean_semantic_text(broken) == ""
+    assert clean_semantic_text("贷款金额") == "贷款金额"

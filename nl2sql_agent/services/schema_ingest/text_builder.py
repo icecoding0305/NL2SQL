@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from nl2sql_agent.services.vector_store.base import VectorStoreAdapter
+from nl2sql_agent.services.text_encoding import clean_semantic_text
 
 COLLECTION_TABLE = "schema_table"
 COLLECTION_COLUMN = "schema_column"
@@ -86,7 +87,7 @@ def build_table_level_text(
         for relation in relations
     ) or "无显式外键"
     return (
-        f"表名:{table_name}\n说明:{table.get('comment') or ''}\n"
+        f"表名:{table_name}\n说明:{clean_semantic_text(table.get('comment') or '')}\n"
         f"数据量估计:{table.get('row_count_estimate')}\n"
         f"主键:{','.join(table.get('primary_keys', [])) or '无'}\n"
         f"外键关系:{relation_text}\n核心字段:{field_text}\n"
@@ -94,17 +95,25 @@ def build_table_level_text(
     )
 
 
-def build_column_level_text(table_name: str, fields: list[tuple[str, dict]]) -> str:
+def build_column_level_text(
+    table_name: str,
+    fields: list[tuple[str, dict]],
+    table_comment: str = "",
+) -> str:
     lines = [
         f"{name}({field.get('raw_type') or field.get('type') or ''}) "
         f"角色:{field.get('dim_or_meas') or 'unknown'} "
         f"类别:{field.get('category') or 'unknown'} "
         f"PK:{bool(field.get('primary_key'))} UNIQUE:{bool(field.get('unique'))} "
         f"NULLABLE:{bool(field.get('nullable', True))} "
-        f"说明:{field.get('comment') or ''} 样例:{_vector_examples(field)}"
+        f"说明:{clean_semantic_text(field.get('comment') or '')} 样例:{_vector_examples(field)}"
         for name, field in fields
     ]
-    return f"表:{table_name}\n" + "\n".join(lines)
+    # XiYan-style column-first retrieval still needs table semantics on every
+    # column document. This helps distinguish identical amount/date fields in
+    # loan, repayment and claim domains without binding concepts to table names.
+    context = clean_semantic_text(table_comment)
+    return f"表:{table_name}\n表说明:{context}\n" + "\n".join(lines)
 
 
 def write_mschema_table_embeddings(
@@ -112,7 +121,7 @@ def write_mschema_table_embeddings(
     effective_mschema: dict,
     table_name: str,
     manifest: dict,
-    columns_per_chunk: int = 15,
+    columns_per_chunk: int = 1,
 ) -> None:
     """仅以 effective M-Schema 为输入，重建一张表的全部向量文档。"""
     table = effective_mschema.get("tables", {}).get(table_name)
@@ -159,7 +168,7 @@ def write_mschema_table_embeddings(
             store.upsert(
                 COLLECTION_COLUMN,
                 f"{table_name}#col#{chunk_no}",
-                build_column_level_text(table_name, chunk),
+                build_column_level_text(table_name, chunk, table.get("comment") or ""),
                 metadata,
             )
             chunk_no += 1
@@ -179,7 +188,7 @@ def write_mschema_table_embeddings(
 
 
 def remove_table_from_store(
-    store: VectorStoreAdapter, table_name: str, columns_per_chunk: int = 15
+    store: VectorStoreAdapter, table_name: str, columns_per_chunk: int = 1
 ) -> None:
     """删除一张表的表级、字段级和关系级向量条目。"""
     if hasattr(store, "remove_table"):

@@ -38,6 +38,7 @@ from nl2sql_agent.services.knowledge_store import KnowledgeStore
 from nl2sql_agent.services.query_store import QueryStore
 from nl2sql_agent.services.query_cancellation import QueryExecutionCancelled
 from nl2sql_agent.services.relation_store import DatabaseRelationStore
+from nl2sql_agent.services.schema_evaluation import SchemaEvaluationService
 from nl2sql_agent.services.query_terminal import finalize_query_state
 from nl2sql_agent.services.text_encoding import normalize_query_payload, repair_mojibake
 from nl2sql_agent.security import verify_platform_token
@@ -58,6 +59,7 @@ _knowledge_seed_lock = threading.Lock()
 _deps_lock = threading.Lock()
 _active_query_cancellations: dict[str, threading.Event] = {}
 _active_query_cancellations_lock = threading.Lock()
+_schema_evaluation = SchemaEvaluationService()
 
 
 # 全局共享 checkpointer:查询与审批(resume)必须用同一实例,否则无法恢复线程状态
@@ -188,6 +190,7 @@ def _state_to_dict(state: dict) -> dict:
         # 检索置信度相关(模块 3.5 澄清展示用)
         "retrieval_confidence": state.get("retrieval_confidence"),
         "retrieval_candidates": [h.model_dump() for h in cands],
+        "retrieval_evidence": state.get("retrieval_evidence") or [],
         "query_intent": state["query_intent"].model_dump() if state.get("query_intent") else None,
         "resolved_query": state["resolved_query"].model_dump() if state.get("resolved_query") else None,
         "semantic_graph": state["semantic_graph"].model_dump() if state.get("semantic_graph") else None,
@@ -250,6 +253,7 @@ def _persist(
         next_node=next_node,
         retrieval_confidence=d["retrieval_confidence"],
         retrieval_candidates=d["retrieval_candidates"],
+        retrieval_evidence=d["retrieval_evidence"],
         query_intent=d["query_intent"],
         resolved_query=d["resolved_query"],
         semantic_graph=d["semantic_graph"],
@@ -609,6 +613,23 @@ async def api_model_diagnostics():
         "routes": get_deps().model_routes(),
         "note": "Whether a configured model was actually called is recorded in each query's llm_calls.",
     }
+
+
+@router.get("/schema-evaluation")
+async def api_schema_evaluation_status():
+    """Return the latest in-process report without triggering expensive work."""
+    return _schema_evaluation.status()
+
+
+@router.post("/schema-evaluation/run")
+async def api_run_schema_evaluation():
+    """Run the read-only production Schema path against the governed golden set."""
+    if _schema_evaluation.running:
+        raise HTTPException(409, "Schema 评测正在运行，请稍后查看结果")
+    try:
+        return await asyncio.to_thread(_schema_evaluation.run)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.get("/history")

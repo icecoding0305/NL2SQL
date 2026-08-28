@@ -52,6 +52,8 @@ embedding:
   dimension: 384
   # 同一查询会检索表/字段/关系三个集合，复用其单条查询向量。
   query_cache_size: 256
+  # 语义文本清洗规则变化时自动失效旧 vector-cache，避免继续使用乱码向量。
+  text_normalization_version: 4
   # 该模型为默认基线。更换中文金融领域模型前，应使用真实标注集对比
   # Recall@K、字段召回率、Join 路径正确率和澄清率，并同步修改 dimension。
 
