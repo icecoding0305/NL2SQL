@@ -120,16 +120,23 @@ def _validate_labels(cases: list[dict[str, Any]], catalog) -> None:
         raise RuntimeError("Invalid golden labels:\n- " + "\n- ".join(errors))
 
 
-def evaluate_case(node, case: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def evaluate_case(
+    node,
+    case: dict[str, Any],
+    initial_state: NL2SQLState | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     query = str(case["question"])
-    frozen = case.get("query_intent")
-    intent = QueryIntent.model_validate(frozen) if frozen else parse_query_intent(query)
-    state = NL2SQLState(
-        user_query=query,
-        user_id="schema-golden-eval",
-        data_scope=list(case.get("data_scope") or ["risk_mart"]),
-        query_intent=intent,
-    )
+    if initial_state is None:
+        frozen = case.get("query_intent")
+        intent = QueryIntent.model_validate(frozen) if frozen else parse_query_intent(query)
+        state = NL2SQLState(
+            user_query=query,
+            user_id="schema-golden-eval",
+            data_scope=list(case.get("data_scope") or ["risk_mart"]),
+            query_intent=intent,
+        )
+    else:
+        state = initial_state
     output = node(state)
     output = output.model_dump(mode="json") if isinstance(output, NL2SQLState) else output
     predicted_tables = [item.table_name for item in output.get("retrieved_schema") or []]
@@ -177,9 +184,11 @@ def run_golden_evaluation(
     cases_path: str | Path = DEFAULT_CASES,
     *,
     m_schema_path: str | Path | None = None,
+    payload_override: dict[str, Any] | None = None,
+    deps_override=None,
 ) -> dict[str, Any]:
     cases_path = Path(cases_path).resolve()
-    payload = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+    payload = payload_override or yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
     cases = payload.get("cases") or []
     if not cases:
         raise RuntimeError(f"Golden set is empty: {cases_path}")
@@ -188,9 +197,8 @@ def run_golden_evaluation(
     dataset_mschema = None
     if configured_mschema:
         dataset_mschema = (cases_path.parent / str(configured_mschema)).resolve()
-    deps = build_deps(
-        m_schema_path=m_schema_path or dataset_mschema,
-        executor=InMemoryExecutor(),
+    deps = deps_override or build_deps(
+        m_schema_path=m_schema_path or dataset_mschema, executor=InMemoryExecutor()
     )
     _validate_labels(cases, deps.catalog)
     node = make_schema_retrieval_node(deps)
@@ -234,10 +242,121 @@ def run_golden_evaluation(
 
     metrics = evaluate_schema_cases(evaluated)
     return {
+        "mode": "baseline",
         "dataset_version": payload.get("version", 1),
         "description": payload.get("description", ""),
         "coverage": payload.get("coverage") or {},
         "metrics": metrics,
+        "metrics_by_suite": _metrics_by_suite(evaluated),
+        "cases": details,
+    }
+
+
+def _intent_score(expected: QueryIntent, predicted: QueryIntent) -> tuple[bool, float]:
+    roles = ("entities", "measures", "attributes", "filters", "dimensions")
+    recalls: list[float] = []
+    for role in roles:
+        expected_values = {_norm(item.text) for item in getattr(expected, role)}
+        if not expected_values:
+            continue
+        predicted_values = {_norm(item.text) for item in getattr(predicted, role)}
+        recalls.append(len(expected_values & predicted_values) / len(expected_values))
+    return expected.query_type == predicted.query_type, (
+        sum(recalls) / len(recalls) if recalls else 1.0
+    )
+
+
+def run_online_shadow_evaluation(
+    deps,
+    cases_path: str | Path = DEFAULT_CASES,
+    *,
+    payload_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run production query understanding and retrieval, stopping before SQL."""
+    from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
+
+    cases_path = Path(cases_path).resolve()
+    payload = payload_override or yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+    cases = payload.get("cases") or []
+    _validate_labels(cases, deps.catalog)
+    resolution_node = make_query_resolution_node(deps)
+    retrieval_node = make_schema_retrieval_node(deps)
+    evaluated: list[dict[str, Any]] = []
+    details: list[dict[str, Any]] = []
+    query_type_scores: list[bool] = []
+    slot_recalls: list[float] = []
+    for case in cases:
+        state = NL2SQLState(
+            user_query=str(case["question"]),
+            user_id="schema-online-shadow-eval",
+            data_scope=list(case.get("data_scope") or ["risk_mart"]),
+        )
+        resolution = resolution_node(state)
+        resolution_data = (
+            resolution.model_dump() if isinstance(resolution, NL2SQLState) else resolution
+        )
+        state = state.model_copy(update=resolution_data)
+        expected_intent = QueryIntent.model_validate(case.get("query_intent") or {})
+        predicted_intent = state.query_intent or parse_query_intent(state.user_query)
+        type_match, slot_recall = _intent_score(expected_intent, predicted_intent)
+        query_type_scores.append(type_match)
+        slot_recalls.append(slot_recall)
+        node = retrieval_node
+        if state.need_clarification:
+            node = lambda _state: {"field_ambiguities": {"query_resolution": []}}
+        metric_row, detail = evaluate_case(node, case, state)
+        detail.update({
+            "suite": case.get("suite"),
+            "tags": case.get("tags") or [],
+            "intent_query_type_match": type_match,
+            "intent_slot_recall": round(slot_recall, 6),
+            "predicted_query_intent": predicted_intent.model_dump(mode="json"),
+            "resolution_clarification": state.need_clarification,
+            "expected_tables": case.get("expected_tables") or [],
+            "expected_columns": case.get("expected_columns") or [],
+            "expected_joins": case.get("expected_joins") or [],
+            "expected_clarification": case.get("expected_clarification"),
+        })
+        table_ok = {_norm(x) for x in case.get("expected_tables") or []} <= {
+            _norm(x) for x in detail["predicted_tables"]
+        }
+        column_ok = {_norm(x) for x in case.get("expected_columns") or []} <= {
+            _norm(x) for x in detail["predicted_columns"]
+        }
+        expected_joins = {
+            tuple(sorted((_norm(left), _norm(right))))
+            for left, right in case.get("expected_joins") or []
+        }
+        predicted_joins = {
+            tuple(sorted((_norm(left), _norm(right))))
+            for left, right in detail["predicted_joins"]
+        }
+        join_ok = expected_joins <= predicted_joins
+        clarification_ok = (
+            "expected_clarification" not in case
+            or bool(case["expected_clarification"]) == detail["clarified"]
+        )
+        detail["passed"] = bool(
+            type_match
+            and slot_recall == 1.0
+            and table_ok
+            and column_ok
+            and join_ok
+            and clarification_ok
+        )
+        metric_row["clarified"] = detail["clarified"]
+        evaluated.append(metric_row)
+        details.append(detail)
+    return {
+        "mode": "online_shadow",
+        "dataset_version": payload.get("version", 1),
+        "description": payload.get("description", ""),
+        "coverage": payload.get("coverage") or {},
+        "intent_metrics": {
+            "query_type_accuracy": round(sum(query_type_scores) / len(query_type_scores), 6),
+            "slot_recall": round(sum(slot_recalls) / len(slot_recalls), 6),
+        },
+        "metrics": evaluate_schema_cases(evaluated),
         "metrics_by_suite": _metrics_by_suite(evaluated),
         "cases": details,
     }

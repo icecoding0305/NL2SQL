@@ -17,7 +17,7 @@ _SPLIT_RE = re.compile(r"、|，|,|以及|及|和")
 _GROUP_RE = re.compile(r"(?:统计|查询|计算)?每个([\u4e00-\u9fffA-Za-z_]{1,12}?)(?:的|累计|贷款|代偿|还款)")
 _GROUP_BY_RE = re.compile(r"按([\u4e00-\u9fffA-Za-z_]{1,12}?)(?:维度)?(?:统计|汇总|分组|计算)")
 _LIMIT_RE = re.compile(
-    r"(?:前|top\s*)(?P<prefix_limit>\d+)"
+    r"(?:前\s*|top\s*)(?P<prefix_limit>\d+)"
     r"|(?:限制)?(?:返回|取|保留)\s*(?P<return_limit>\d+)\s*(?:条|个|行|笔|名)?",
     re.IGNORECASE,
 )

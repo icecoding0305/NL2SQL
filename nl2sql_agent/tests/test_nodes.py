@@ -744,6 +744,71 @@ def test_broad_topic_defers_model_metric_scope_question_to_schema(deps):
     assert any(item.broad for item in out["semantic_graph"].outputs)
 
 
+def test_explicit_cumulative_metric_does_not_block_on_redundant_formula_question(deps):
+    from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
+    from nl2sql_agent.services.semantic_parser import build_semantic_graph
+    from nl2sql_agent.state import QueryAssumption, ResolvedQuery, SemanticOutput
+
+    query = "按累计贷款金额从高到低返回前 10 个客户"
+
+    class RedundantFormulaQuestionLLM:
+        def complete_structured(self, prompt, model, retries=0):
+            graph = build_semantic_graph(query).model_copy(update={
+                "outputs": [SemanticOutput(
+                    id="output_1", subject_id="subject_1", concept="累计贷款金额",
+                    grounding_concept="贷款金额", source_text="累计贷款金额",
+                    required=True, confidence=0.95, aggregation="sum",
+                )],
+                "unresolved_slots": ["贷款金额的计算口径"],
+            })
+            return ResolvedQuery(
+                original_query=query,
+                rewritten_query=query,
+                query_type="aggregation",
+                assumptions=[QueryAssumption(
+                    content="累计贷款金额按每个客户的贷款金额之和计算",
+                    source="system_inference",
+                    materiality="medium",
+                )],
+                unresolved_business_slots=["贷款金额的计算口径"],
+                semantic_graph=graph,
+                confidence=0.9,
+            )
+
+    deps.config.clarification_rules.setdefault("query_resolution", {})["use_llm"] = True
+    deps.node_llms["query_resolution"] = RedundantFormulaQuestionLLM()
+    out = make_query_resolution_node(deps)(NL2SQLState(**make_input(query)))
+
+    assert out["need_clarification"] is False
+    assert out["resolved_query"].unresolved_business_slots == []
+    amount = next(item for item in out["semantic_graph"].outputs if "贷款金额" in item.concept)
+    assert amount.aggregation == "sum"
+
+
+def test_material_metric_alternatives_still_require_clarification(deps):
+    from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
+    from nl2sql_agent.services.semantic_parser import build_semantic_graph
+    from nl2sql_agent.state import ResolvedQuery
+
+    query = "按累计贷款金额从高到低返回前 10 个客户"
+
+    class MaterialAlternativeLLM:
+        def complete_structured(self, prompt, model, retries=0):
+            slot = "贷款金额口径是放款金额还是贷款余额"
+            graph = build_semantic_graph(query).model_copy(update={"unresolved_slots": [slot]})
+            return ResolvedQuery(
+                original_query=query, rewritten_query=query, query_type="aggregation",
+                unresolved_business_slots=[slot], semantic_graph=graph, confidence=0.9,
+            )
+
+    deps.config.clarification_rules.setdefault("query_resolution", {})["use_llm"] = True
+    deps.node_llms["query_resolution"] = MaterialAlternativeLLM()
+    out = make_query_resolution_node(deps)(NL2SQLState(**make_input(query)))
+
+    assert out["need_clarification"] is True
+    assert "贷款余额" in out["clarification_questions"][0]
+
+
 def test_high_confidence_broad_topic_uses_schema_stage_without_resolution_llm(deps):
     from nl2sql_agent.nodes.m2_query_resolution import make_query_resolution_node
 

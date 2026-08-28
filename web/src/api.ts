@@ -35,6 +35,36 @@ export const apiPut = <T>(path: string, body?: unknown) =>
   request<T>(path, { method: "PUT", body: JSON.stringify(body ?? {}) });
 export const apiDelete = <T>(path: string) => request<T>(path, { method: "DELETE" });
 
+export async function apiUpload<T>(path: string, file: File): Promise<T> {
+  const token = getAccessToken();
+  const resp = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "X-Filename": encodeURIComponent(file.name),
+      ...(token ? { "X-Platform-Token": token } : {}),
+    },
+    body: file,
+  });
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail || `HTTP ${resp.status}`);
+  }
+  return resp.json() as Promise<T>;
+}
+
+export async function apiDownload(path: string, filename: string) {
+  const token = getAccessToken();
+  const resp = await fetch(path, { headers: token ? { "X-Platform-Token": token } : {} });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const url = URL.createObjectURL(await resp.blob());
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 const adminRequest = <T>(path: string, method: "POST" | "PUT" | "DELETE", body?: unknown) =>
   request<T>(path, {
     method,

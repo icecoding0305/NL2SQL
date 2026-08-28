@@ -19,8 +19,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import unquote
 
-from fastapi import APIRouter, Body, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -134,6 +135,12 @@ class EventStream:
 
     async def get(self):
         return await self._queue.get()
+
+
+class SchemaEvaluationRequest(BaseModel):
+    mode: Literal["baseline", "online_shadow"] = "baseline"
+    database_id: str | None = None
+    case_id: str | None = None
 
 
 def _state_to_dict(state: dict) -> dict:
@@ -616,20 +623,56 @@ async def api_model_diagnostics():
 
 
 @router.get("/schema-evaluation")
-async def api_schema_evaluation_status():
+async def api_schema_evaluation_status(
+    mode: Literal["baseline", "online_shadow"] = "baseline",
+    database_id: str | None = None,
+):
     """Return the latest in-process report without triggering expensive work."""
-    return _schema_evaluation.status()
+    return _schema_evaluation.status(mode, database_id)
 
 
 @router.post("/schema-evaluation/run")
-async def api_run_schema_evaluation():
+async def api_run_schema_evaluation(body: SchemaEvaluationRequest):
     """Run the read-only production Schema path against the governed golden set."""
     if _schema_evaluation.running:
         raise HTTPException(409, "Schema 评测正在运行，请稍后查看结果")
     try:
-        return await asyncio.to_thread(_schema_evaluation.run)
+        if not body.database_id:
+            raise ValueError("请选择用于评测的数据库 Schema")
+        deps = get_deps(body.database_id)
+        return await asyncio.to_thread(
+            _schema_evaluation.run, body.mode, deps, body.database_id, body.case_id
+        )
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/schema-evaluation/dataset")
+async def api_upload_schema_evaluation_dataset(
+    request: Request,
+    x_filename: str | None = Header(default=None, alias="X-Filename"),
+):
+    """Import and persist an XLSX evaluation set without multipart dependencies."""
+    try:
+        return await asyncio.to_thread(
+            _schema_evaluation.import_xlsx,
+            await request.body(),
+            unquote(x_filename or "schema-evaluation.xlsx"),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/schema-evaluation/template")
+async def api_schema_evaluation_template():
+    content = await asyncio.to_thread(_schema_evaluation.template_xlsx)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="schema-evaluation-template.xlsx"'},
+    )
 
 
 @router.get("/history")

@@ -89,6 +89,19 @@ def test_implicit_grouped_top_n_restores_ranking_measure_and_grain():
     assert outputs["贷款总金额"].aggregation == "sum"
 
 
+def test_cumulative_top_n_with_space_after_prefix_is_complete():
+    query = "按累计贷款金额从高到低返回前 10 个客户"
+    graph = build_semantic_graph(query)
+
+    outputs = {item.concept: item for item in graph.outputs}
+    assert graph.limit == 10
+    assert graph.group_by == ["客户"]
+    assert graph.order_by[0].direction == "desc"
+    assert outputs["累计贷款金额"].aggregation == "sum"
+    assert outputs["累计贷款金额"].grounding_concept == "贷款金额"
+    assert "客户" in outputs
+
+
 def test_limit_return_wording_is_normalized_to_top_n():
     query = "统计每个产品的贷款总金额，按贷款总金额降序排列，限制返回3条"
     graph = build_semantic_graph(query)

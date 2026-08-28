@@ -209,6 +209,30 @@ def _should_use_llm_resolution(state: NL2SQLState, resolved: ResolvedQuery, conf
     return any(str(marker).lower() in query for marker in markers)
 
 
+def _aggregation_resolves_slot(slot: str, graph) -> bool:
+    """Do not block an explicit aggregate merely because the model restates its formula as unresolved."""
+    text = re.sub(r"\s+", "", str(slot or ""))
+    if not text or not any(marker in text for marker in ("口径", "计算方式", "统计方式")):
+        return False
+    # Alternatives change the business answer and must still be clarified.
+    if any(marker in text for marker in ("还是", "或者", "是否包含", "是否包括", "余额", "授信")):
+        return False
+    outputs = [output for output in (graph.outputs if graph else []) if output.aggregation]
+    if not outputs:
+        return False
+    normalized_slot = re.sub(r"累计|合计|总计|总额|的|统计|计算|方式|口径", "", text)
+    for output in outputs:
+        concept = output.grounding_concept or output.concept or output.source_text
+        normalized_concept = re.sub(
+            r"累计|合计|总计|总额|的|统计|计算|方式|口径", "", str(concept or "")
+        )
+        if normalized_concept and (
+            normalized_concept in normalized_slot or normalized_slot in normalized_concept
+        ):
+            return True
+    return False
+
+
 def make_query_resolution_node(deps):
     def query_resolution_node(state: NL2SQLState) -> NL2SQLState | dict:
         query = state.user_query.strip()
@@ -312,6 +336,21 @@ def make_query_resolution_node(deps):
         preview_graph = enrich_semantic_graph(query, preview_graph)
         preview_graph, _ = ensure_semantic_coverage(query, preview_graph)
         resolved = resolved.model_copy(update={"semantic_graph": preview_graph})
+        unresolved = [
+            slot for slot in unresolved
+            if not _aggregation_resolves_slot(slot, preview_graph)
+        ]
+        if preview_graph is not None:
+            preview_graph = preview_graph.model_copy(update={
+                "unresolved_slots": [
+                    slot for slot in preview_graph.unresolved_slots
+                    if not _aggregation_resolves_slot(slot, preview_graph)
+                ],
+            })
+        resolved = resolved.model_copy(update={
+            "semantic_graph": preview_graph,
+            "unresolved_business_slots": unresolved,
+        })
         broad_topics = [
             output.grounding_concept or output.source_text or output.concept
             for output in (preview_graph.outputs if preview_graph else [])

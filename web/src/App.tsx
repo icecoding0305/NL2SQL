@@ -9,6 +9,7 @@ import {
   DatabaseOutlined,
   ExperimentOutlined,
   HistoryOutlined,
+  SettingOutlined,
   MessageOutlined,
   SafetyCertificateOutlined,
   SwapOutlined,
@@ -42,6 +43,8 @@ const MENU_PARENT_BY_PAGE: Partial<Record<PageKey, string>> = {
   "knowledge-synonyms": "knowledge-management",
   "knowledge-rules": "knowledge-management",
   "knowledge-cases": "knowledge-management",
+  history: "system-management",
+  evaluation: "system-management",
 };
 
 export default function App() {
@@ -82,8 +85,15 @@ export default function App() {
         { key: "knowledge-cases", icon: <ExperimentOutlined />, label: "优化案例" },
       ],
     },
-    { key: "history", icon: <HistoryOutlined />, label: "历史与审计" },
-    { key: "evaluation", icon: <ExperimentOutlined />, label: "召回评测" },
+    {
+      key: "system-management",
+      icon: <SettingOutlined />,
+      label: "系统管理",
+      children: [
+        { key: "history", icon: <HistoryOutlined />, label: "历史与审计" },
+        { key: "evaluation", icon: <ExperimentOutlined />, label: "召回评测" },
+      ],
+    },
   ];
 
   return (

@@ -641,6 +641,16 @@ button, input, textarea { font: inherit; }
   margin-bottom: 16px;
 }
 .evaluation-case-detail { padding: 8px 20px 14px; }
+.evaluation-control-card .ant-card-body { display: flex; flex-direction: column; gap: 14px; }
+.evaluation-dataset-line { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.evaluation-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.evaluation-schema-select { min-width: 220px; }
+.evaluation-case-select { min-width: min(420px, 100%); flex: 1; }
+
+@media (max-width: 768px) {
+  .evaluation-controls > .ant-select,
+  .evaluation-controls > .ant-btn { width: 100%; }
+}
 
 /* ---------------------------------------------------------------
  * 语义色统一:把 antd Tag 的默认蓝/绿/红/橙映射到主题色

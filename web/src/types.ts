@@ -209,6 +209,10 @@ export interface SchemaEvaluationCase {
 }
 
 export interface SchemaEvaluationReport {
+  mode: "baseline" | "online_shadow";
+  database_id?: string;
+  dataset_id?: string;
+  case_id?: string;
   dataset_version: number;
   description: string;
   coverage: Record<string, unknown>;
@@ -218,15 +222,20 @@ export interface SchemaEvaluationReport {
   duration_seconds: number;
   started_at: number;
   finished_at: number;
+  intent_metrics?: { query_type_accuracy: number; slot_recall: number };
 }
 
 export interface SchemaEvaluationStatus {
   running: boolean;
+  mode: "baseline" | "online_shadow";
   dataset: {
+    dataset_id: string;
+    name: string;
     version: number;
     description: string;
     coverage: Record<string, unknown>;
     case_count: number;
+    cases: { id: string; question: string; suite?: string }[];
   };
   report: SchemaEvaluationReport | null;
 }
